@@ -3,12 +3,20 @@
   <img src="docs/assets/fugato-banner-light.svg" alt="Fugato, for Claude and any number of Codex voices: four voices enter one after another and close on a final barline" width="100%">
 </picture>
 
-**Claude plans. Codex works. Claude accepts.** Fugato is a Claude Code plugin with a companion CLI. Claude writes the acceptance
-criteria and a bounded brief for each task. Codex workers investigate, implement
-and review on their own threads and hand back structured reports. Claude checks
-the evidence, records a verdict and integrates the work.
+**Run OpenAI Codex workers from inside Claude Code.** Fugato is a Claude Code
+plugin with a companion CLI. Claude writes the acceptance criteria and a brief
+for each Codex worker. The workers investigate, edit and test in parallel on
+their own threads, and Claude checks what they actually ran before it accepts
+anything.
 
 <a href="#install">Install</a> &nbsp;·&nbsp; <a href="#quick-start">Quick start</a> &nbsp;·&nbsp; <a href="#modes">Modes</a> &nbsp;·&nbsp; <a href="docs/commands.md">Documentation</a> &nbsp;·&nbsp; <a href="plugins/codex/CHANGELOG.md">Changelog</a>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fugato-showcase-live-dark.svg">
+  <img src="docs/assets/fugato-showcase-live-light.svg" alt="Claude Code with three Codex workers on one bug: the transcript shows each worker's latest commands and status, and the fugato-live pane on the right lists the workers on a shared time axis and follows the reviewer as it runs" width="100%">
+</picture>
+
+<p align="center"><sub>Three Codex workers on one bug. Claude's transcript on the left; the optional <code>fugato-live</code> pane on the right follows every worker as it runs.</sub></p>
 
 ## Install
 
@@ -156,6 +164,11 @@ another in threads; Claude chairs and accepts a reviewed candidate on evidence. 
 
 ## How it works
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fugato-how-it-works-dark.svg">
+  <img src="docs/assets/fugato-how-it-works-light.svg" alt="Claude plans: three acceptance criteria, each carried by a brief to a worker. Codex works: Zhang, Sohonie and Noether enter one after another on their own threads. Claude accepts: two reports are accepted on evidence, the review is still running" width="100%">
+</picture>
+
 1. **Brief.** Claude defines the acceptance criteria and gives each worker a
    bounded assignment: context, owned paths and the checks to run.
 2. **Work.** Each worker runs on its own Codex thread and can ask Claude a
@@ -164,6 +177,25 @@ another in threads; Claude chairs and accepts a reviewed candidate on evidence. 
    commands it actually ran from what it claims, with assumptions and blockers.
 4. **Accept.** Claude checks the evidence against the criteria, asks for
    corrections where needed, records a verdict in the run journal and integrates.
+
+## Inside a worker
+
+Each worker's own transcript shows every command and edit as it happens, with
+its status on the left, and ends with the report Claude checks: a summary, the
+files changed, the checks run and the findings.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fugato-showcase-agent-dark.svg">
+  <img src="docs/assets/fugato-showcase-agent-light.svg" alt="A worker's transcript: commands with their status, two file edits with line counts, and the closing report with changed files, checks and findings" width="86%">
+</picture>
+
+In roundtable mode, Codex personas argue a goal out in a shared forum. The live
+pane shows the posts as an index; press one to read it.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fugato-showcase-forum-dark.svg">
+  <img src="docs/assets/fugato-showcase-forum-light.svg" alt="The roundtable forum in the live pane: numbered posts by kind and author, replies indented under their parent, one candidate expanded with its body and references" width="70%">
+</picture>
 
 ## Highlights
 

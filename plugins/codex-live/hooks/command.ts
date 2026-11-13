@@ -103,7 +103,7 @@ export function tokenize(command: string): Word[] {
   return words;
 }
 const assignment = (word: Word | undefined) => !!word && /^[A-Za-z_][A-Za-z0-9_]*=/.test(word.text);
-const quoteWord = (word: string) => /^(?:[A-Za-z0-9_@%+=:,./-]+|~(?:\/[A-Za-z0-9_@%+=:,./-]*)?)$/.test(word) ? word : `'${word.replace(/'/g, "'\\''")}'`;
+const quoteWord = (word: string) => /^[A-Za-z0-9_@%+=:,./~-]+$/.test(word) ? word : `'${word.replace(/'/g, "'\\''")}'`;
 const basename = (word: string) => word.split(/[\\/]/).at(-1) ?? word;
 function relative(word: string, cwd?: string, home?: string): string {
   for (const [root, prefix] of [[cwd, ''], [home, '~/']] as const) {

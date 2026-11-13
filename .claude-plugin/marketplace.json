@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Fugato — Claude Code orchestration with Codex workers. Fork of openai/codex-plugin-cc.",
-    "version": "1.7.0"
+    "version": "1.7.1"
   },
   "plugins": [
     {
       "name": "fugato",
       "description": "Fugato: delegate coding, research and review from Claude Code to parallel Codex workers.",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "author": {
         "name": "OpenAI"
       },
@@ -20,7 +20,7 @@
     {
       "name": "fugato-live",
       "description": "Read-only live pane for this Claude session's Fugato Codex jobs and roundtable forums.",
-      "version": "1.7.0",
+      "version": "1.7.1",
       "source": "./plugins/codex-live"
     }
   ]

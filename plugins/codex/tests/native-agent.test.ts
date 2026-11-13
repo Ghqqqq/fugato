@@ -14,6 +14,7 @@ test('command display follows every spec vector without changing shell words', (
     [String.raw`/bin/zsh -lc "nl -ba plugins/codex-live/hooks/poll.ts | sed -n '1,80p'"`, 'nl', '-ba plugins/codex-live/hooks/poll.ts +1'],
     [String.raw`/bin/zsh -lc "N=/x/node env -u CLAUDE_CONFIG_DIR npm_config_offline=true node --test a.mjs"`, 'node', '--test a.mjs'],
     ['/usr/bin/git status --short', 'git', 'status --short'],
+    ['git diff HEAD~1 -- src', 'git', 'diff HEAD~1 -- src'],
     ['/bin/zsh -lc "cd /work/repo && npm test"', 'cd', '. +1'],
     [String.raw`env -i -u HOME FOO='a b' /bin/bash -l -c 'git -C /work/repo -c x=y status'`, 'git', '-C . status'],
     [String.raw`rg 'a|b' "c;d" a\ b a'bc'"de" 'it'\''s' /home/me/x /work/repository/x`, 'rg', String.raw`'a|b' 'c;d' 'a b' abcde 'it'\''s' ~/x /work/repository/x`],

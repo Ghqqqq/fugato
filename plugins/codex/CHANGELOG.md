@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.1
+
+- Show command arguments that contain `~` as written: `git diff HEAD~1` no
+  longer appears as `git diff 'HEAD~1'` in the agent view or the live pane.
+  Display only: what Codex runs is unchanged.
+- Rewrite the README opening so it says what Fugato does, and add pictures of
+  it running: Claude Code with three workers and the live pane, a How it works
+  diagram, one worker's agent view and a roundtable forum. The screenshots are
+  drawn from the plugins' own display code by
+  `docs/assets/src/showcase/build.sh`, so they can be regenerated when the
+  display changes.
+
 ## 1.7.0
 
 - Rename the Claude Code plugins `codex` to `fugato` and `codex-live` to

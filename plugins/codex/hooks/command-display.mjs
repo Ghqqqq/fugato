@@ -118,7 +118,7 @@ export function displayPath(path, context = {}) {
   if (home && (path === home || path.startsWith(home + '/')) && !path.slice(home.length).split('/').includes('..')) return '~' + path.slice(home.length);
   return path;
 }
-export const quoteWord = word => word instanceof ShellSyntax || /^(?:[A-Za-z0-9_@%+=:,./-]+|~(?:\/[A-Za-z0-9_@%+=:,./-]*)?)$/.test(word) ? word : "'" + word.replaceAll("'", "'\\''") + "'";
+export const quoteWord = word => word instanceof ShellSyntax || /^[A-Za-z0-9_@%+=:,./~-]+$/.test(word) ? word : "'" + word.replaceAll("'", "'\\''") + "'";
 const assignment = word => /^[A-Za-z_][A-Za-z0-9_]*=/.test(word ?? '');
 const basename = word => word?.split('/').at(-1) ?? '';
 function skipEnvironment(words) {

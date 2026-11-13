@@ -828,6 +828,7 @@ test('command cleanup follows shared vectors, redirections, heredocs and the for
     [String.raw`/bin/zsh -lc "nl -ba plugins/codex-live/hooks/poll.ts | sed -n '1,80p'"`, 'nl', '-ba plugins/codex-live/hooks/poll.ts +1'],
     [String.raw`/bin/zsh -lc "N=/x/node env -u CLAUDE_CONFIG_DIR npm_config_offline=true node --test a.mjs"`, 'node', '--test a.mjs'],
     ['/usr/bin/git status --short', 'git', 'status --short'],
+    ['git diff HEAD~1 -- src', 'git', 'diff HEAD~1 -- src'],
     ['env -u TEST /bin/zsh -lc "git status"', 'git', 'status'],
     ['git -C /work/repo -c user.name=Alice status', 'git', '-C . status'],
     [String.raw`/bin/zsh -lc "cd /work/repo && npm test"`, 'cd', '. +1'],
