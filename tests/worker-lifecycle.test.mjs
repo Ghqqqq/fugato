@@ -1823,6 +1823,40 @@ test("automatic inferred-turn recheck reconciles without a command and remains b
     assert.deepEqual(f.requests(), requestsBefore);
   });
 
+  await t.test("a busy broker rechecks privately and retries an unreachable read", async t => {
+    const { readyBroker, requireLocalSockets } = await import("./helpers.mjs");
+    if (!await requireLocalSockets(t)) return;
+    const f = fixture("inferred-final:unreadable");
+    Object.assign(f.env, { CODEX_COMPANION_INFERRED_RECHECK_MS: "100", CODEX_COMPANION_INFERRED_RECHECK_RETRY_MS: "2000" });
+    // Pin the shared broker so the abandoned stream keeps refusing other clients' reads.
+    const broker = await readyBroker(f.repo, f.env);
+    t.after(broker.close);
+    const brokerServerPid = f.state().launches.at(-1).pid;
+    const { jobId } = json(f.call("task", "--fresh", "--detached", "--json", "fixture"));
+    const original = await until(() => {
+      const job = storedJob(f, jobId);
+      return job.status === "completed" && job;
+    });
+    assert.equal(original.result.inferredCompletion, true);
+    assert.equal(original.result.turnEnded, false);
+
+    const recovery = await until(() => storedJob(f, jobId).recovery);
+    assert.equal(recovery.status, "unreachable");
+    assert.equal(recovery.detail, "Fixture turn unavailable");
+    fs.writeFileSync(path.join(f.dir, "fake-codex-state.json"), JSON.stringify({ ...f.state(), confirmationMode: "completed" }));
+    await until(() => !alive(storedJob(f, jobId).inferredRecheck.pid));
+    const resolved = storedJob(f, jobId);
+    assert.equal(resolved.recovery.status, "recovered");
+    assert.equal(resolved.status, "completed");
+    assert.equal(resolved.result.turnEnded, true);
+    assert.equal(resolved.result.rawOutput, original.result.rawOutput);
+    const checks = reads(f);
+    assert.equal(checks.length, 3, "confirmation plus two automatic reads");
+    assert.equal(checks[0].serverId, brokerServerPid);
+    assert.ok(checks.slice(1).every(read => read.serverId !== brokerServerPid && read.params.threadId === original.threadId));
+    assert.equal(f.requests().filter(request => request.method === "turn/start").length, 1);
+  });
+
   await t.test("a still-running turn stops after two attempts", async () => {
     const terminal = false;
     const { f, original } = launch(false, "6000", "100");

@@ -2165,13 +2165,13 @@ async function handleInferredTurnRecheck(argv) {
       await new Promise(resolve => setTimeout(resolve, ms));
       const current = read();
       if (!isCurrent(current)) return;
-      const result = await reconcileLostTurn(workspaceRoot, current, { isCurrent });
-      if (result.outcome !== "in_progress") return;
+      const result = await reconcileLostTurn(workspaceRoot, current, { isCurrent, privateWhenBusy: true });
+      if (result.outcome !== "in_progress" && result.recovery?.status !== "unreachable") return;
     }
   } catch { /* Optional recovery must never surface a helper failure to the user. */ }
 }
 
-export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null, interruptRequested = false, admittingJobId = null, isCurrent = () => true } = {}) {
+export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null, interruptRequested = false, admittingJobId = null, isCurrent = () => true, privateWhenBusy = false } = {}) {
   let stored = restoreMissingTaskRecord(workspaceRoot, job);
   if (!isCurrent(stored)) return { outcome: "unknown" };
   if (!unresolvedTask(stored)) {
@@ -2192,7 +2192,9 @@ export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null,
       stored = updateJob(workspaceRoot, stored.id, latest => isCurrent(latest) && unresolvedTask(latest) && ACTIVE.has(latest.status) && !processAlive(latest.pid)
         ? { status: "failed", phase: "failed", pid: null, completedAt: nowIso(), errorMessage: "Worker exited before its turn outcome was recorded." } : null);
     }
-    let result = turnResult ?? (stored.threadId ? await readAppServerTurn(workspaceRoot, stored, { admittingJobId, privateWhenBusy: Boolean(admittingJobId) }) : { turnStatus: "notStarted" });
+    let result = turnResult ?? (stored.threadId ? await readAppServerTurn(workspaceRoot, stored, {
+      admittingJobId, privateWhenBusy: privateWhenBusy || Boolean(admittingJobId)
+    }) : { turnStatus: "notStarted" });
     if (!result) return recordTurnResolution(workspaceRoot, stored, "unknown", { status: "unknown", detail: "The recorded turn is not readable. It may not have been persisted; do not automatically rerun it." }, isCurrent);
     const ambiguous = { turnResolution: "unknown", recovery: { status: "unknown", detail: "The thread's recorded ownership is incomplete or ambiguous; no turn was attributed to this job." } };
     const attributionConfirmed = latest => {

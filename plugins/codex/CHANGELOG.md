@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.2
+
+- Resolve a worker whose turn end was inferred from its final answer even when
+  other workers are busy on the shared runtime. The automatic recheck now reads
+  the turn through a private runtime when the shared one is busy, as follow-up
+  admission already did, and an unreachable read no longer skips its second
+  attempt. Before, such a worker stayed marked unresolved in `fugato-live`
+  and `Clear finished` could not remove it. A worker already stuck this way
+  resolves on the next `fugato result <worker>` run while no other worker is
+  busy on the shared runtime.
+
 ## 1.7.1
 
 - Show command arguments that contain `~` as written: `git diff HEAD~1` no
