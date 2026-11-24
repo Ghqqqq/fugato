@@ -197,13 +197,16 @@ const resumableTask = job => job.jobClass === "task" && Boolean(job.threadId);
 export function continuationReport(job) {
   const continuationCommand = resumableTask(job) && job.id ? companionCommand(`task --continue ${quote(job.id)} --cwd ${quote(job.request?.cwd ?? job.workspaceRoot)} ${job.direct ? "--direct" : "--follow --report --json"}`) : null;
   return { continuationCommand,
-    continuationNote: continuationCommand ? "Starts one new turn on the same Codex thread with this job's recorded sandbox, write, model and browser-origin settings; append extra instructions as the prompt. It has not been run. Wait for any pending interruption to finish first." : "No resumable task thread was recorded; no continuation command is available." };
+    continuationNote: continuationCommand ? job.request?.backend === "antigravity"
+      ? "Starts a new turn on this Antigravity session with its recorded backend, model and thinking settings. Requires server session/load support. Wait for any pending interruption to finish before continuing."
+      : "Starts one new turn on the same Codex thread with this job's recorded sandbox, write, model and browser-origin settings; append extra instructions as the prompt. It has not been run. Wait for any pending interruption to finish first." : "No resumable task thread was recorded; no continuation command is available." };
 }
 // The details view retains the full report and the old direct-mode commands,
 // summary and expanded lists. JSON/feed callers keep their existing payloads.
 export function fullReport(payload, job = {}) {
   const reason = budgetReason(payload.interruptionReason ?? job.result?.interruptionReason ?? job.cancelRequested?.reason);
   const report = { ...payload,
+    ...(job.request?.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity", ...(job.result?.acpUsage ? { acpUsage: job.result.acpUsage } : {}) } : {}),
     ...(reason ? { reason: { ...reason, ...(job.budget ? {
       maximum: reason.limit === "max_minutes" ? job.budget.maxMinutes * 60000 : job.budget.maxTokens,
       consumed: reason.limit === "max_minutes" ? job.budget.consumedMs : job.budget.consumedTokens,
@@ -399,6 +402,7 @@ export function directReport(payload, job = {}, env = process.env) {
   /** @type {Record<string, any> & { summary: string }} */
   const report = {
     status: full.status,
+    ...(job.request?.backend === "antigravity" || full.backend === "antigravity" ? { backend: "antigravity" } : {}),
     worker,
     jobId,
     summary: truncate(summary, DIRECT_SUMMARY_LIMIT),
@@ -610,7 +614,7 @@ function questionCallerGone(previous, caller) {
 // Tickets keep the existing slot's ownership/answer-transfer rules unchanged.
 export async function askParentQuestion(cwd, id, question, context = {}) {
   const job = readJobFile(resolveJobFile(cwd, id));
-  if (job.request?.permissionPolicy?.mapping !== "claude") return askParentQuestionSlot(cwd, id, question, context);
+  if (job.request?.permissionPolicy?.mapping !== "claude" && job.request?.backend !== "antigravity") return askParentQuestionSlot(cwd, id, question, context);
   const caller = context.caller ?? questionCaller, ticketId = randomUUID();
   const turnId = context.turnId ?? job.turnId;
   const deadline = Date.now() + (job.questionTimeoutSec ?? 900) * 1000;
@@ -860,6 +864,16 @@ export class JobRuntime {
   // Only an explicit answer grants anything. Mapped jobs queue every kind;
   // legacy Computer Use requests retain the single-slot fail-closed behavior.
   async approval(request) {
+    if (request.kind === "acp-permission") {
+      const matches = job => job.request?.backend === "antigravity" && job.threadId === request.binding?.threadId && job.turnId === request.binding?.turnId;
+      if (request.signal?.aborted || !matches(readJobFile(resolveJobFile(this.cwd, this.id)))) return "deny";
+      const { text, resolution } = await askParentQuestion(this.cwd, this.id,
+        { question: request.question, options: ACTION_APPROVAL_OPTIONS, kind: "action-approval", binding: request.binding },
+        { signal: this.abort.signal, cancelled: () => request.signal?.aborted, onProgress: this.onProgress, turnId: request.binding.turnId });
+      const current = readJobFile(resolveJobFile(this.cwd, this.id));
+      return resolution === "answered" && text === "Allow once" && !request.signal?.aborted && !this.abort.signal.aborted &&
+        !current.cancelRequested && ACTIVE.has(current.status) && matches(current) ? "once" : "deny";
+    }
     if (request.kind === "action-approval") {
       const job = readJobFile(resolveJobFile(this.cwd, this.id));
       if (request.signal?.aborted || job.threadId !== request.binding.threadId || job.turnId !== request.binding.turnId || !job.request?.permissionPolicy?.forwardActions) return "deny";
@@ -910,6 +924,7 @@ export function progressSnapshot(job) {
   const seconds = Math.floor(elapsedMs / 1000), elapsed = `${Math.floor(seconds / 60)}m${seconds % 60}s`;
   const phase = pending ? "needs_answer" : job.phase === "needs_answer" ? "running" : job.phase ?? job.status;
   return { status: pending ? "needs_answer" : job.status, jobId: job.id, threadId: job.threadId ?? null, turnId: job.turnId ?? null,
+    ...(job.request?.backend === "antigravity" || job.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity" } : {}),
     ...(job.agentName ? { agentName: job.agentName } : {}),
     ownerId: job.ownerId ?? null, sessionId: job.sessionId ?? null, ownerAttached: Boolean(job.ownerAttached), ...leaseSnapshot(job),
     headline: `${pending ? "waiting for parent" : job.currentItem?.summary ?? phase} · ${elapsed}`.slice(0, 60), phase, elapsed, elapsedMs,

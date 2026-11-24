@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Add Google Gemini workers through the Antigravity CLI's ACP v1 server:
+  `fugato task --backend antigravity` and native `fugato:gemini-native` reuse
+  task tracking, parent questions, reports, cancellation and session continuation.
+- Discover Google models and thinking options from the authenticated server with
+  `models --backend antigravity`; check readiness with `setup --backend antigravity`.
+  Google workers keep their backend on follow-up and use their own defaults.
+- Forward ACP permissions for explicit single-use parent approval. Reject
+  unsupported Codex sandbox, permission mapping, fork, priority, token-budget
+  and roundtable options before launching a Google worker. Preserve ACP usage
+  separately from Codex token totals. Document the live-account verification
+  boundary and first-version support in the Antigravity guide.
+
 ## 1.7.2
 
 - Resolve a worker whose turn end was inferred from its final answer even when

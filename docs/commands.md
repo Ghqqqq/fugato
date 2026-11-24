@@ -2,6 +2,16 @@
 
 Slash commands and companion subcommands. Back to the [README](../README.md).
 
+## Google workers
+
+Google Gemini is available through Antigravity ACP. Use
+`fugato setup --backend antigravity` to check the CLI login,
+`fugato models --backend antigravity` to discover account-specific model and
+thinking values, and `fugato task --backend antigravity` to dispatch a worker
+with its brief on stdin. Native dispatch uses `fugato:gemini-native`.
+Follow-up, status, result, answer and cancel commands use the same worker/job
+handles as Codex. See [Antigravity setup and support boundaries](antigravity.md).
+
 ## Slash commands
 
 The Claude Code plugins are `fugato` and optional `fugato-live`. For an older

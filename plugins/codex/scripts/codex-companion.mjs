@@ -16,6 +16,8 @@ import { normalizeBrowserOrigins, normalizeBundleIds } from "./lib/server-reques
 import { browserOriginSetup, computerUseSetup, transportSetup, defaultSandboxSetup, defaultModeSetup, permissionMappingSetup, readTomlField, dispatchSetup, dispatchPreference, contextSetup, budgetDefaultsSetup, personaModelsSetup, workerDefaultsSetup, readWorkerDefaults, normalizeRequestedModel, isSupportedReasoningEffort, ensureBrowserApproval, ensureComputerUseApproval, ensureProjectDocs, projectDocsSetup, SANDBOX_MODES } from "./lib/setup-config.mjs";
 import { budgetLimit, newJobBudget } from "./lib/job-budget.mjs";
 import { listModels, renderModels } from "./lib/models.mjs";
+import { ensureAntigravityAvailable, listAntigravityModels, runAntigravityTurn } from "./lib/antigravity.mjs";
+import { acpSetting, jobBackend, normalizeBackend, validateAntigravityTask } from "./lib/backends.mjs";
 import { activityReader, formatActivity, redactActivity, snippet } from "./lib/activity.mjs";
 import { JobRuntime, ACTIVE, OWNER_GRACE_MS, seconds, ownerId, renewLease, requestCancel, answerQuestion, progressSnapshot, leaseExpiryReport, continuationReport, fullReport, directReport, envelopeBytes, adoptJob, ownershipNotice } from "./lib/job-runtime.mjs";
 import { reserveAgentName, releaseAgentName } from "./lib/agent-names.mjs";
@@ -174,6 +176,11 @@ runs add/close require journal use <runId> or --run, and tasks stay unlinked. On
 Show/validate fall back to the newest workspace run when none is active.`,
   task: `Usage: fugato task [options] <<'DUET_TASK'
 Read the brief only from stdin; implies --direct. Fresh unless --to/--thread/--continue/--resume/--resume-last.
+  --backend <codex|antigravity>  Worker runtime (default codex). Follow-ups inherit it; sessions cannot switch backends.
+    Antigravity uses agy acp and its own login. Discover Google models with fugato models --backend antigravity.
+    Google model/thinking defaults come from ACP, and permission requests go to the parent for Allow once/Deny.
+    Supports danger-full-access only; Codex sandbox/permission mapping, fork, fast tier, roundtable,
+    browser/Computer Use grants and token budgets are unavailable. Use --max-minutes for a time budget.
   --help, -h  Show help without starting anything; unknown task flags are errors.
   --name <label>  Prefer this worker name on a fresh thread; follow-ups keep their name.
     Use 1-64 ASCII letters, digits, _, . or -, starting with a letter or digit.
@@ -237,8 +244,9 @@ Never parse output files, poll or run two waits for one job. Continue user-stopp
 Compatibility: node "$CODEX_COMPANION" <subcommand> still works. Its task accepts positional text,
 --prompt-file <file>, --report/--json, --follow (feed wait), --detached (return handles),
 --background (legacy launch), and --feed-limit <n> (60; 0 unlimited), outside direct mode.`,
-  models: `fugato models lists models offered by the current Codex account.
-Usage: fugato models [--json] [--all]
+  models: `fugato models lists models offered by the selected worker runtime.
+Usage: fugato models [--backend codex|antigravity] [--cwd <dir>] [--json] [--all]
+Antigravity reads the authenticated ACP session's model/thinking options without sending a model prompt.
 Uses app-server model/list, falling back to the isolated model cache; reports the source.
   --json  Model descriptions, efforts, context windows and effective tiers with sources.
   --all  Include hidden models; --help, -h  Help without starting the runtime.`,
@@ -247,6 +255,8 @@ Uses app-server model/list, falling back to the isolated model cache; reports th
   --max-concurrent <n|off>  Fugato-wide worker turn limit (default off).
 Usage: fugato setup [options]
 Check isolated runtime readiness or change setup; --help, -h exits without changes.
+  --backend antigravity  Check Google ACP readiness using existing agy login, with no model prompt.
+    Accepts --cwd and --json; does not configure the Codex runtime. Missing login: agy acp --login.
   --cwd, -C <dir>  Workspace; --json  JSON output; --dry-run  Preview a setup change.
   --sync-tools  Sync tools; --profile <chrome|codex-app>  Tool profile; --replace-cua  Replace CUA config.
   --cua-template <file>  Absolute template path; --chatgpt-resources <dir>  Absolute resources path.
@@ -596,9 +606,20 @@ function projectDocsSummary() {
 }
 
 async function handleModels(argv) {
-  const { options, positionals } = parseCommandInput(argv, { booleanOptions: ["json", "all"] });
-  if (positionals.length) throw new Error("Usage: fugato models [--json] [--all]");
-  const catalog = await listModels({ all: Boolean(options.all) });
+  const { options, positionals } = parseCommandInput(argv, { valueOptions: ["backend", "cwd"], booleanOptions: ["json", "all"] });
+  if (positionals.length) throw new Error("Usage: fugato models [--backend codex|antigravity] [--cwd <dir>] [--json] [--all]");
+  if (normalizeBackend(options.backend) === "antigravity") {
+    const catalog = await listAntigravityModels(resolveCommandCwd(options));
+    const report = { backend: "antigravity", source: "antigravity-acp", models: catalog.data.map(model => ({
+      slug: model.model ?? model.id, displayName: model.displayName, isDefault: Boolean(model.isDefault),
+      efforts: model.supportedReasoningEfforts?.map(value => value.reasoningEffort) ?? [], defaultEffort: model.defaultReasoningEffort ?? null
+    })), configOptions: catalog.configOptions };
+    const rows = report.models.map(model => [model.slug, model.displayName, model.isDefault ? "current" : "", model.efforts.join(", ")].map(escapeDiagnosticControls).join(" | "));
+    outputCommandResult(report, ["Google models from Antigravity ACP", "ID | Name | Selection | Thinking options for the current model", ...rows,
+      "Model and thinking values come from the server. Changing models can change the available thinking options.", ""].join("\n"), options.json);
+    return;
+  }
+  const catalog = await listModels({ all: Boolean(options.all), cwd: resolveCommandCwd(options) });
   const defaults = workerDefaultsSetup();
   const tiers = { strong: defaults.defaultModel, effort: defaults.defaultEffort, routine: defaults.ultraRoutineModel };
   const models = catalog.models.map(model => ({ ...model, inUse: [
@@ -611,11 +632,22 @@ async function handleModels(argv) {
 
 async function handleSetup(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "cua-template", "chatgpt-resources", "transport", "profile", "default-sandbox", "default-mode", "permission-mapping", "dispatch", "default-model", "default-effort", "ultra-routine-model", "browser-approval", "computer-use-approval", "project-docs", "agent-memory", "max-concurrent", "default-max-minutes", "default-max-tokens"],
+    valueOptions: ["backend", "cwd", "cua-template", "chatgpt-resources", "transport", "profile", "default-sandbox", "default-mode", "permission-mapping", "dispatch", "default-model", "default-effort", "ultra-routine-model", "browser-approval", "computer-use-approval", "project-docs", "agent-memory", "max-concurrent", "default-max-minutes", "default-max-tokens"],
     repeatableOptions: ["allow-browser-origin", "revoke-browser-origin", "allow-computer-app", "revoke-computer-app", "persona-model"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate", "sync-tools", "dry-run", "list-browser-origins", "list-computer-apps", "replace-cua"]
   });
   validatePositionalArity(positionals, 0, "setup");
+  if (normalizeBackend(options.backend) === "antigravity") {
+    if (Object.keys(options).some(key => !["backend", "cwd", "session", "json"].includes(key))) {
+      throw new Error("Antigravity setup accepts only --backend antigravity, --cwd and --json. Authenticate with agy acp --login.");
+    }
+    const cwd = resolveCommandCwd(options);
+    const catalog = await listAntigravityModels(cwd);
+    const report = { backend: "antigravity", ready: true, models: catalog.data.map(model => model.model ?? model.id),
+      detail: "Antigravity ACP initialized and created a session with the current CLI credentials. No model prompt was submitted." };
+    outputCommandResult(report, `${report.detail}\nAvailable models: ${report.models.map(escapeDiagnosticControls).join(", ")}\n`, options.json);
+    return;
+  }
   const computerUseFlags = options["computer-use-approval"] !== undefined || options["allow-computer-app"] || options["revoke-computer-app"] || options["list-computer-apps"];
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
@@ -834,7 +866,8 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
   const workspaceJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const jobs = workspaceJobs.filter((job) => job.id !== options.excludeJobId && job.title !== "Codex Stop Gate Review");
+  const jobs = workspaceJobs.filter((job) => job.id !== options.excludeJobId && job.title !== "Codex Stop Gate Review"
+    && (!options.backend || jobBackend(job) === options.backend));
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -846,7 +879,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
     return { id: trackedTask.threadId };
   }
 
-  if (sessionId) {
+  if (sessionId || options.backend === "antigravity") {
     return null;
   }
 
@@ -1032,9 +1065,11 @@ const withGitContext = (context, brief) => brief.trim() && context ? context + b
 async function executeTaskRun(request) {
   requireTaskRequest(request.prompt ?? "", request.resumeLast, request.threadId);
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureCodexAvailable(request.cwd);
+  const backend = normalizeBackend(request.backend);
+  if (backend === "codex") ensureCodexAvailable(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
+    backend,
     prompt: request.prompt,
     resumeLast: Boolean(request.resumeLast || request.threadId)
   });
@@ -1042,6 +1077,7 @@ async function executeTaskRun(request) {
   let resumeThreadId = request.threadId ?? null;
   if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
+      backend,
       excludeJobId: request.jobId
     });
     if (!latestThread) {
@@ -1077,15 +1113,18 @@ async function executeTaskRun(request) {
   // Only an owned (detached/--follow) job has a parent polling for questions, so
   // only there can a Computer Use request be forwarded; a plain foreground run
   // keeps "never" and such a request fails closed at once.
-  const approvalPolicy = request.permissionPolicy ? (request.detached ? request.permissionPolicy.approvalPolicy : "never") : request.detached ? FORWARDED_APPROVALS_LABEL : "never";
+  const approvalPolicy = backend === "antigravity" ? request.detached ? "antigravity+ask-parent" : "antigravity+deny-requests"
+    : request.permissionPolicy ? (request.detached ? request.permissionPolicy.approvalPolicy : "never") : request.detached ? FORWARDED_APPROVALS_LABEL : "never";
   updateJob(workspaceRoot, request.jobId, () => ({ preExistingChanges: before.preExistingChanges, sandbox, approvalPolicy }));
-  request.onProgress?.(`Sandbox: ${sandbox}; approval policy: ${approvalPolicy}${request.detached ? " (Computer Use app requests are forwarded to the parent)" : ""}. Captured workspace baseline (${before.status}).`);
+  request.onProgress?.(backend === "antigravity"
+    ? `Antigravity ACP uses its own tool permissions without a Fugato filesystem sandbox; approval policy: ${approvalPolicy}. Captured workspace baseline (${before.status}).`
+    : `Sandbox: ${sandbox}; approval policy: ${approvalPolicy}${request.detached ? " (Computer Use app requests are forwarded to the parent)" : ""}. Captured workspace baseline (${before.status}).`);
 
   const runtime = new JobRuntime(workspaceRoot, request.jobId, { foreground: !request.detached, parentPid: LAUNCH_PARENT_PID, onProgress: request.onProgress });
   let result, memberThreadId = null;
   try {
     if (!request.detached) runtime.abort.signal.throwIfAborted();
-    result = await runAppServerTurn(workspaceRoot, {
+    result = await (backend === "antigravity" ? runAntigravityTurn : runAppServerTurn)(workspaceRoot, {
     executionCwd: fs.realpathSync(request.cwd),
     jobId: request.jobId,
     onThreadBusy: (threadId, turnIds) => {
@@ -1132,12 +1171,13 @@ async function executeTaskRun(request) {
       // Capture cleanup is only recorded after sending turn/interrupt. A stop
       // observed after capture completed must not claim an interrupt was sent.
       updateJob(workspaceRoot, request.jobId, current => ({
-        turnInterruptAttempted: Boolean(current.backgroundTerminals),
-        turnInterrupted: Boolean(current.backgroundTerminals && result?.turnEnded && result?.turn?.status === "interrupted")
+        turnInterruptAttempted: backend === "antigravity" ? Boolean(result?.turnInterruptAttempted ?? current.turnInterruptAttempted) : Boolean(current.backgroundTerminals),
+        turnInterrupted: backend === "antigravity" ? Boolean(result?.turnEnded && result?.turn?.status === "interrupted") : Boolean(current.backgroundTerminals && result?.turnEnded && result?.turn?.status === "interrupted")
       }));
     } finally { runtime.close(); }
   }
-  if (runtime.reason) Object.assign(result, { interruptionReason: runtime.reason, interruptionConfirmed: Boolean(result.turnEnded), status: 1 });
+  if (runtime.reason) Object.assign(result, { interruptionReason: runtime.reason,
+    interruptionConfirmed: backend === "antigravity" ? result.interruptionConfirmed === true : Boolean(result.turnEnded), status: 1 });
 
   Object.assign(result, compareWorkspaceSnapshots(before, snapshotWorkspace(workspaceRoot), result.touchedFiles));
   return buildTaskExecution(result, request, taskMetadata);
@@ -1166,6 +1206,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
   );
   const payload = {
     status: result.status,
+    ...(request.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity", ...(result.acpUsage ? { acpUsage: result.acpUsage } : {}) } : {}),
     jobId: request.jobId,
     threadId: result.threadId,
     turnId: result.turnId,
@@ -1250,7 +1291,7 @@ function buildReviewJobMetadata(reviewName, target) {
   };
 }
 
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
+function buildTaskRunMetadata({ prompt, resumeLast = false, backend = "codex" }) {
   if (!resumeLast && process.env.CODEX_COMPANION_STOP_REVIEW_GATE === "1" && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
       title: "Codex Stop Gate Review",
@@ -1258,7 +1299,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
     };
   }
 
-  const title = resumeLast ? "Codex Resume" : "Codex Task";
+  const title = backend === "antigravity" ? resumeLast ? "Gemini Resume" : "Gemini Task" : resumeLast ? "Codex Resume" : "Codex Task";
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
@@ -1313,7 +1354,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   });
   // Set once on creation; adoption may change sessionId, never this origin.
   // A null submission distinguishes new, never-submitted jobs from legacy ones.
-  const record = { ...job, turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
+  const record = { ...job, ...(identity.backend === "antigravity" ? { backend: identity.backend } : {}), turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
     ...(lifecycle.budget ? { budget: lifecycle.budget } : {}),
     ...(identity.dispatchNonce ? { dispatchNonce: identity.dispatchNonce } : {}),
     ...(identity.dispatchToolUseId ? { dispatchToolUseId: identity.dispatchToolUseId,
@@ -1395,9 +1436,10 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   return record;
 }
 
-function buildTaskRequest({ cwd, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins = [], approvedComputerApps = [], resumeLast, threadId, jobId, report, detached = false, developerInstructions, claudeMd, skills, agentType, agentMemory, claudeInstructionsBase, gitContext, budget, permissionPolicy, roundtable }) {
+function buildTaskRequest({ cwd, backend = "codex", model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins = [], approvedComputerApps = [], resumeLast, threadId, jobId, report, detached = false, developerInstructions, claudeMd, skills, agentType, agentMemory, claudeInstructionsBase, gitContext, budget, permissionPolicy, roundtable }) {
   return {
     cwd,
+    ...(backend === "antigravity" ? { backend } : {}),
     model,
     effort,
     serviceTier,
@@ -1695,8 +1737,13 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, nativePermissionOptions({ ...COMMAND_OPTIONS.task,
     internalValueOptions: [...(COMMAND_OPTIONS.task.internalValueOptions ?? []), "agent-type"] }));
   const declaredAgentType = options["agent-type"];
-  if (declaredAgentType !== undefined && !["fugato:codex-native", "fugato:codex-reviewer", "fugato:codex-implementer", "fugato:codex-investigator"].includes(declaredAgentType)) {
+  if (declaredAgentType !== undefined && !["fugato:codex-native", "fugato:codex-reviewer", "fugato:codex-implementer", "fugato:codex-investigator", "fugato:gemini-native"].includes(declaredAgentType)) {
     throw new Error("--agent-type requires a declared native agent type.");
+  }
+  if (options.backend !== undefined) normalizeBackend(options.backend);
+  if (declaredAgentType === "fugato:gemini-native") {
+    if (options.backend !== undefined && options.backend !== "antigravity") throw new Error("The Gemini native worker requires --backend antigravity.");
+    options.backend = "antigravity";
   }
   const budgetDefaults = budgetDefaultsSetup();
   const budget = newJobBudget(
@@ -1750,8 +1797,8 @@ async function handleTask(argv) {
   // Bind the handle once so a later lookup cannot select a different thread.
   if (options.resume || options["resume-last"]) {
     if (options.thread !== undefined || options.continue !== undefined || options.fresh) throw new Error("Choose --thread, --continue, --fresh, or --resume/--resume-last; these options cannot be combined.");
-    const latest = await resolveLatestTrackedTaskThread(resolveWorkspaceRoot(cwd));
-    if (!latest) throw new Error("No previous Codex task thread was found for this repository.");
+    const latest = await resolveLatestTrackedTaskThread(resolveWorkspaceRoot(cwd), { backend: options.backend });
+    if (!latest) throw new Error(`No previous ${options.backend === "antigravity" ? "Antigravity" : "Codex"} task session was found for this repository.`);
     options.thread = latest.id;
   }
   let inheritance = options.thread ? resolveThreadInheritance(cwd, options.thread.trim(), { allowCrossSessionFallback: explicitThread || explicitJob }) : null;
@@ -1769,7 +1816,7 @@ async function handleTask(argv) {
     if (!continued) throw new Error(`No stored job found for --continue ${options.continue}.`);
     if (continued.jobClass !== "task" || !continued.threadId) throw new Error(`Job ${continued.id} has no resumable Codex thread; nothing to continue.`);
     if (ACTIVE.has(continued.status)) throw new Error(`Job ${continued.id} is still ${continued.status}; wait for it to end (or cancel it) before continuing its thread.`);
-    for (const flag of ["thread", "fresh", "resume", "resume-last", "write", "model", "effort", "fast", "normal"]) {
+    for (const flag of ["backend", "thread", "fresh", "resume", "resume-last", "write", "model", "effort", "fast", "normal"]) {
       if (options[flag] !== undefined) throw new Error(`--continue inherits the original job's ${flag} setting; do not pass --${flag}.`);
     }
     if (options["approve-browser-origin"]?.length) throw new Error("--continue inherits the original job's approved browser origins; do not pass --approve-browser-origin.");
@@ -1794,6 +1841,10 @@ async function handleTask(argv) {
       : "Inherited settings from the continued job; no request grants recorded in this session were inherited."
   } };
   const recordedSettings = recordedThreadSettings(sourceJob);
+  const backend = normalizeBackend(options.backend ?? recordedSettings.backend ?? "codex");
+  if (sourceJob && backend !== jobBackend(sourceJob)) {
+    throw new Error("A worker session keeps its original backend. Start a fresh task to change --backend.");
+  }
   const recordedSandbox = recordedSettings.sandbox;
   if ((continued || options.thread?.trim()) && !SANDBOX_MODES.includes(recordedSandbox) && options.sandbox === undefined) {
     const message = "No recorded sandbox settings are available for this thread; pass --sandbox explicitly before continuing.";
@@ -1816,6 +1867,7 @@ async function handleTask(argv) {
       (!previousRoundtable || previousRoundtable.roomId !== roundtable.roomId || previousRoundtable.persona !== roundtable.persona)) {
     throw new Error("A resumed thread keeps its original roundtable/persona binding; start a fresh thread to seat a new member.");
   }
+  if (backend === "antigravity" && roundtable) throw new Error("Antigravity roundtable personas are not supported yet. Dispatch independent Gemini workers with --backend antigravity.");
   const seating = roundtable ? validateMember(roundtable.roomId, roundtable.persona, getCurrentClaudeSessionId()) : null;
   if (seating?.member.threadId && seating.member.threadId !== (continued?.threadId ?? options.thread)) throw new Error("Roundtable member already has a thread; continue that thread with --to or --thread.");
   // Member activity always journals to the room's run, never the session's
@@ -1829,9 +1881,11 @@ async function handleTask(argv) {
       throw new Error(`Roundtable member ${roundtable.persona} must use its recorded workspace; pass --cwd ${JSON.stringify(workspace)}.`);
     }
   }
-  const defaults = readWorkerDefaults();
-  const model = normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model;
-  const effort = normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort;
+  const defaults = backend === "codex" ? readWorkerDefaults() : {};
+  const model = backend === "antigravity" ? acpSetting(options.model ?? recordedSettings.model, "model")
+    : normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model;
+  const effort = backend === "antigravity" ? acpSetting(options.effort ?? recordedSettings.effort, "effort")
+    : normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort;
   if (options.fast && options.normal) throw new Error("Choose either --fast or --normal.");
   const serviceTier = options.fast ? "priority" : options.normal || options.fast === false ? null : recordedSettings.serviceTier ?? null;
   const prompt = readTaskPrompt(cwd, options, positionals);
@@ -1872,6 +1926,10 @@ async function handleTask(argv) {
   }
   const permissionPolicy = taskPermissionPolicy(options, cwd, previousRequest?.permissionPolicy);
   if (permissionPolicy) sandbox = permissionPolicy.sandbox;
+  if (backend === "antigravity") {
+    validateAntigravityTask({ options, sandbox, permissionPolicy, budget, roundtable });
+    if (permissionMappingSetup().permissionMapping === "claude") throw new Error("Antigravity ACP does not support Claude permission mapping. Use a Codex worker while permission mapping is enabled.");
+  }
   write = sandbox !== "read-only";
   const agentType = contextRequest?.agentType ?? declaredAgentType ?? (nativeAgentName ? "fugato:codex-native" : null);
   const skillContext = threadId ? { skills: contextRequest?.skills ?? [], text: "" } : prepareClaudeSkills({ agentType, cwd });
@@ -1902,29 +1960,33 @@ async function handleTask(argv) {
   }
   // The browser is unrestricted by default: mirror the saved preference into
   // the browser runtime's own file before Codex starts (a no-op once written).
-  try { ensureBrowserApproval(); } catch (error) { process.stderr.write(`Browser approval preference not applied: ${error.message}\n`); }
-  // Computer Use: in mirror mode (the default) the apps the user marked "always
-  // allow" in their Codex app are copied into the isolated runtime's own
-  // approval file (read-only on ~/.codex; a no-op once in step).
-  try { ensureComputerUseApproval(); } catch {
-    // Retry an interrupted mirror before starting the runtime. Persistent
-    // failures leave the old allowlist or a fully recorded new one; pending
-    // provenance is retained, so no partial grant becomes explicit consent.
-    try { ensureComputerUseApproval(); } catch (error) { process.stderr.write(`Computer Use approval preference not applied: ${error.message}\n`); }
+  if (backend === "codex") {
+    try { ensureBrowserApproval(); } catch (error) { process.stderr.write(`Browser approval preference not applied: ${error.message}\n`); }
+    // Computer Use: in mirror mode (the default) the apps the user marked "always
+    // allow" in their Codex app are copied into the isolated runtime's own
+    // approval file (read-only on ~/.codex; a no-op once in step).
+    try { ensureComputerUseApproval(); } catch {
+      // Retry an interrupted mirror before starting the runtime. Persistent
+      // failures leave the old allowlist or a fully recorded new one; pending
+      // provenance is retained, so no partial grant becomes explicit consent.
+      try { ensureComputerUseApproval(); } catch (error) { process.stderr.write(`Computer Use approval preference not applied: ${error.message}\n`); }
+    }
+    // Project instructions: let Codex read CLAUDE.md where no AGENTS.md exists
+    // (its own project_doc_fallback_filenames; a no-op once written).
+    try { ensureProjectDocs(); } catch (error) { process.stderr.write(`Project instructions preference not applied: ${error.message}\n`); }
   }
-  // Project instructions: let Codex read CLAUDE.md where no AGENTS.md exists
-  // (its own project_doc_fallback_filenames; a no-op once written).
-  try { ensureProjectDocs(); } catch (error) { process.stderr.write(`Project instructions preference not applied: ${error.message}\n`); }
   const taskMetadata = buildTaskRunMetadata({
+    backend,
     prompt,
     resumeLast: Boolean(resumeLast || threadId)
   });
 
   if (options.background || options.detached || options.follow || options.direct) {
-    ensureCodexAvailable(cwd);
+    if (backend === "antigravity") ensureAntigravityAvailable(cwd);
+    else ensureCodexAvailable(cwd);
 
     if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
     if (job.dispatchReused) {
       await waitForJob(workspaceRoot, job, { owner: job.ownerId, timeoutSec: options["timeout-sec"], direct: true, quiet: options.quiet, toolUseId: dispatchToolUseId });
       return;
@@ -1935,6 +1997,7 @@ async function handleTask(argv) {
       budget,
       permissionPolicy,
       cwd,
+      backend,
       model,
       effort,
       serviceTier,
@@ -1976,8 +2039,8 @@ async function handleTask(argv) {
   }
 
   if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
-  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
+  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
   if (options.run !== undefined) job.request.run = options.run;
   if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
   Object.assign(job.request, forkRequest);
@@ -1989,6 +2052,7 @@ async function handleTask(argv) {
         ...claudeInstructions,
         permissionPolicy,
         cwd,
+        backend,
         model,
         effort,
         serviceTier,
@@ -2084,6 +2148,7 @@ async function handleTaskWorker(argv) {
 // Reports stored by earlier releases lack the run settings; fill them from the
 // recorded request so task/wait/result --report always show them.
 function withRunSettings(report, request) {
+  if (request?.backend === "antigravity") Object.assign(report, { backend: "antigravity", provider: "Google Antigravity" });
   for (const key of ["model", "effort", "serviceTier"]) report[key] ??= request?.[key] ?? null;
   if (request?.forked) {
     for (const key of ["forked", "forkSourceSha256", "forkImportId", "forkLabel", "threadId"]) report[key] = request[key];
@@ -2176,6 +2241,20 @@ export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null,
   if (!isCurrent(stored)) return { outcome: "unknown" };
   if (!unresolvedTask(stored)) {
     return { outcome: stored?.recovered ? stored.recovery?.turnStatus ?? stored.status : "unknown", result: stored?.result };
+  }
+  if (jobBackend(stored) === "antigravity") {
+    // ACP v1 has no exact-turn read/interrupt endpoint on a second connection.
+    // The live worker owns cancellation. Never send its session to Codex or
+    // infer success from a later session/load replay after a lost receipt.
+    const alive = processAlive(stored.pid);
+    const recovery = { status: alive ? "running" : "unknown", source: "antigravity-acp",
+      detail: alive ? "The Antigravity worker still owns the ACP connection; cancellation is handled by that worker."
+        : "The Antigravity worker exited without a confirmed turn result. ACP cannot recover this exact turn; inspect its log and Antigravity before retrying. The task has not been replayed." };
+    if (!alive && ACTIVE.has(stored.status) && stored.pid) {
+      stored = updateJob(workspaceRoot, stored.id, latest => isCurrent(latest) && unresolvedTask(latest) && !processAlive(latest.pid)
+        ? { status: "failed", phase: "failed", pid: null, completedAt: nowIso(), errorMessage: recovery.detail } : null);
+    }
+    return recordTurnResolution(workspaceRoot, stored, alive ? "in_progress" : "unknown", recovery, isCurrent);
   }
   // A queued launch without a PID is not evidence of a dead worker. Legacy
   // terminal records without turn handles must also retain their outcome.
@@ -2493,6 +2572,7 @@ function handleTaskResumeCandidate(argv) {
         ? null
         : {
             id: candidate.id,
+            ...(jobBackend(candidate) === "antigravity" ? { backend: "antigravity" } : {}),
             status: candidate.status,
             title: candidate.title ?? null,
             summary: candidate.summary ?? null,
@@ -2615,6 +2695,19 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
     }
     if (stored && !ACTIVE.has(stored.status) && !unresolvedTask(stored)) {
       reportOutcome(stored);
+      return;
+    }
+    if (stored && jobBackend(stored) === "antigravity") {
+      let current = requestCancel(snapshot.workspaceRoot, stored.id, "cancelled_by_user", { expect });
+      if (!current) { reportUnchanged(snapshot.workspaceRoot, stored); return; }
+      // The original stdio connection owns session/cancel. Loading a session
+      // into another process cannot safely interrupt that pending prompt.
+      for (const deadline = Date.now() + 6000; Date.now() < deadline && ACTIVE.has(current.status);) {
+        await sleep(100);
+        current = readStoredJob(snapshot.workspaceRoot, stored.id);
+      }
+      if (unresolvedTask(current)) await reconcileLostTurn(snapshot.workspaceRoot, current);
+      reportOutcome(readStoredJob(snapshot.workspaceRoot, stored.id));
       return;
     }
     // Save intent before handle discovery or an interrupt can race recovery.

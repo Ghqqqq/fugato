@@ -193,7 +193,7 @@ export function recordedThreadSettings(job) {
     if (write !== undefined) sandbox = write ? "workspace-write" : "read-only";
   }
   return { sandbox,
-    ...Object.fromEntries(["model", "effort", "serviceTier"].map(key => [key, sources.find(source => source[key] !== undefined)?.[key]])) };
+    ...Object.fromEntries(["backend", "model", "effort", "serviceTier"].map(key => [key, sources.find(source => source[key] !== undefined)?.[key]])) };
 }
 
 export function resolveThreadInheritance(cwd, threadId, { allowCrossSessionFallback = false } = {}) {

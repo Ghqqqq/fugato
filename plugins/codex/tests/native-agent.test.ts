@@ -2,10 +2,28 @@ import { test, expect, mock } from 'claude-code/testing';
 import { captures as recordedCaptures } from './native-captures.mjs';
 import { register as registerNative, logEntry, foldEntries, eventRow, logRows, proseRows, headerRow, statusRow, reportMarkdown, textWidth } from '../hooks/native-agent.mjs';
 import { cleanCommand } from '../hooks/command-display.mjs';
+import { PRESETS, applyPreset, isNativeType } from '../hooks/presets.mjs';
 
 const root = '/private/tmp/duet14-g-fixture';
 const TYPE = 'fugato:codex-native';
 const clone = (value: any) => JSON.parse(JSON.stringify(value));
+test('Gemini preset pins the backend and leaves model, thinking and sandbox to the runtime', () => {
+  const preset = PRESETS['fugato:gemini-native'];
+  expect(isNativeType('fugato:gemini-native')).toBe(true);
+  expect(applyPreset({ flags: [], brief: 'Complete the task.' }, preset)).toEqual({
+    flags: ['--backend', 'antigravity'], brief: 'Complete the task.'
+  });
+  expect(applyPreset({ flags: ['--effort', 'high', '--sandbox', 'read-only'], brief: 'Read.' }, preset).flags)
+    .toEqual(['--effort', 'high', '--sandbox', 'read-only', '--backend', 'antigravity']);
+  let code: string | undefined;
+  try { applyPreset({ flags: ['--backend', 'codex'], brief: 'Wrong backend.' }, preset); }
+  catch (error: any) { code = error.code; }
+  expect(code).toBe('native_preset_backend');
+  expect(logEntry('Antigravity: Checking the workspace.')).toEqual({ kind: 'message', title: 'Checking the workspace.' });
+  expect(logEntry('Antigravity worker Gemini started · job task-1')).toBe(null);
+  expect(logEntry('Open Antigravity activity: /fugato-live Gemini')).toBe(null);
+});
+
 test('command display follows every spec vector without changing shell words', () => {
   const vectors: [string, string, string, string?][] = [
     [String.raw`/bin/zsh -lc "rg -n --hidden -g '!native-captures.mjs' 'codex:|codex@fugato' plugins"`, 'rg', "-n --hidden -g '!native-captures.mjs' 'codex:|codex@fugato' plugins"],
@@ -189,11 +207,13 @@ test('report blocks preserve summary lines, ordered facts, colours and the sixty
   expect(JSON.stringify(report)).toBe(input);
   expect(reportMarkdown({ text: input, isSummary: true })).toBe(null);
 });
-// Migrate only the two captured usage labels; preserve the recorded execution.
+// Migrate captured display labels and the expanded flag help; preserve the
+// recorded execution, requests and lifecycle ordering.
 const captures = recordedCaptures.map(capture => {
   const started = capture.notices.find((notice: any) => notice.message.content[0].text.includes('started · job '));
   const model = started?.message.content[0].text.match(/ · ([^ ]+) \/ /)?.[1] ?? 'unknown';
   return JSON.parse(JSON.stringify(capture)
+    .replaceAll('Invalid DUET header. Allowed flags: --model,', 'Invalid DUET header. Allowed flags: --backend, --model,')
     .replaceAll('Codex usage · 150 input (40 cached) · 30 output tokens',
       `Codex tokens (provider: OpenAI Codex, model ${model}) · 150 input · 40 cached · 30 output · 180 total`)
     .replaceAll('Codex usage · 12,345 input (8,000 cached) · 678 output tokens',

@@ -114,6 +114,9 @@ export async function reconcileAutomaticTask(file, now, deadline) {
   };
   const job = read();
   if (!job || Date.now() >= deadline) return false;
+  // ACP has no exact-turn recovery API. Keep unknown Google outcomes intact;
+  // their session identifiers must never reach the Codex app-server.
+  if (job.request?.backend === "antigravity" || job.backend === "antigravity") return false;
   const { readAppServerTurn } = await import("./codex.mjs");
   const result = await readAppServerTurn(job.workspaceRoot, job, { env, deadline });
   // Unavailable/in-progress turns remain byte-for-byte unchanged. Do not let

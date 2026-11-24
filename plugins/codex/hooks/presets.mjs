@@ -1,7 +1,9 @@
 // Exact declared types, never a teammate's name from classic agent_type.
 export const AGENT_TYPE = 'fugato:codex-native';
+export const GEMINI_AGENT_TYPE = 'fugato:gemini-native';
 export const PRESETS = Object.freeze({
   [AGENT_TYPE]: Object.freeze({ rolePrompt: null, sandbox: null, speed: null }),
+  [GEMINI_AGENT_TYPE]: Object.freeze({ backend: 'antigravity', rolePrompt: null, sandbox: null, speed: null }),
   'fugato:codex-reviewer': Object.freeze({
     rolePrompt: 'Codex reviewer role: Review the assigned changes without modifying files. Prioritize actionable correctness, regression and security findings; cite file locations and explain impact. Report checks actually run and any review limits.',
     sandbox: 'read-only', speed: null
@@ -35,7 +37,13 @@ export function nativeIdentity({ declaredType, spawnType, bindingType, classicTy
 // settings alone. Presets constrain task flags, not the Claude shell model.
 export function applyPreset(parsed, preset, permissionMode) {
   if (!preset) return parsed;
-  const flags = [...parsed.flags], sandboxAt = flags.indexOf('--sandbox');
+  const flags = [...parsed.flags], sandboxAt = flags.indexOf('--sandbox'), backendAt = flags.indexOf('--backend');
+  if (backendAt >= 0 && preset.backend && flags[backendAt + 1] !== preset.backend) {
+    const error = new Error(`This worker requires the ${preset.backend} backend; a conflicting DUET header was refused.`);
+    error.code = 'native_preset_backend';
+    throw error;
+  }
+  if (backendAt < 0 && preset.backend) flags.push('--backend', preset.backend);
   if (sandboxAt >= 0 && preset.sandbox && flags[sandboxAt + 1] !== preset.sandbox) {
     const error = new Error(`This Codex role requires the ${preset.sandbox} sandbox; a conflicting DUET header was refused.`);
     error.code = 'native_preset_sandbox';

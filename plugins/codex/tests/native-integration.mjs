@@ -9,6 +9,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { installFakeCodex as generateFakeCodex } from '../../../tests/fake-codex-fixture.mjs';
+import { installFakeAntigravity } from '../../../tests/fake-antigravity-fixture.mjs';
 import { register } from '../hooks/register.mjs';
 import { AGENT_TYPE } from '../hooks/native-agent.mjs';
 import { AGENT_NAMES } from '../scripts/lib/agent-names.mjs';
@@ -1292,6 +1293,94 @@ test('native role presets dispatch and persist roles, sandbox ceilings and saved
     assert.equal(planned.status, 'completed');
     assert.equal(f.jobs().find(job => job.id === planned.jobId).request.sandbox, 'read-only');
   }
+});
+
+test('native Gemini worker dispatches ACP, keeps its backend on reload and omits Codex defaults', async () => {
+  const f = fixture('review-ok', 'gemini-worker');
+  const acp = installFakeAntigravity(`${f.root}/antigravity`, { behavior: 'worker-report' });
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  f.env.CODEX_COMPANION_BIN = `${f.root}/bin/unavailable-codex`;
+  const type = 'fugato:gemini-native';
+  const first = await f.turn('Check this assignment with Gemini.', 1, false, { agentType: type, effort: 'max' });
+  assert.equal(first.status, 'completed', JSON.stringify(first));
+  const initial = f.jobs().find(job => job.id === first.jobId);
+  assert.equal(initial.request.backend, 'antigravity');
+  assert.equal(initial.request.agentType, type);
+  const launch = f.capture.processes.find(record => record.kind === 'spawn' && record.request.argv[2] === 'task').request;
+  assert.equal(launch.argv[launch.argv.indexOf('--backend') + 1], 'antigravity');
+  assert.equal(launch.argv.includes('--effort'), false, 'Claude shell effort must not configure Gemini');
+  assert.equal(launch.argv.includes('--model'), false);
+  assert.equal(launch.argv.includes('--fast'), false);
+  assert.equal(launch.argv.includes('--sandbox'), false, 'The preset must not override a configured sandbox');
+  assert.equal(acp.requests().some(request => request.method === 'session/set_config_option'), false);
+  assert.equal(fs.existsSync(f.env.CODEX_FIXTURE_STATE_PATH), false, 'Codex must not run for a Gemini task');
+  assert.ok(!first.usage, 'ACP context occupation must not become per-turn token usage');
+  const notices = f.capture.notices.map(notice => notice.message.content[0].text).join('\n');
+  assert.match(notices, /Antigravity worker .* started/);
+  assert.doesNotMatch(notices, /provider: OpenAI Codex/);
+  f.reload();
+  const followup = await f.turn('DUET: --effort high\nContinue the same Gemini assignment.', 2, false, { wake: true });
+  assert.equal(followup.status, 'completed', JSON.stringify(followup));
+  const continued = f.jobs().find(job => job.id === followup.jobId);
+  assert.equal(continued.threadId, initial.threadId);
+  assert.equal(continued.request.backend, 'antigravity');
+  assert.equal(continued.request.agentType, type);
+  assert.equal(continued.request.effort, 'high');
+  assert.ok(acp.requests().some(request => request.method === 'session/load' && request.params.sessionId === initial.threadId));
+  assert.doesNotMatch(JSON.stringify(followup), /OLD REPLAY MUST BE EXCLUDED/);
+  const conflict = await f.turn('DUET: --backend codex\nChange this worker backend.', 3, false, { wake: true });
+  assert.equal(conflict.blockers[0].code, 'native_preset_backend');
+  assert.equal(f.jobs().length, 2);
+});
+
+test('native Gemini requests fail closed for plan mode, unknown backends and readonly sandboxes', async () => {
+  const f = fixture('review-ok', 'gemini-restrictions');
+  const type = 'fugato:gemini-native';
+  const planned = await f.turn('Investigate from plan mode.', 1, false, { agentType: type, permissionMode: 'plan' });
+  assert.equal(planned.blockers[0].code, 'native_plan_mode_read_only');
+  assert.equal(f.capture.processes.length, 0);
+  assert.equal(f.jobs().length, 0);
+  const invalid = await f.turn('DUET: --backend made-up\nReject an unknown backend.', 2, false, { agentType: type });
+  assert.equal(invalid.status, 'blocked');
+  assert.match(invalid.summary, /Invalid DUET header/);
+  assert.equal(f.jobs().length, 0);
+  const acp = installFakeAntigravity(`${f.root}/antigravity`);
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  const readonly = await f.turn('DUET: --sandbox read-only\nRequire an enforced read-only worker.', 3, false, { agentType: type });
+  assert.equal(readonly.status, 'blocked');
+  assert.equal(f.jobs().length, 0);
+  assert.equal(acp.state().launches.length, 0);
+});
+
+test('native Gemini permission answers and /tasks stop retain the ACP job binding', async () => {
+  const type = 'fugato:gemini-native';
+  const f = fixture('review-ok', 'gemini-approval');
+  const acp = installFakeAntigravity(`${f.root}/antigravity`, { behavior: 'permission' });
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  const question = await f.turn('Request permission for the fixture edit.', 1, false, { agentType: type });
+  assert.equal(question.status, 'needs_answer', JSON.stringify(question));
+  assert.equal(question.question.kind, 'action-approval');
+  assert.match(question.question.text, /Antigravity/);
+  f.reload();
+  const answer = await f.turn('Allow once', 2, false, { wake: true });
+  assert.equal(answer.status, 'completed', JSON.stringify(answer));
+  assert.equal(answer.jobId, question.jobId);
+  assert.equal(f.jobs().length, 1);
+  assert.deepEqual(acp.state().serverResponses.find(response => response.id === 'permission-1').result,
+    { outcome: { outcome: 'selected', optionId: 'allow-this' } });
+
+  const stopped = fixture('review-ok', 'gemini-stop');
+  const held = installFakeAntigravity(`${stopped.root}/antigravity`, { behavior: 'hold' });
+  stopped.env.FUGATO_ANTIGRAVITY_BIN = held.binary;
+  stopped.stopOnWait();
+  const report = await stopped.turn('Work until the owner stops this task.', 1, true, { agentType: type });
+  assert.ok(['interrupted', 'cancelled'].includes(report.status), JSON.stringify(report));
+  const job = await until(() => stopped.jobs().find(job => job.result?.interruptionConfirmed));
+  assert.equal(job.request.backend, 'antigravity');
+  assert.equal(job.result.interruptionConfirmed, true);
+  assert.equal(stopped.readStore()['native:v2:native-session:native-agent'].cancellation?.confirmation, 'confirmed');
+  assert.ok(held.requests().some(request => request.method === 'session/cancel' && request.params.sessionId === job.threadId));
+  assert.doesNotMatch(report.summary, /Codex turn/);
 });
 
 test('real companion: dispatch, completion and reload follow-up reuse the Codex thread/cwd without a model', async () => {
@@ -3673,7 +3762,7 @@ function replayCaptures() {
   if (captures.length === 8) {
     const source = '// Generated by native-integration.mjs from the real companion + fake Codex. Do not hand-edit.\n' +
       `export const captures = ${JSON.stringify(captures, null, 2)};\n`;
-    const root = fs.mkdtempSync('/private/tmp/duet14-native-replay-');
+    const root = fs.mkdtempSync(path.join(suiteRoot, 'native-replay-'));
     try {
       const copy = `${root}/plugins/codex`;
       fs.mkdirSync(`${copy}/.claude-plugin`, { recursive: true });

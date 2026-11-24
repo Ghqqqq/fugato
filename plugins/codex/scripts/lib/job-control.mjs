@@ -172,8 +172,8 @@ export function enrichJob(job, options = {}) {
       (event.type === "commandExecution" && event.exitCode === 0 ? " · exit 0" : ""), 300));
   const enriched = {
     ...visible,
-    model: job.model ?? job.request?.model ?? null,
-    effort: job.effort ?? job.request?.effort ?? null,
+    model: job.model ?? job.result?.model ?? job.request?.model ?? null,
+    effort: job.effort ?? job.result?.effort ?? job.request?.effort ?? null,
     sandbox: job.sandbox ?? job.request?.sandbox ?? null,
     kindLabel: getJobTypeLabel(job),
     ...leaseSnapshot(job), ...leaseExpiryReport(job),

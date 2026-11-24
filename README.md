@@ -38,6 +38,18 @@ For the live pane, add `/plugin install fugato-live@fugato`.
 Upgrading from Duet or Fugato 1.6.0? Your state carries over: see the
 [upgrade guide](docs/upgrading-from-duet.md).
 
+### Google Gemini workers
+
+Fugato also supports Google workers through an authenticated Antigravity CLI
+(`agy acp`). Run `fugato setup --backend antigravity` and
+`fugato models --backend antigravity`, then dispatch
+`Agent(subagent_type: "fugato:gemini-native", prompt: "<brief>")` or
+`fugato task --backend antigravity` with the brief on stdin.
+Google tasks use Antigravity's own tools and permission rules; this first version
+requires full-access execution and supports independent workers. The
+[Antigravity guide](docs/antigravity.md) covers setup, approvals, session
+continuation and the exact support boundaries.
+
 ## Quick start
 
 ```text
@@ -223,6 +235,7 @@ pane shows the posts as an index; press one to read it.
 | Topic | Page |
 | --- | --- |
 | Commands and CLI | [Commands](docs/commands.md) |
+| Google Gemini workers | [Antigravity ACP](docs/antigravity.md) |
 | Modes | [Ultra](docs/ultra-codex.md) · [Pair](docs/pair.md) · [Duel](docs/duel.md) · [Roundtable](docs/roundtable.md) |
 | Dispatch, reports, questions and recovery | [Direct mode](docs/direct-mode.md) · [Worker lifecycle](docs/worker-lifecycle.md) |
 | Settings, sandbox, browser and Computer Use | [Configuration](docs/configuration.md) · [Browser](docs/browser-approvals.md) · [Computer Use](docs/computer-use-approvals.md) |

@@ -234,7 +234,8 @@ export async function runTrackedJob(job, runner, options = {}) {
         const ownReason = execution.payload?.interruptionReason;
         const reason = ownReason ? null : current.cancelRequested?.reason;
         // Either stop still needs the cleanup a finished capture could not send.
-        if ((reason || ownReason) && job.jobClass === "task" && execution.threadId && !current.backgroundTerminals) {
+        if ((reason || ownReason) && job.jobClass === "task" && execution.threadId && !current.backgroundTerminals &&
+            current.request?.backend !== "antigravity" && current.backend !== "antigravity") {
           cleanupThread = execution.threadId;
           return null;
         }
@@ -243,7 +244,8 @@ export async function runTrackedJob(job, runner, options = {}) {
           execution.jobStatus = completionStatus;
           execution.exitStatus = 1;
           Object.assign(execution.payload, { status: 1, workerStatus: completionStatus,
-            interruptionReason: reason, interruptionConfirmed: Boolean(execution.payload.turnEnded) });
+            interruptionReason: reason, interruptionConfirmed: current.request?.backend === "antigravity"
+              ? execution.payload.interruptionConfirmed === true : Boolean(execution.payload.turnEnded) });
           if (execution.report) Object.assign(execution.report, { status: completionStatus, interruptionReason: reason,
             interruptionConfirmed: execution.payload.interruptionConfirmed }, continuationReport({ ...current, threadId: execution.threadId }),
             leaseExpiryReport({ ...current, result: execution.payload }));
