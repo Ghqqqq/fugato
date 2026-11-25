@@ -2,6 +2,7 @@
 
 import { spawnDetached } from "./lib/process.mjs";
 import { createRoom, readRoom, listRooms, assertChair, roundtableStatus, postEvent, readIndex, readThread, readResource, pending, ack, setStatus, updateMember, validateMember, renderForum, renderRoundtableStatus, renderAttention } from "./lib/forum.mjs";
+import * as forumModule from "./lib/forum.mjs";
 import { resolveRoster, personaInstructions, CHAIR_CARD, INTENSITIES, PERSONA_IDS } from "./lib/roundtable-personas.mjs";
 import { closeMemberWorkspaces } from "./lib/roundtable-workspaces.mjs";
 import { effectiveRoleTable, readPersonaModels, roleModelsSetup } from "./lib/setup-config.mjs";
@@ -183,7 +184,7 @@ Read the brief only from stdin; implies --direct. Fresh unless --to/--thread/--c
   --backend <codex|antigravity>  Worker runtime (default codex). Follow-ups inherit it; sessions cannot switch backends.
     Antigravity uses agy acp and its own login. Discover Google models with fugato models --backend antigravity.
     Google model/thinking defaults come from ACP, and permission requests go to the parent for Allow once/Deny.
-    Supports danger-full-access only; Codex sandbox/permission mapping, fork, fast tier, roundtable,
+    Supports danger-full-access only; Codex sandbox/permission mapping, fork, fast tier,
     browser/Computer Use grants and token budgets are unavailable. Use --max-minutes for a time budget.
   --help, -h  Show help without starting anything; unknown task flags are errors.
   --name <label>  Prefer this worker name on a fresh thread; follow-ups keep their name.
@@ -1194,7 +1195,7 @@ async function executeTaskRun(request) {
     claudeMd: request.claudeMd,
     skills: request.skills,
     resumeThreadId,
-    prompt: withGitContext(request.gitContext, request.report ? `${request.prompt || DEFAULT_CONTINUE_PROMPT}\n\n${loadPromptTemplate(ROOT_DIR, "worker-task")}` : request.prompt || (resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "")),
+    prompt: withGitContext(request.gitContext, request.report ? `${request.prompt || DEFAULT_CONTINUE_PROMPT}\n\n${backend === "antigravity" ? loadPromptTemplate(ROOT_DIR, "worker-task").replace("under the duet_parent MCP server", "under the parent-bridge MCP server") : loadPromptTemplate(ROOT_DIR, "worker-task")}` : request.prompt || (resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "")),
     outputSchema: request.report ? readOutputSchema(WORKER_REPORT_SCHEMA) : null,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
@@ -1804,7 +1805,7 @@ function checkLivePermission(options, workspaceRoot, job) {
   }
 }
 
-function antigravityTaskSettings(options, previous, recorded) {
+export function antigravityTaskSettings(options, previous, recorded, seat = null) {
   const settings = {};
   const defaults = [
     ["model", "selectedModel", ANTIGRAVITY_DEFAULT_MODEL],
@@ -1812,13 +1813,42 @@ function antigravityTaskSettings(options, previous, recorded) {
   ];
   for (const [key, selectedKey, fallback] of defaults) {
     const actual = previous?.result?.[key] ?? previous?.[selectedKey];
-    const inherited = actual ?? recorded[key];
+    const seatValue = seat?.[key];
+    const inherited = actual ?? seatValue ?? recorded[key];
     const marker = key + "Default";
     settings[key] = acpSetting(options[key] ?? inherited ?? fallback, key);
     // A continued job may have ended before ACP applied its default request.
-    if (options[key] === undefined && actual == null && (inherited == null || previous?.request?.[marker])) settings[marker] = true;
+    // A seat value never sets the backend fallback marker.
+    if (options[key] === undefined && actual == null && seatValue == null && (recorded[key] == null || previous?.request?.[marker])) settings[marker] = true;
   }
   return settings;
+}
+
+function releaseSeatClaim(roomId, persona, { claimedAt }) {
+  if (typeof forumModule.releaseMemberClaim === "function") {
+    return forumModule.releaseMemberClaim(roomId, persona, { claimedAt });
+  }
+  return { released: false };
+}
+
+function withMemberClaim(roundtable, threadId, action) {
+  let claimedAt = roundtable && !threadId
+    ? updateMember(roundtable.roomId, roundtable.persona, { claim: true })?.claimedAt ?? null
+    : null;
+  const release = () => {
+    if (!claimedAt) return;
+    const at = claimedAt;
+    claimedAt = null;
+    try { releaseSeatClaim(roundtable.roomId, roundtable.persona, { claimedAt: at }); } catch { /* preserve original error */ }
+  };
+  try {
+    const result = action({ release });
+    claimedAt = null;
+    return result;
+  } catch (error) {
+    release();
+    throw error;
+  }
 }
 
 async function handleTask(argv) {
@@ -1837,6 +1867,8 @@ async function handleTask(argv) {
   if (declaredAgentType === "fugato:gemini-native") {
     if (options.backend !== undefined && options.backend !== "antigravity") throw new Error("The Gemini native worker requires --backend antigravity.");
     options.backend = "antigravity";
+  } else if (declaredAgentType !== undefined && options.backend === "antigravity") {
+    throw new Error(`The ${declaredAgentType} worker requires --backend codex; dispatch fugato:gemini-native for Antigravity.`);
   }
   const budgetDefaults = budgetDefaultsSetup();
   const budget = newJobBudget(
@@ -1975,8 +2007,14 @@ async function handleTask(argv) {
       (!previousRoundtable || previousRoundtable.roomId !== roundtable.roomId || previousRoundtable.persona !== roundtable.persona)) {
     throw new Error("A resumed thread keeps its original roundtable/persona binding; start a fresh thread to seat a new member.");
   }
-  if (backend === "antigravity" && roundtable) throw new Error("Antigravity roundtable personas are not supported yet. Dispatch independent Gemini workers with --backend antigravity.");
   const seating = roundtable ? validateMember(roundtable.roomId, roundtable.persona, getCurrentClaudeSessionId()) : null;
+  if (seating) {
+    const seatBackend = seating.member.backend ?? backendForModel(seating.member.model);
+    if (seatBackend !== backend) {
+      const agent = seatBackend === "antigravity" ? "fugato:gemini-native" : "fugato:codex-native";
+      throw new Error(`Roundtable member ${roundtable.persona} runs on ${seatBackend}; dispatch ${agent} (use --backend ${seatBackend}).`);
+    }
+  }
   if (seating?.member.threadId && seating.member.threadId !== (continued?.threadId ?? options.thread)) throw new Error("Roundtable member already has a thread; continue that thread with --to or --thread.");
   // Member activity always journals to the room's run, never the session's
   // current active run; a room without a run journals nowhere.
@@ -1990,10 +2028,17 @@ async function handleTask(argv) {
     }
   }
   const defaults = backend === "codex" ? readWorkerDefaults() : {};
-  const settings = backend === "antigravity" ? antigravityTaskSettings(options, sourceJob, recordedSettings) : {
+  const settings = backend === "antigravity" ? antigravityTaskSettings(options, sourceJob, recordedSettings, seating?.member) : {
     model: normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model,
     effort: normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort
   };
+  if (settings.model && backendForModel(settings.model) !== backend) {
+    const modelBackend = backendForModel(settings.model);
+    const agent = modelBackend === "codex" ? "fugato:codex-native" : "fugato:gemini-native";
+    throw new Error(backend === "antigravity"
+      ? `Antigravity supports only Gemini models (gemini-*). Cannot select '${settings.model}'; dispatch ${agent} for Codex models.`
+      : `Model ${settings.model} runs on ${modelBackend}. Dispatch ${agent} or select a model for the ${backend} backend.`);
+  }
   if (options.role !== undefined) settings.role = options.role;
   if (options["high-stakes"]) settings.highStakes = true;
   if (options.fast && options.normal) throw new Error("Choose either --fast or --normal.");
@@ -2036,11 +2081,11 @@ async function handleTask(argv) {
   const permissionPolicy = taskPermissionPolicy(options, cwd, previousRequest?.permissionPolicy);
   if (permissionPolicy) sandbox = permissionPolicy.sandbox;
   if (backend === "antigravity") {
-    validateAntigravityTask({ options, sandbox, permissionPolicy, budget, roundtable });
+    validateAntigravityTask({ options, sandbox, permissionPolicy, budget });
     if (permissionMappingSetup().permissionMapping === "claude") throw new Error("Antigravity ACP does not support Claude permission mapping. Use a Codex worker while permission mapping is enabled.");
   }
   write = sandbox !== "read-only";
-  const agentType = contextRequest?.agentType ?? declaredAgentType ?? (nativeAgentName ? "fugato:codex-native" : null);
+  const agentType = contextRequest?.agentType ?? declaredAgentType ?? (nativeAgentName ? (backend === "antigravity" ? "fugato:gemini-native" : "fugato:codex-native") : null);
   const skillContext = threadId ? { skills: contextRequest?.skills ?? [], text: "" } : prepareClaudeSkills({ agentType, cwd });
   const memoryContext = threadId ? { agentMemory: contextRequest?.agentMemory ?? { enabled: false }, text: "" }
     : prepareAgentMemory({ workspace: workspaceRoot, role: agentType ?? "worker" });
@@ -2094,36 +2139,26 @@ async function handleTask(argv) {
     if (backend === "antigravity") ensureAntigravityAvailable(cwd);
     else ensureCodexAvailable(cwd);
 
-    if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
-    if (job.dispatchReused) {
+    const { job, request, reused } = withMemberClaim(roundtable, threadId, ({ release }) => {
+      const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
+      if (job.dispatchReused) { release(); return { job, request: null, reused: true }; }
+      if (options.direct) job.direct = true;
+      const request = buildTaskRequest({
+        ...claudeInstructions, budget, permissionPolicy, cwd, backend, settings, serviceTier, prompt, write, sandbox,
+        approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id,
+        report: Boolean(options.report || options.detached || options.follow || options.direct), detached: true
+      });
+      if (continued) request.continuedFrom = continued.id;
+      if (options.run !== undefined) request.run = options.run;
+      if (inheritance?.details) request.settingsInheritance = inheritance.details;
+      Object.assign(request, forkRequest);
+      if (roundtable) updateMember(roundtable.roomId, roundtable.persona, { status: "active", jobIds: [job.id], ...(threadId ? { threadId } : {}) });
+      return { job, request, reused: false };
+    });
+    if (reused) {
       await waitForJob(workspaceRoot, job, { owner: job.ownerId, timeoutSec: options["timeout-sec"], direct: true, quiet: options.quiet, toolUseId: dispatchToolUseId });
       return;
     }
-    if (options.direct) job.direct = true;
-    const request = buildTaskRequest({
-      ...claudeInstructions,
-      budget,
-      permissionPolicy,
-      cwd,
-      backend,
-      settings,
-      serviceTier,
-      prompt,
-      write,
-      sandbox,
-      approvedBrowserOrigins,
-      approvedComputerApps,
-      resumeLast,
-      threadId,
-      jobId: job.id,
-      report: Boolean(options.report || options.detached || options.follow || options.direct), detached: true
-    });
-    if (continued) request.continuedFrom = continued.id;
-    if (options.run !== undefined) request.run = options.run;
-    if (inheritance?.details) request.settingsInheritance = inheritance.details;
-    Object.assign(request, forkRequest);
-    if (roundtable) updateMember(roundtable.roomId, roundtable.persona, { status: "active", jobIds: [job.id], ...(threadId ? { threadId } : {}) });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     if (options.follow || options.direct) {
       // Native-like single call: submit, then stay attached as the owner until the
@@ -2146,13 +2181,15 @@ async function handleTask(argv) {
     return;
   }
 
-  if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
-  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, settings, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
-  if (options.run !== undefined) job.request.run = options.run;
-  if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
-  Object.assign(job.request, forkRequest);
-  if (roundtable) updateMember(roundtable.roomId, roundtable.persona, { status: "active", jobIds: [job.id], ...(threadId ? { threadId } : {}) });
+  const job = withMemberClaim(roundtable, threadId, () => {
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
+    job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, settings, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
+    if (options.run !== undefined) job.request.run = options.run;
+    if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
+    Object.assign(job.request, forkRequest);
+    if (roundtable) updateMember(roundtable.roomId, roundtable.persona, { status: "active", jobIds: [job.id], ...(threadId ? { threadId } : {}) });
+    return job;
+  });
   await runForegroundCommand(
     job,
     (progress) =>
@@ -3507,6 +3544,39 @@ function roundtableOptions(options, allowed, command) {
   for (const key of Object.keys(options)) if (!["json", "session", ...allowed].includes(key)) throw new Error(`${command} does not accept --${key}.`);
 }
 
+const GEMINI_SEAT_EFFORTS = ["low", "medium", "high", "xhigh"];
+function normalizeSeatEffort(effort, backend) {
+  if (backend !== "antigravity") return normalizeReasoningEffort(effort);
+  if (effort == null) return null;
+  const normalized = String(effort).trim().toLowerCase();
+  if (!normalized) return null;
+  if (!GEMINI_SEAT_EFFORTS.includes(normalized)) {
+    throw new Error(`Invalid Gemini effort "${effort}". Use ${GEMINI_SEAT_EFFORTS.join(", ")}.`);
+  }
+  return normalized;
+}
+export function validateRoundtableSeats(members, { cwd = process.cwd(), env = process.env } = {}) {
+  const geminiSeats = members.filter(member => (member.backend ?? backendForModel(member.model)) === "antigravity").map(member => member.persona);
+  if (!geminiSeats.length) return;
+  const list = geminiSeats.join(", ");
+  if (!resolveAntigravityExecutable(cwd, env)) {
+    throw new Error(`Gemini roundtable seats (${list}) require the Antigravity CLI (agy). Install agy, set FUGATO_ANTIGRAVITY_BIN, or choose Codex models for those seats.`);
+  }
+  if (permissionMappingSetup({ env }).permissionMapping === "claude") {
+    throw new Error(`Gemini roundtable seats (${list}) cannot run while Claude permission mapping is enabled (setup --permission-mapping claude). Disable permission mapping or choose Codex models for those seats.`);
+  }
+}
+export function formatRoundtableStartMembers(roomId, members) {
+  return members.map(({ persona, name, model, effort, backend, workspace }) => {
+    const seatBackend = backend ?? backendForModel(model);
+    const agentType = seatBackend === "antigravity" ? "fugato:gemini-native" : "fugato:codex-native";
+    const header = seatBackend === "antigravity"
+      ? `DUET: --backend antigravity --model ${model} --effort ${effort} --roundtable ${roomId} --persona ${persona} --cwd ${JSON.stringify(workspace.path)}`
+      : `DUET: --model ${model} --effort ${effort} --normal --roundtable ${roomId} --persona ${persona} --cwd ${JSON.stringify(workspace.path)}`;
+    return { persona, name, model, effort, backend: seatBackend, agentType, workspace, header };
+  });
+}
+
 // Room operations are separate from the orchestration-mode on/off handler.
 async function handleRoundtable(argv) {
   const { options, positionals } = parseCommandInput(argv, COMMAND_OPTIONS.roundtable);
@@ -3517,35 +3587,47 @@ async function handleRoundtable(argv) {
   roundtableOptions(options, action === "start" ? ["intensity", "roles", "run", "cwd", "persona-model", "high-stakes"]
     : action === "close" ? ["title", "label", "selects", "unreviewed"] : [], `roundtable ${action}`);
   if (action === "start") {
-    const cwd = resolveCommandWorkspace(options), overrides = {};
+    const requestCwd = resolveCommandCwd(options), cwd = resolveWorkspaceRoot(requestCwd), overrides = {};
     for (const value of options["persona-model"] ?? []) {
       const match = /^([^=]+)=(.+)$/.exec(value);
       if (!match || !PERSONA_IDS.includes(match[1])) throw new Error("--persona-model needs a known persona=model[:effort].");
       const [, persona, setting] = match, separator = setting.lastIndexOf(":");
       const suffix = separator < 0 ? null : setting.slice(separator + 1);
       const hasEffort = suffix !== null;
-      if (hasEffort && (!suffix || !isSupportedReasoningEffort(suffix))) throw new Error("Invalid persona effort.");
       const model = normalizeRequestedModel(hasEffort ? setting.slice(0, separator) : setting);
       if (!model || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(model)) throw new Error("Invalid persona model.");
+      const seatBackend = backendForModel(model);
+      let effort;
+      if (hasEffort) {
+        const trimmed = suffix.trim().toLowerCase();
+        if (!trimmed || (seatBackend === "antigravity" ? !GEMINI_SEAT_EFFORTS.includes(trimmed) : !isSupportedReasoningEffort(trimmed))) {
+          throw new Error(seatBackend === "antigravity"
+            ? `Invalid Gemini effort for ${persona}: ${suffix}. Use ${GEMINI_SEAT_EFFORTS.join(", ")}.`
+            : "Invalid persona effort.");
+        }
+        effort = trimmed;
+      }
       if (Object.hasOwn(overrides, persona)) throw new Error(`Duplicate --persona-model for ${persona}.`);
-      overrides[persona] = { model, ...(hasEffort ? { effort: normalizeReasoningEffort(suffix) } : {}) };
+      overrides[persona] = { model, ...(hasEffort ? { effort } : {}) };
     }
     const intensity = options.intensity ?? "standard";
     const roles = options.roles?.split(",").map(id => id.trim()) ?? INTENSITIES[intensity]?.roster ?? [];
     const warnings = [];
     const mapping = readPersonaModels(process.env, { ids: roles, warnings });
     for (const warning of warnings) process.stderr.write(`${warning}\n`);
-    const roleModels = Object.fromEntries(effectiveRoleTable({ cwd }).roles.map(row => [row.id, row.fallback?.model ?? row.model]));
+    const roleModels = Object.fromEntries(effectiveRoleTable({ cwd: requestCwd }).roles.map(row => [row.id, row.fallback?.model ?? row.model]));
     const members = resolveRoster({ intensity, roles, mapping, overrides, roleModels, highStakes: options["high-stakes"] });
     for (const member of members) {
       member.model = normalizeRequestedModel(member.model);
-      member.effort = normalizeReasoningEffort(member.effort);
+      const seatBackend = member.backend ?? backendForModel(member.model);
+      member.backend = seatBackend;
+      member.effort = normalizeSeatEffort(member.effort, seatBackend);
       if (!member.model || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(member.model) || !member.effort) throw new Error(`Invalid saved model/effort for ${member.persona}.`);
     }
+    validateRoundtableSeats(members, { cwd: requestCwd });
     const runId = options.run === undefined ? readActiveRun(cwd, sessionId)?.runId ?? null : validateTaskRun(cwd, options.run)?.runId ?? null;
     const room = createRoom({ sessionId, workspaceRoot: cwd, goal: readStdinIfPiped(), intensity, members, runId });
-    const payload = { roomId: room.roomId, runId, intensity, members: room.members.map(({ persona, name, model, effort, workspace }) => ({ persona, name, model, effort, workspace,
-      header: `DUET: --model ${model} --effort ${effort} --normal --roundtable ${room.roomId} --persona ${persona} --cwd ${JSON.stringify(workspace.path)}` })), chairCard: CHAIR_CARD };
+    const payload = { roomId: room.roomId, runId, intensity, members: formatRoundtableStartMembers(room.roomId, room.members), chairCard: CHAIR_CARD };
     outputCommandResult(payload, `${JSON.stringify(payload, null, 2)}\n`, options.json);
     return;
   }

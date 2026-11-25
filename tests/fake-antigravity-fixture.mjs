@@ -4,14 +4,14 @@ import path from "node:path";
 // A real stdio peer exercises framing, bidirectional requests and process
 // ownership without installing agy or touching the user's Google credentials.
 export function installFakeAntigravity(directory, options = {}) {
-  const { behavior = "normal", version = "1.5.16", serverRequests = [], turnUpdates = null, loadPermission, promptUsage,
+  const { behavior = "normal", version = "1.5.16", serverRequests = [], mcpPermissionRequests = [], turnUpdates = null, loadPermission, promptUsage,
     modelIds, currentModel, currentEffort, sessionGate, promptGate } = typeof options === "string" ? { behavior: options } : options;
   fs.mkdirSync(directory, { recursive: true });
   const statePath = path.join(directory, "antigravity-state.json");
   const script = path.join(directory, "fake-agy.mjs");
   fs.writeFileSync(statePath, JSON.stringify({ requests: [], serverResponses: [], sessions: [], launches: [], nextSession: 1 }));
-  const config = { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage, modelIds, currentModel, currentEffort, sessionGate, promptGate };
-  fs.writeFileSync(script, `#!${process.execPath}\nconst { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage, modelIds, currentModel, currentEffort, sessionGate, promptGate } = ${JSON.stringify(config)};\n` + String.raw`
+  const config = { statePath, behavior, version, serverRequests, mcpPermissionRequests, turnUpdates, loadPermission, promptUsage, modelIds, currentModel, currentEffort, sessionGate, promptGate };
+  fs.writeFileSync(script, `#!${process.execPath}\nconst { statePath, behavior, version, serverRequests, mcpPermissionRequests, turnUpdates, loadPermission, promptUsage, modelIds, currentModel, currentEffort, sessionGate, promptGate } = ${JSON.stringify(config)};\n` + String.raw`
 import fs from "node:fs";
 import readline from "node:readline";
 const read = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -52,7 +52,7 @@ const modelId = behavior === "dynamic-selectors" ? "selected-model" : "model";
 const thoughtId = behavior === "dynamic-selectors" ? "reasoning-choice" : "thought_level";
 let sessionId = null, model = currentModel ?? (["non-gemini-default", "no-gemini"].includes(behavior) ? otherModels[0].value : geminiModels[0].value);
 let thought = currentEffort ?? "high", promptRequest = null, thinkingOverride = null;
-let scriptedReplies = 0;
+let scriptedReplies = 0, mcpServers = [], activeMcpCalls = new Map();
 let pendingLoad = null;
 const configs = () => [
   { id: modelId, category: "model", name: "Model", type: "select", currentValue: model,
@@ -118,6 +118,15 @@ input.on("line", line => {
   if (!message.method) {
     save(value => value.serverResponses.push(message));
     if (message.id === "load-permission") { sessionReply(pendingLoad, true); return; }
+    if (activeMcpCalls.has(message.id)) {
+      const call = activeMcpCalls.get(message.id);
+      activeMcpCalls.delete(message.id);
+      const approved = message.result?.outcome?.outcome === "selected" && message.result.outcome.optionId === "allow";
+      update({ ...call, sessionUpdate: "tool_call_update", status: approved ? "in_progress" : "failed" });
+      if (approved) update({ ...call, sessionUpdate: "tool_call_update", status: "completed" });
+      if (++scriptedReplies === mcpPermissionRequests.length) finish();
+      return;
+    }
     if (serverRequests.length) {
       if (++scriptedReplies === serverRequests.length) finish();
     } else if (message.id === "1" && behavior !== "permission-cancel") finish();
@@ -134,12 +143,14 @@ input.on("line", line => {
       break;
     case "session/new": {
       if (behavior === "auth-required") { send({ id: message.id, error: { code: -32000, message: "Authentication required" } }); break; }
+      mcpServers = Array.isArray(message.params?.mcpServers) ? message.params.mcpServers : [];
       save(value => { sessionId = "agy-session-" + value.nextSession++; value.sessions.push({ sessionId, cwd: message.params.cwd }); });
       sessionReply(message.id);
       break;
     }
     case "session/load":
       sessionId = message.params.sessionId;
+      mcpServers = Array.isArray(message.params?.mcpServers) ? message.params.mcpServers : [];
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OLD REPLAY MUST BE EXCLUDED" } });
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "OLD REASONING" } });
       update({ sessionUpdate: "tool_call", toolCallId: "old-command", name: "run_command", kind: "execute", title: "false", status: "completed", rawInput: { CommandLine: "false" }, args: { CommandLine: "false" } });
@@ -165,6 +176,30 @@ input.on("line", line => {
     }
     case "session/prompt":
       promptRequest = message;
+      if (mcpPermissionRequests.length) {
+        const serverName = mcpServers[0]?.name ?? "duet_parent";
+        mcpPermissionRequests.forEach((entry, index) => {
+          const reqId = String(index + 1);
+          const name = entry.name ?? ("mcp_" + (entry.server ?? serverName) + "_" + entry.tool + (entry.nameSuffix ?? ""));
+          const rawInput = Object.hasOwn(entry, "rawInput") ? entry.rawInput : { toolSummary: "Run " + (entry.tool ?? name) };
+          const args = Object.hasOwn(entry, "args") ? entry.args : rawInput;
+          const toolCallId = entry.toolCallId ?? ("call_mcp_" + (index + 1));
+          const base = {
+            toolCallId, name, args, kind: entry.kind ?? "other", title: entry.title ?? ("Run " + name), rawInput,
+            ...(entry.locations !== undefined ? { locations: entry.locations } : {}),
+            ...(entry.content !== undefined ? { content: entry.content } : {})
+          };
+          const options = entry.options ?? [
+            { optionId: "allow", name: "Allow", kind: "allow_once" },
+            { optionId: "deny", name: "Deny", kind: "reject_once" }
+          ];
+          activeMcpCalls.set(reqId, base);
+          update({ sessionUpdate: "tool_call", ...base, status: "in_progress" });
+          update({ sessionUpdate: "tool_call_update", ...base, status: "pending" });
+          send({ id: reqId, method: "session/request_permission", params: { sessionId, toolCall: { sessionUpdate: "tool_call", ...base, status: "pending" }, options } });
+        });
+        break;
+      }
       if (serverRequests.length) {
         serverRequests.forEach(({ method, params, beforeUpdates = [], afterUpdates = [] }, index) => {
           for (const frame of beforeUpdates) update(frame);
