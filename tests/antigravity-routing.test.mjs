@@ -11,7 +11,7 @@ const { fixture, json, patchJob } = await lifecycleHarness();
 
 function mixedFixture() {
   const f = fixture("review-ok");
-  const acp = installFakeAntigravity(f.dir);
+  const acp = installFakeAntigravity(f.dir, { version: "1.5.15" });
   f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
   const stateDir = resolveStateDir(f.repo, f.env);
   const stored = id => JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${id}.json`)));
@@ -40,27 +40,87 @@ test("resume-last and rescue select the latest task on the requested backend", (
   assert.equal(f.acp.requests().find(message => message.method === "session/load").params.sessionId, gemini.threadId);
 });
 
-test("an exact --to job supplies the backend and settings when another provider shares its handle", () => {
+test("an exact --to job selects its backend when another provider shares its handle", () => {
   const f = mixedFixture();
   const codex = f.task("--sandbox", "read-only", "--model", "gpt-5.4", "--effort", "low");
-  f.task("--to", codex.id, "--sandbox", "workspace-write", "--effort", "medium");
-  const gemini = f.task("--backend", "antigravity", "--model", "fixture-gemini", "--effort", "high");
-  const follow = original => {
+  const latestCodex = f.task("--to", codex.id, "--sandbox", "workspace-write", "--effort", "medium");
+  const gemini = f.task("--backend", "antigravity", "--model", "gemini-4-neon", "--effort", "high");
+  const follow = (original, latest) => {
     const job = f.task("--to", original.id);
-    assert.equal(job.request.settingsInheritance.jobId, original.id);
-    assert.equal(job.followUpOf, original.id);
+    assert.equal(job.request.settingsInheritance.jobId, latest.id);
+    assert.equal(job.followUpOf, latest.id);
     assert.equal(job.threadId, original.threadId);
-    for (const key of ["backend", "sandbox", "model", "effort"]) assert.equal(job.request[key], original.request[key], key);
+    for (const key of ["backend", "sandbox", "model", "effort"]) assert.equal(job.request[key], latest.request[key], key);
     return job;
   };
   // Point only the newer, distracting record at the target provider's real session.
   patchJob(f, gemini.id, { threadId: codex.threadId });
-  const newerCodex = follow(codex);
+  const newerCodex = follow(codex, latestCodex);
   patchJob(f, gemini.id, { threadId: gemini.threadId });
   patchJob(f, newerCodex.id, { threadId: gemini.threadId });
-  follow(gemini);
+  follow(gemini, gemini);
   assert.equal(f.state().lastThreadResume.threadId, codex.threadId);
   assert.equal(f.acp.requests().find(message => message.method === "session/load").params.sessionId, gemini.threadId);
+});
+
+test("an older Codex --to job inherits settings and grants from the newest eligible attempt", () => {
+  const f = mixedFixture();
+  const older = f.task("--sandbox", "danger-full-access", "--model", "gpt-5.4",
+    "--approve-browser-origin", "https://older.example", "--approve-computer-app", "com.example.Older");
+  const latest = f.task("--thread", older.threadId, "--sandbox", "read-only", "--model", "spark",
+    "--approve-browser-origin", "https://latest.example", "--approve-computer-app", "com.example.Latest");
+  const follow = f.task("--to", older.id);
+  for (const key of ["sandbox", "model", "approvedBrowserOrigins", "approvedComputerApps"]) {
+    assert.notDeepEqual(older.request[key], latest.request[key], key);
+    assert.deepEqual(follow.request[key], latest.request[key], key);
+  }
+  assert.equal(follow.followUpOf, latest.id);
+  assert.deepEqual(follow.request.settingsInheritance, { jobId: latest.id, scope: "session",
+    settingsInherited: true, requestGrantsInherited: true,
+    note: "Inherited settings and recorded request grants from this session's job; runtime-only grants were excluded." });
+});
+
+test("continuing a legacy Codex job gets missing instructions, agent type and skills from its thread", () => {
+  const f = mixedFixture();
+  const legacy = f.task("--sandbox", "read-only");
+  const latest = f.task("--thread", legacy.threadId, "--sandbox", "workspace-write");
+  const context = { developerInstructions: "Preserve the fixture schema.", agentType: "fugato:codex-investigator",
+    skills: [{ name: "inspect-schema", path: path.join(f.repo, "skills", "inspect-schema", "SKILL.md") }] };
+  patchJob(f, legacy.id, { request: null });
+  patchJob(f, latest.id, { request: { ...latest.request, ...context } });
+  const gemini = f.task("--backend", "antigravity");
+  patchJob(f, gemini.id, { threadId: legacy.threadId });
+  const follow = f.task("--continue", legacy.id);
+  assert.equal(follow.request.settingsInheritance.jobId, legacy.id);
+  assert.equal(follow.request.sandbox, legacy.request.sandbox);
+  for (const [key, value] of Object.entries(context)) assert.deepEqual(follow.request[key], value, key);
+});
+
+test("Codex continuation reports the original session scope and inheritance details", () => {
+  const f = mixedFixture();
+  const neverStarted = { status: "failed", turnId: null, turnSubmission: null, report: null,
+    result: { turnStatus: "notStarted", turnEnded: true } };
+  const granted = "Inherited settings and recorded request grants from this session's job; runtime-only grants were excluded.";
+  const excluded = "Inherited settings from the continued job; no request grants recorded in this session were inherited.";
+  const check = (follow, expected) => assert.equal(JSON.stringify(follow.request.settingsInheritance), JSON.stringify(expected));
+
+  f.env.CODEX_COMPANION_SESSION_ID = "";
+  const sessionless = f.task();
+  check(f.task("--continue", sessionless.id), { jobId: sessionless.id, scope: "session",
+    settingsInherited: true, requestGrantsInherited: true, note: granted });
+
+  f.env.CODEX_COMPANION_SESSION_ID = "foreign-session";
+  const foreign = f.task();
+  f.env.CODEX_COMPANION_SESSION_ID = "local-session";
+  const refused = f.task("--thread", foreign.threadId);
+  patchJob(f, refused.id, neverStarted);
+  check(f.task("--continue", refused.id), { jobId: foreign.id, scope: "workspace",
+    settingsInherited: true, requestGrantsInherited: false, note: excluded });
+
+  const alone = f.task();
+  patchJob(f, alone.id, neverStarted);
+  check(f.task("--continue", alone.id, "--sandbox", "read-only"), { jobId: null, scope: "workspace",
+    settingsInherited: false, requestGrantsInherited: false, note: excluded });
 });
 
 test("continuing a never-submitted ACP job loads its recorded Antigravity session", () => {
