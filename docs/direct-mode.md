@@ -28,19 +28,24 @@ The function hook runs Codex and returns its report through the native agent
 completion. An optional first prompt line sets Codex options:
 
 ```text
-DUET: --model gpt-6-astra --effort xhigh --sandbox read-only --normal
+DUET: --role investigate --sandbox read-only --normal
 <brief: objective, context, owned paths, constraints, acceptance criteria>
 ```
 
 The header also accepts `--cwd`, `--fork`, `--max-minutes` and `--max-tokens`.
 A `--cwd <repo>/sub` starts or resumes
 the Codex thread in that subdirectory; broker and job state stay at the repository
-root. Set the Codex model in the header:
-the Agent tool's `model` only selects the Claude shell. Initial-task effort
-precedence is `DUET: --effort` > explicitly supplied Agent
-`effort` (including `max`) > companion default. The shell definition's
-`effort: low` is not a Codex request; follow-ups retain recorded thread settings
-unless overridden. Native calls can be foreground or background.
+root. On a fresh dispatch, `--role <id>` supplies the model and effort, and
+`--high-stakes` fixes them to `gpt-6.2-astra` / `xhigh`. Explicit user
+model or effort choices override the role fields and conflict with
+`--high-stakes`. Agent-tool effort is omitted when either role flag
+is present, and the Agent tool's `model` selects the Claude shell. Without
+role flags, header effort takes precedence over explicitly supplied Agent
+effort, then the companion default. Follow-ups inherit recorded settings.
+Follow-ups, `--to`, `--thread`, `--resume`, `--resume-last`,
+`--continue`, `--fork` and roundtable seats refuse both role flags.
+Native calls can be foreground or background. See the
+[role table and high-stakes rule](ultra-codex.md#worker-roles).
 Role presets use `fugato:codex-reviewer` / `fugato:codex-investigator` (read-only)
 or `fugato:codex-implementer` (workspace-write), retaining the usual model/effort
 and speed settings. Conflicting sandbox headers get `native_preset_sandbox`.
@@ -152,7 +157,7 @@ Claude makes one Bash call per job with `run_in_background: true` and
 sockets.
 
 ```bash
-fugato task --model gpt-6-astra --effort xhigh --normal <<'DUET_TASK'
+fugato task --role implement --normal <<'DUET_TASK'
 <brief: objective, context, owned paths, constraints, acceptance criteria>
 DUET_TASK
 ```
@@ -444,8 +449,8 @@ lease otherwise.
 
 | Choice | Default | Override |
 | --- | --- | --- |
-| Model | Configured worker model (default `gpt-6-astra`) | `setup --default-model <name>`; `--model <name>` per call (`spark` maps to `gpt-5.3-codex-spark`) |
-| Reasoning effort | Configured worker effort (default `xhigh`) | `setup --default-effort <effort>`; `--effort none…xhigh` or `--effort max` per call where the model supports it |
+| Model and effort | Effective row for `--role <id>`, or roleless defaults | `setup --role-model id=model[:effort]` saves a row. Explicit `--model` or `--effort` overrides it for a dispatch. |
+| High stakes | `gpt-6.2-astra` / `xhigh` | Use `--high-stakes` on a fresh Codex dispatch. |
 | Speed | normal | `--fast` requests the fast tier; `--normal` resets inherited speed |
 | Direct-mode timeout | 3600 s | `--timeout-sec <seconds>` (maximum 3600) |
 | Owner lease | 1800 s in direct mode; 180 s otherwise | `--lease-sec <seconds>` |

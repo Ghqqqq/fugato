@@ -17,10 +17,9 @@ export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // Name the selected dispatch route up front so the first task needs no readiness notice.
 // An unavailable adapter observation enables the Bash fallback on later sessions.
 async function sessionStartContext() {
-  let model = "gpt-6-astra", effort = "xhigh", dispatch = "auto", unavailable = null;
+  let dispatch = "auto", unavailable = null;
   try {
-    const { readWorkerDefaults, dispatchPreference, readNativeUnavailable } = await import("./lib/setup-config.mjs");
-    ({ model, effort } = readWorkerDefaults());
+    const { dispatchPreference, readNativeUnavailable } = await import("./lib/setup-config.mjs");
     dispatch = dispatchPreference();
     if (dispatch === "auto") unavailable = readNativeUnavailable();
   } catch { /* built-in guidance must remain available on any preference error */ }
@@ -30,12 +29,12 @@ async function sessionStartContext() {
       ? 'The saved dispatch preference is bash: dispatch through background Bash `fugato task`; load the `fugato:native-fallback` skill and follow it. Do not use fugato:codex-native.'
       : `Native dispatch was unavailable on this host at ${unavailable.at} (missing turn start); prefer background Bash \`fugato task\` through the \`fugato:native-fallback\` skill. This observation is honored for 24 hours after the last observation, or until \`fugato setup --dispatch\` is run without \`--dry-run\`.`
   ] : [
-    'Dispatch Codex natively by default from the first dispatch: Agent(subagent_type: "fugato:codex-native", prompt: "<brief>") (a valid caller name is kept when free; otherwise the plugin assigns a scientist name; the name appears in the Agent result); an optional first prompt line DUET: <flags> sets task flags. The agent result is the Fugato report; use SendMessage to the named agent for follow-ups and answers.',
+    'Dispatch natively by default from the first dispatch: use Agent(subagent_type: "fugato:codex-native", prompt: "<brief>") for Codex rows and fugato:gemini-native for Gemini rows (see the fugato:models skill). A valid free caller name is kept; otherwise the result gives the assigned scientist name. Use SendMessage to the named agent for follow-ups and answers.',
     "If native dispatch returns `native_adapter_unavailable` or `native_capacity`, needs a per-call option the `DUET:` line rejects, or you must follow up a worker launched through Bash, load the `fugato:native-fallback` skill and follow it."
   ];
   return [
     ...routeContext,
-    `When delegating outside an orchestration mode, explicitly set model, effort and speed: \`${bash ? "fugato task" : "DUET:"} --model ${model} --effort ${effort} --normal\` unless the user chose otherwise; add \`--sandbox read-only\` for investigation/review. Active ultra, pair, duel or roundtable reminders and protocols take precedence.`,
+    `When delegating outside an orchestration mode, choose a role for each fresh dispatch: \`${bash ? "fugato task" : "DUET:"} --role <id> --normal\`. Use \`--high-stakes\` when the rule in the fugato:models skill applies. Set explicit \`--model\` or \`--effort\` for user choices only and omit \`--high-stakes\` in that case. Preserve explicit speed choices. For enforced read-only work, use a Codex row and \`--sandbox read-only\`. Active mode reminders and protocols take precedence.`,
     `Use a fresh ${bash ? "worker" : "native agent"} per independent job; never run two jobs on one thread at once. Concurrent edits need disjoint owned paths or separate worktrees.`,
     "Briefs state the objective, owned paths, numbered acceptance criteria and verification commands.",
     "Accept only on evidence: read the actual diff and rerun checks. A success message, launch receipt or `running` payload is not completion; never simulate a worker report or notification."
@@ -84,8 +83,8 @@ async function main() {
         if (["resume", "compact"].includes(input.source)) {
           const mode = readMode(cwd, input.session_id); // discard legacy workspace records
           if (mode) {
-            const { readWorkerDefaults } = await import("./lib/setup-config.mjs");
-            modeReminder = reminderText(mode, undefined, readWorkerDefaults());
+            const { effectiveRoleTable } = await import("./lib/setup-config.mjs");
+            modeReminder = reminderText(mode, undefined, effectiveRoleTable({ cwd: input.cwd || process.cwd() }));
           }
         }
         else {

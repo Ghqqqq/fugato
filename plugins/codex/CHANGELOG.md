@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Select worker settings by role on fresh dispatches with `--role <id>`.
+  Use `--high-stakes` to fix the worker at `gpt-6.2-astra` / `xhigh`.
+  The effective table uses Gemini rows when `agy` is installed and Codex
+  fallbacks otherwise.
+- Save individual role settings with repeatable `fugato setup --role-model`.
+  Reminders and model listings show the effective role table or the roles
+  relevant to the active mode. Roundtable personas derive Codex models from
+  their roles. Use `roundtable start --high-stakes` for room-wide selection.
+
 ## 1.8.0
 
 - Add full-access Gemini workers through Google's official `agy acp` runtime

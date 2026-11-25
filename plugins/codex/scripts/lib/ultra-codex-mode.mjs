@@ -168,18 +168,45 @@ export function protocolVersion(text = fs.readFileSync(PROTOCOL_PATH, "utf8")) {
   return createHash("sha256").update(body).digest("hex").slice(0, 8);
 }
 
+export const BUILTIN_WORKER_DEFAULTS = Object.freeze({ model: "gpt-6-astra", effort: "xhigh", routineModel: "gpt-6.1-sol" });
+
+export function formatRoleTuples(rows) {
+  const abbreviate = model => model.replace(/^(?:gpt-6\.[12]|gemini-4)-/, "") || model;
+  const slugs = new Set(rows.map(row => row.model));
+  const abbreviations = new Map();
+  for (const slug of slugs) {
+    const short = abbreviate(slug);
+    abbreviations.set(short, (abbreviations.get(short) ?? 0) + 1);
+  }
+  return rows.map(({ model, effort }) => {
+    const short = abbreviate(model);
+    return `${abbreviations.get(short) === 1 ? short : model}/${effort}`;
+  });
+}
+
 // What the UserPromptSubmit hook adds to the prompt while the mode is on.
 // Short on purpose: it is paid on every prompt. The protocol itself is read
 // only when its current version is absent (including after compaction).
-export const BUILTIN_WORKER_DEFAULTS = Object.freeze({ model: "gpt-6-astra", effort: "xhigh", routineModel: "gpt-6.1-sol" });
-export function reminderText(mode, protocolPath = PROTOCOL_PATH, models = BUILTIN_WORKER_DEFAULTS) {
+export function reminderText(mode, protocolPath = PROTOCOL_PATH, table) {
   const version = protocolVersion(fs.readFileSync(protocolPath, "utf8"));
-  const { model, effort, routineModel } = models;
   const name = mode.name ?? "ultra", options = mode.options ?? mode;
   const suffix = `v${version} to substantive tasks; re-read ${protocolPath} unless its full text (first line: <!-- Ultra-codex protocol v${version} -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.`;
-  if (name === "pair") return `Pair mode on (one primary Codex worker on ${model}/${effort}, max ${PAIR_MAX_REWORK_ROUNDS} rework rounds). Apply pair protocol ${suffix}`;
-  if (name === "duel") return `Duel mode on (Claude vs Codex on ${model}/${effort}, max ${options.rounds} rounds). Apply duel protocol ${suffix}`;
-  if (name === "roundtable") return `Roundtable mode on (intensity ${options.intensity}, roles ${options.roles?.join(",") ?? "recommend roster for confirmation"}; persona models from fugato setup --persona-model). Apply Roundtable mode protocol ${suffix}`;
+  if (name === "roundtable") return `Roundtable mode on (intensity ${options.intensity}, roles ${options.roles?.join(",") ?? "recommend roster for confirmation"}; persona models from role table with room and saved persona overrides). Apply Roundtable mode protocol ${suffix}`;
+  if (name === "pair" || name === "duel") {
+    const ids = name === "pair" ? ["implement", "verify"] : ["implement", "verify", "architect"];
+    const [implement, verify, architect] = formatRoleTuples(ids.map(id => table.roles.find(row => row.id === id)));
+    if (name === "pair") return `Pair mode on (executor role implement ${implement}, verifier role verify ${verify}, max ${PAIR_MAX_REWORK_ROUNDS} rework rounds). Apply pair protocol ${suffix}`;
+    return `Duel mode on (Codex builder implement ${implement}, breaker verify ${verify}, analysis architect ${architect}, max ${options.rounds} rounds). Apply duel protocol ${suffix}`;
+  }
   const cap = options.maxWorkers === "unlimited" ? "no worker cap" : `max ${effectiveMaxWorkers(options.maxWorkers)} workers${options.maxWorkers === "auto" ? " (auto)" : ""}`;
-  return `Ultra-codex mode on (${options.scale}, ${cap}, routine ${routineModel}, strong ${model}). Apply protocol ${suffix}`;
+  const tuples = formatRoleTuples([...table.roles, table.highStakes]);
+  const groups = new Map();
+  for (const [index, { id }] of table.roles.entries()) {
+    const tuple = tuples[index];
+    if (!groups.has(tuple)) groups.set(tuple, []);
+    groups.get(tuple).push(id);
+  }
+  const roles = Array.from(groups, ([tuple, ids]) => `${ids.join("|")} ${tuple}`).join(", ");
+  const gemini = table.gemini.installed ? "on" : "off (Codex fallbacks)";
+  return `Ultra-codex mode on (${options.scale}, ${cap}; roles: ${roles}; high-stakes ${tuples.at(-1)}; Gemini ${gemini}). Apply protocol ${suffix}`;
 }

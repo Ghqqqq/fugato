@@ -2,11 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { makeTempDir, initGitRepo, run } from "./helpers.mjs";
+import { makeTempDir, initGitRepo, run, writeExecutable } from "./helpers.mjs";
 import { buildEnv } from "./fake-codex-fixture.mjs";
 import { clearMode, effectiveMaxWorkers, pruneModes, readMode, setMode, modeFile, protocolVersion, PROTOCOL_PATH } from "../plugins/codex/scripts/lib/ultra-codex-mode.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
-import { defaultModeSetup, dispatchPreference, readNativeUnavailable } from "../plugins/codex/scripts/lib/setup-config.mjs";
+import { defaultModeSetup, dispatchPreference, readNativeUnavailable, roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 import { runWithRetainedStdin } from "./stdin-fixture.mjs";
 
 const script = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
@@ -22,7 +22,8 @@ const MODES = [
 function fixture() {
   const dir = makeTempDir(), repo = path.join(dir, "repo");
   fs.mkdirSync(repo); initGitRepo(repo);
-  const baseEnv = { ...buildEnv(dir), CODEX_COMPANION_HOME: path.join(dir, "isolated"), CLAUDE_PLUGIN_DATA: path.join(dir, "data") };
+  const baseEnv = { ...buildEnv(dir), CODEX_COMPANION_HOME: path.join(dir, "isolated"), CLAUDE_PLUGIN_DATA: path.join(dir, "data"),
+    FUGATO_ANTIGRAVITY_BIN: path.join(dir, "fixture-agy.exe") };
   const env = { ...baseEnv, CODEX_COMPANION_SESSION_ID: SESSION };
   const json = result => { assert.equal(result.status, 0, result.stderr + result.stdout); return JSON.parse(result.stdout); };
   const call = (...args) => run(process.execPath, [script, ...args], { cwd: repo, env });
@@ -72,6 +73,9 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
   assert.equal(f.prompt("task").stdout, "");
   const context = result => f.json(result).hookSpecificOutput.additionalContext;
   const baseline = context(f.lifecycle("SessionStart", { source: "compact" }));
+  assert.match(baseline, /DUET: --role <id> --normal/);
+  assert.match(baseline, /Use `--high-stakes` when the rule/);
+  assert.match(baseline, /Set explicit `--model` or `--effort` for user choices only/);
   for (const mode of MODES) {
     const on = f.json(f.call(mode.verb, "on", ...mode.flags, "--json"));
     assert.deepEqual(on.activeMode, { name: mode.name, options: mode.options, since: on.since });
@@ -111,6 +115,44 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
   assert.equal(fs.existsSync(legacy), false);
   assert.equal(fs.existsSync(stale.file), false);
   assert.equal(fs.existsSync(recent.file), true);
+});
+
+test("ultra reminder groups equal role tuples and updates when agy becomes available", () => {
+  const f = fixture();
+  setMode(f.repo, SESSION, { scale: "quick", maxWorkers: 2 }, f.env);
+  const prefix = "Ultra-codex mode on (quick, max 2 workers; roles: ";
+  const suffix = `). Apply protocol v${protocolVersion()} to substantive tasks`;
+  const reminder = () => {
+    const result = f.prompt("task");
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.split("; re-read")[0];
+  };
+  assert.equal(reminder(),
+    prefix + "scan sol/low, implement|investigate|read|research sol/high, review sol/medium, " +
+    "debug|architect|verify|judge|alt-design astra/xhigh, visual|media terra/medium; " +
+    "high-stakes astra/xhigh; Gemini off (Codex fallbacks)" + suffix);
+  writeExecutable(f.env.FUGATO_ANTIGRAVITY_BIN, "");
+  assert.equal(reminder(),
+    prefix + "scan sol/low, implement|investigate sol/high, review sol/medium, " +
+    "debug|architect|verify|judge astra/xhigh, visual terra/medium, read|media|research neon/high, " +
+    "alt-design neon/xhigh; high-stakes astra/xhigh; Gemini on" + suffix);
+});
+
+test("reminders show saved role settings and qualify model slugs that collide in the same line", () => {
+  const f = fixture();
+  roleModelsSetup({ env: f.env, models: ["implement=gpt-6.1-sol:medium", "verify=gpt-6.2-sol:high",
+    "architect=gpt-6.1-astra:xhigh"] });
+  const reminder = () => f.prompt("task").stdout;
+  setMode(f.repo, SESSION, { name: "ultra" }, f.env);
+  assert.match(reminder(), /scan gpt-6\.2-sol\/low, implement gpt-6\.1-sol\/medium, investigate\|verify\|read\|research gpt-6\.2-sol\/high/);
+  assert.match(reminder(), /architect gpt-6\.1-astra\/xhigh/);
+  assert.match(reminder(), /high-stakes gpt-6\.2-astra\/xhigh/);
+  setMode(f.repo, SESSION, { name: "pair" }, f.env);
+  assert.match(reminder(), /^Pair mode on \(executor role implement gpt-6\.1-sol\/medium, verifier role verify gpt-6\.2-sol\/high, max 2 rework rounds\)\. Apply pair protocol /);
+  setMode(f.repo, SESSION, { name: "duel", options: { rounds: 1 } }, f.env);
+  assert.match(reminder(), /^Duel mode on \(Codex builder implement gpt-6\.1-sol\/medium, breaker verify gpt-6\.2-sol\/high, analysis architect astra\/xhigh, max 1 rounds\)\. Apply duel protocol /);
+  const resume = f.json(f.lifecycle("SessionStart", { source: "resume" }));
+  assert.ok(resume.hookSpecificOutput.additionalContext.endsWith(reminder().trim()));
 });
 
 test("mode replacement and targeted off leave running jobs and other sessions intact", () => {
@@ -182,6 +224,7 @@ test("dispatch setup previews, persists across plugin data paths and resets star
   f.baseEnv.CODEX_COMPANION_BIN = "fixture-disabled";
   const context = () => f.json(f.lifecycle("SessionStart", { source: "startup" })).hookSpecificOutput.additionalContext;
   assert.match(context(), /background Bash.*fugato task/);
+  assert.match(context(), /fugato task --role <id> --normal/);
   assert.doesNotMatch(context(), /Agent\(subagent_type:/);
   const before = fs.readFileSync(file, "utf8");
   assert.equal(f.call("setup", "--dispatch", "invalid").status, 1);

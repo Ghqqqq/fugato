@@ -21,10 +21,13 @@ invocation guidance. Older sessions may need a reload/new session or the absolut
 launcher path.
 
 ```bash
-fugato task --model gpt-6-astra --effort xhigh --normal <<'DUET_TASK'
+fugato task --role implement --normal <<'DUET_TASK'
 <brief>
 DUET_TASK
 ```
+
+Choose the role for the assignment from the [effective table](ultra-codex.md#worker-roles).
+Apply the high-stakes rule on fresh dispatch and honor explicit user settings.
 
 Use stdin only, single-quoted arguments and `DUET_TASK`/`DUET_ANSWER` heredocs
 whose delimiters do not occur as complete lines in the text. The permission hook
