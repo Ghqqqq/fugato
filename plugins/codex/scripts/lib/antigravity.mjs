@@ -172,8 +172,8 @@ function parentBridgeServers(cwd, options) {
   const threadId = options.resumeThreadId ?? bridge.threadId;
   const jobId = options.jobId ?? bridge.jobId;
   if (!threadId && !jobId) throw new Error("Antigravity parent bridge requires a Fugato job or session handle.");
-  const env = { [PARENT_BRIDGE_ENV.cwd]: bridge.cwd ?? cwd,
-    ...(threadId ? { [PARENT_BRIDGE_ENV.threadId]: threadId } : { [PARENT_BRIDGE_ENV.jobId]: jobId }),
+  const env = { [PARENT_BRIDGE_ENV.cwd]: bridge.cwd ?? cwd, CODEX_COMPANION_BRIDGE_BACKEND: "antigravity",
+    ...(jobId ? { [PARENT_BRIDGE_ENV.jobId]: jobId } : { [PARENT_BRIDGE_ENV.threadId]: threadId }),
     CODEX_COMPANION_HOME: resolveIsolatedCodexHome(), ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
   return [{ name: PARENT_BRIDGE_SERVER, command: process.execPath,
     args: [fileURLToPath(new URL("../parent-bridge-mcp.mjs", import.meta.url))],
