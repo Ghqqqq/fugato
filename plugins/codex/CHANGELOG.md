@@ -18,16 +18,20 @@
   cache reads and writes. Background delivery accepts partial counts. Keep
   context occupancy in `acpUsage`, refuse explicit token limits and ignore
   saved token limits for Gemini tasks.
-- Refuse mid-turn `SendMessage`. Once a permission report returns, only
-  `Allow once` or `Deny` answers it. After the turn finishes, a new message
-  starts the next assignment.
+- Refuse mid-turn `SendMessage`. A `needs_answer` report gives the required
+  first line, `Answer <questionId>`. Match the job's pending ID and accept
+  `Allow once` or `Deny` for approvals, or up to 8,000 characters for ordinary
+  questions. After the turn finishes, a plain brief starts the next assignment.
+- Keep the final report intact across repeated tool status updates. Drop the
+  old diff when an edit changes without supplying a new one.
 - Require agy 1.5.15+ for continuation. Exact job follow-ups retain the
   backend. Use `--backend antigravity` with `--resume-last` or
   `task-resume-candidate` to select a Gemini job.
 - Restore a matching result saved before a crash. A lost result stays unknown
-  and its assignment is never replayed. Block concurrent prompts on the same
-  session across workspaces. Check the process start time before cancellation
-  to avoid signalling a reused PID. Release the slot once the owned process exits.
+  and its assignment is never replayed. Check PID registration and prompt
+  timing before signalling a surviving agy process. Block concurrent prompts
+  on the same ACP session across workspaces. Scope admission, cleanup and
+  parent questions to the backend when session handles coincide.
 
 ## 1.7.2
 

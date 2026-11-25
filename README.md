@@ -52,8 +52,10 @@ Dispatch `Agent(subagent_type: "fugato:gemini-native", prompt: "<brief>")`
 in Claude Code or pass the brief on stdin to `fugato task --backend antigravity`.
 Workers require full access. In agy's default mode, each edit and command
 needs approval. Wait for the native worker's report before using `SendMessage`.
-Answer a displayed permission question with exactly `Allow once` or `Deny`.
-Send a new assignment once the turn finishes. Continuing a worker requires
+For `needs_answer`, follow the report's `next` field. Put `Answer <questionId>`
+with the displayed ID on the first line and the answer on the next line.
+For permission requests, the answer body is exactly `Allow once` or `Deny`.
+After the turn finishes, send a plain brief to continue. Continuation requires
 agy 1.5.15 or later. [Setup and usage](docs/antigravity.md#set-up)
 
 ## Quick start

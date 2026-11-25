@@ -25,11 +25,14 @@ limit because agy reports usage at the end of the turn.
 [Companion CLI](../plugins/codex/scripts/codex-companion.mjs)
 
 Native dispatch uses `fugato:gemini-native`. A running turn refuses
-`SendMessage`. Wait for the agent's report. If it returns `needs_answer`
-with a permission question, send exactly `Allow once` or `Deny`. Other
-text shows the question again and starts no work. A denial usually ends
-the turn with a blocked report. After the turn finishes, use `SendMessage`
-for the next assignment. [Native worker messaging](antigravity.md#start-a-native-worker-in-claude-code)
+`SendMessage`. For a `needs_answer` report, follow its `next` field. Send
+`Answer <questionId>` on the first line, using the displayed ID, then the
+answer body on the following lines. A permission answer must be exactly
+`Allow once` or `Deny`. An ordinary answer accepts up to 8,000 characters
+of free text. Fugato checks the job's pending question and refuses missing,
+stale or mismatched IDs without starting work. After the turn finishes,
+send a plain brief for the next assignment.
+[Native worker messaging](antigravity.md#start-a-native-worker-in-claude-code)
 
 ## Slash commands
 

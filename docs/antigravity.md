@@ -99,18 +99,29 @@ The native preset fixes the backend to `antigravity` and rejects a conflicting
 backend. The Claude shell's effort and saved Codex model and effort defaults
 do not select Gemini settings.
 
-Wait for the worker's report before using `SendMessage`. While the turn is
-running, even a progress notice showing a permission request is too early
-to answer. Fugato refuses the message with this reply.
+Wait for the worker's report before using `SendMessage`. A running turn
+refuses messages, even if a progress notice already shows a question.
+Once the turn finishes, send a plain brief to start the next assignment on
+the same session. Use `/tasks` to stop the worker.
+[Message routing](../plugins/codex/hooks/steering.mjs)
 
-> This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again; answer a displayed permission question with exactly Allow once or Deny.
+If the report says `needs_answer`, its `next` field shows the exact reply
+format for that question. Put `Answer <questionId>` on the first line of the
+message, using the displayed ID. Put the answer body on the following lines.
+For example, to allow the displayed operation once, send this two-line
+message with the placeholder replaced by the question ID.
 
-When the agent returns a `needs_answer` report for a permission question,
-send exactly `Allow once` or `Deny`. Any other text shows the question again
-and starts no work. Once the turn finishes, send the next assignment with
-`SendMessage` to continue the session. Use `/tasks` to stop the worker.
-[Message routing](../plugins/codex/hooks/steering.mjs) ·
-[Native adapter](../plugins/codex/hooks/native-agent.mjs)
+```text
+Answer <questionId>
+Allow once
+```
+
+For a permission question, the body must be exactly `Allow once` or `Deny`.
+For an ordinary question, supply a nonempty text answer of up to 8,000
+characters. Fugato checks the ID against the job's actual pending question.
+It refuses replies with a missing header, a stale or mismatched ID, or an
+invalid body. Those replies start no work.
+[`geminiAnswerNext` and `geminiMessageRefusal`](../plugins/codex/hooks/native-agent.mjs)
 
 ## Companion CLI
 
@@ -153,17 +164,18 @@ assign disjoint paths or start each CLI task in a separately prepared worktree.
 [Task validation](../plugins/codex/scripts/lib/backends.mjs) ·
 [Native isolation checks](../plugins/codex/hooks/native-agent.mjs)
 
-In agy's default mode, every edit and command prompts for permission. Claude
-reviews the displayed operation and answers exactly `Allow once` or `Deny`.
-The report card shows the full approval text with its whitespace preserved.
+In agy's default mode, every edit and command prompts for permission. The
+report card shows the full approval text with its whitespace preserved.
+Claude reviews the operation and follows the report's `next` instructions.
 The answer applies only to the operation shown. If the operation changes
 while the answer is pending, or if agy's `rawInput` and its `args` copy
 disagree, Fugato denies the request with `operation-changed-before-approval`.
 After `Deny`, agy usually ends the turn and Fugato reports the job as blocked
 with `approval_denied`.
 
-For a CLI task, run the `fugato answer` command in the report's `next` field
-and pass the exact answer on stdin. It targets the displayed question ID.
+For a CLI task, run the `fugato answer` command in the report's `next` field.
+The command already targets the displayed question ID. Pass just the answer
+body on stdin.
 The foreground compatibility CLI denies requests because it has no waiting
 parent. [Question handling](../plugins/codex/scripts/lib/job-runtime.mjs)
 
@@ -191,10 +203,12 @@ line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/s
   explicit `--max-tokens` limit and ignores a saved default token limit for
   Gemini tasks. Use `--max-minutes` for a running-time budget.
   [Budget handling](../plugins/codex/scripts/codex-companion.mjs)
-- Tool updates and completed file diffs supply activity and report evidence.
-  Captured commands use agy's `rawInput.CommandLine`. A permission denial
-  stays in the report as a blocker. Fugato excludes the denied command from
-  the checks that ran and lists the worker's own verification claims separately.
+- Repeated status updates for the same tool call leave the final report
+  intact. When an edit's arguments or locations change without a new diff,
+  Fugato drops the previous diff. Captured commands use agy's
+  `rawInput.CommandLine`. A permission denial stays in the report as a
+  blocker. Fugato excludes the denied command from the checks that ran and
+  lists the worker's own verification claims separately.
   Fugato sends the requested JSON format in the prompt and parses the response.
   [Command capture and prompt handling](../plugins/codex/scripts/lib/antigravity.mjs)
 - Cancellation, lease expiry, owner loss or a time limit interrupt the
@@ -207,12 +221,19 @@ line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/s
   unknown and never replays the assignment.
   [Result recovery](../plugins/codex/scripts/codex-companion.mjs)
 - While the original agy process is still running the turn, Fugato blocks a
-  second prompt on the same ACP session, even from another workspace.
-  `fugato cancel <jobId>` can stop the surviving process group after a
-  worker crash. It checks the process start time and leaves a reused PID
-  alone. Once the owned process is gone, the worker's concurrency slot is
-  released and the session can continue.
-  [Process verification](../plugins/codex/scripts/lib/acp-process.mjs) ·
+  second prompt on the same ACP session, even from another workspace. If
+  Codex and Antigravity have the same session handle, each backend uses only
+  its own job records to admit a turn, clean up or route a parent question.
+  [Companion CLI](../plugins/codex/scripts/codex-companion.mjs) ·
+  [Parent question routing](../plugins/codex/scripts/parent-bridge-mcp.mjs)
+- After a worker crash, `fugato cancel <jobId>` signals only a verified agy
+  process group. On systems where `ps` reports start times to the second,
+  the matching process must have started before the PID registration second,
+  or in that same second with the prompt submitted in a later second. Windows
+  uses a start timestamp strictly earlier than registration. If ownership is
+  uncertain, Fugato leaves the process running. Once the owned process is
+  gone, the worker's concurrency slot is released and the session can continue.
+  [`processIdentity`](../plugins/codex/scripts/lib/acp-process.mjs) ·
   [Concurrency slots](../plugins/codex/scripts/lib/concurrency.mjs)
 
 ## Support boundaries
