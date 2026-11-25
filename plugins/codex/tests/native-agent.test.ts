@@ -211,12 +211,14 @@ test('report blocks preserve summary lines, ordered facts, colours and the sixty
 test('action-approval cards show the full literal operation before the decisions', () => {
   const text = 'Edit report  file.txt\n\nReplacement:\n    ' + 'long value  '.repeat(110) + '`**literal  end**`';
   const report = { status: 'needs_answer', jobId: 'task-action', worker: 'Gemini', summary: 'Permission requested.',
-    next: 'SendMessage to Gemini with the answer', details: null,
-    question: { kind: 'action-approval', text, options: ['Allow once', 'Deny'] } };
+    backend: 'antigravity', provider: 'Google Antigravity', details: null,
+    next: 'SendMessage to Gemini: "Answer q1\nAllow once" (or Deny)',
+    question: { id: 'q1', kind: 'action-approval', text, options: ['Allow once', 'Deny'] } };
   const leaves = (node: any): string[] => typeof node === 'string' ? [node] : node.children.flatMap(leaves);
   const card = reportMarkdown({ text: JSON.stringify(report) }, { viewport: { columns: 32 } });
   const content = leaves(card);
   expect(content).toContain(text);
+  expect(content).toContain(report.next);
   expect(content.indexOf('1. Allow once  2. Deny') > content.indexOf(text)).toBe(true);
 });
 

@@ -27,21 +27,21 @@ header for an assignment authorized for full access. Native `worktree` and
 `remote` isolation are refused before spawn. Claude plan mode and permission
 mapping are unsupported.
 
-In agy's default mode each edit and command needs approval. For a displayed
-`question.kind: "action-approval"`, the parent obtains the authorization
-needed for that operation and sends exactly `Allow once` or `Deny` through
-`SendMessage`. The card shows the full approval text and preserves
-whitespace. Each answer applies once to the operation shown. If it changes
-before the answer or agy's `rawInput` and `args` disagree, Fugato denies it
-with `operation-changed-before-approval`. Fugato denies questions over the
-16 KiB display limit. After `Deny`, agy usually ends the turn with an
+In agy's default mode each edit and command needs approval. The card shows
+the full operation and preserves whitespace. The parent obtains authorization
+for the displayed operation before answering. If the operation changes before
+the answer or agy's `rawInput` and `args` disagree, Fugato denies it with
+`operation-changed-before-approval`. Fugato denies questions over the 16 KiB
+display limit. After a denial, agy usually ends the turn with an
 `approval_denied` blocker. Denied commands are excluded from checks that ran.
 
-The worker refuses `SendMessage` while a turn is running. Wait for the agent
-to return a report, even if a progress notice already shows a question.
-For a `needs_answer` permission report, any reply other than the two exact
-choices shows the question again and starts no work. After the turn finishes,
-send the next assignment to continue the same Antigravity session.
+Wait for the agent to return a report before sending a message. For
+`needs_answer`, use `SendMessage` with `Answer <questionId>` on the first
+line, substituting the displayed question ID. Put the answer on the next
+line. For `action-approval`, use exactly `Allow once` or `Deny`. For an
+ordinary question, send up to 8,000 characters of answer text. The report's
+`next` field shows the format for that question. Once the job ends, send a
+plain brief to continue the same Antigravity session.
 
 If a model reads this prompt, the native adapter is unavailable or failed.
 Return exactly this blocked report without performing the assignment:
