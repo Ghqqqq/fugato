@@ -65,7 +65,11 @@ function processIdentity(job) {
   if (!matchesInvocation(command, executable)) return "reused";
   const recordedAt = Date.parse(job.acpProcessRecordedAt ?? job.turnSubmission?.at);
   if (!Number.isFinite(startedAt) || !Number.isFinite(recordedAt)) return "unknown";
-  return startedAt <= recordedAt ? "owned" : "reused";
+  // ps reports only whole seconds. A matching executable born anywhere in
+  // the recorded second could be a replacement. CreationDate retains ms.
+  const cutoff = process.platform === "win32" ? recordedAt : Math.floor(recordedAt / 1000) * 1000;
+  if (startedAt === cutoff) return "unknown";
+  return startedAt < cutoff ? "owned" : "reused";
 }
 
 const gone = identity => identity === "absent" || identity === "reused";

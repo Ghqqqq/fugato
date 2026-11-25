@@ -78,6 +78,16 @@ async function killWorker(f, id) {
   await waitForCondition(() => !alive(pid), "worker exit", 5000);
 }
 
+async function recordLivePeer(f, id) {
+  // Exercise positive ownership with a PID observation distinguishable from
+  // the peer's POSIX birth second. Both ends of the original connection live.
+  const job = f.job(id);
+  const nextSecond = Math.floor(Date.parse(job.acpProcessRecordedAt) / 1000) * 1000 + 1000;
+  await waitForCondition(() => Date.now() >= nextSecond, "distinct PID observation second");
+  assert.ok(alive(job.pid) && alive(job.acpProcessPid));
+  updateJob(f.repo, id, () => ({ acpProcessRecordedAt: new Date().toISOString() }));
+}
+
 test("a follow-up killed before session/prompt is recorded as notStarted and can continue", async () => {
   const f = fixture();
   const first = f.complete("--backend", "antigravity");
@@ -119,10 +129,14 @@ test("an unacknowledged cancel records process exit and reports a usable continu
   assert.equal(f.requests("session/prompt").length, 2);
 });
 
-test("cancelling a crashed worker by name stops its ACP group including a stubborn tool", async () => {
+test("cancelling a crashed worker by name stops its ACP group including a stubborn tool", async t => {
   const f = fixture(), { jobId } = f.launch("orphan", "--name", "OrphanWorker");
   await waitForCondition(() => fs.existsSync(f.events + ".tool"), "tool startup", 10000);
   const tool = Number(fs.readFileSync(f.events + ".tool", "utf8")), lost = f.job(jobId);
+  t.after(() => {
+    for (const pid of [tool, lost.acpProcessPid]) if (alive(pid)) process.kill(pid, "SIGKILL");
+  });
+  await recordLivePeer(f, jobId);
   await killWorker(f, jobId);
   assert.ok(alive(lost.acpProcessPid) && alive(tool));
   const cancelled = f.command(["cancel", "OrphanWorker", "--json"], { script: fugato, status: 2 });
@@ -184,6 +198,29 @@ test("recovery publishes only the ended result artifact for the exact ACP assign
   assert.equal(f.requests("session/prompt").length, 1);
 });
 
+test("an accepted cancellation is honored when recovering an ended ACP result", () => {
+  const f = fixture(), { jobId } = f.complete("--backend", "antigravity");
+  const original = f.job(jobId);
+  updateJob(f.repo, jobId, () => ({ status: "running", phase: "working", pid: original.acpProcessPid,
+    completedAt: null, result: null, report: null, cancelRequested: { reason: "cancelled_by_user", at: new Date().toISOString() } }));
+  const details = f.command(["result", jobId, "--details"], { status: 1 });
+  const recovered = f.job(jobId), artifact = JSON.parse(fs.readFileSync(original.resultFile, "utf8"));
+  assert.equal(details.status, "cancelled");
+  assert.equal(details.interruptionReason, "cancelled_by_user");
+  assert.ok(details.continuationCommand.includes(jobId));
+  assert.equal(recovered.status, "cancelled");
+  assert.equal(recovered.turnResolution, "completed");
+  for (const payload of [recovered.result, artifact]) {
+    assert.equal(payload.status, 1);
+    assert.equal(payload.workerStatus, "cancelled");
+    assert.equal(payload.interruptionReason, "cancelled_by_user");
+    assert.equal(payload.interruptionConfirmed, false);
+    assert.deepEqual(payload.structured, original.result.structured);
+    assert.deepEqual(payload.usage, original.result.usage);
+    assert.equal(payload.rawOutput, original.result.rawOutput);
+  }
+});
+
 test("a newer detached agy acp survives cancellation of a job that recorded the same PID", async t => {
   const f = fixture(), { jobId } = f.launch("hold");
   await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
@@ -206,6 +243,26 @@ test("a newer detached agy acp survives cancellation of a job that recorded the 
   assert.ok(alive(replacement.pid));
   assert.equal(f.job(jobId).acpProcessExited, true);
   assert.equal(f.job(jobId).turnResolution, "unknown");
+});
+
+test("a matching ACP process born in the recorded POSIX second stays unresolved and unsignalled",
+  { skip: process.platform === "win32" }, async t => {
+  const f = fixture(), { jobId } = f.launch("survive-eof");
+  await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
+  const { acpProcessPid } = f.job(jobId);
+  t.after(() => { if (alive(acpProcessPid)) process.kill(acpProcessPid, "SIGKILL"); });
+  await killWorker(f, jobId);
+  const start = spawnSync("/bin/ps", ["-p", String(acpProcessPid), "-o", "lstart="],
+    { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
+  assert.equal(start.status, 0, start.error?.message ?? start.stderr);
+  const recordedAt = new Date(Date.parse(start.stdout.trim() + " GMT") + 500).toISOString();
+  updateJob(f.repo, jobId, () => ({ acpProcessRecordedAt: recordedAt }));
+  const response = f.command(["cancel", jobId, "--json"], { status: 2 });
+  assert.equal(response.confirmation, "unconfirmed");
+  assert.ok(alive(acpProcessPid));
+  const job = f.job(jobId);
+  assert.equal(job.acpProcessExited, false);
+  assert.equal(unresolvedTask(job), true);
 });
 
 test("a live ACP prompt sharing a Codex thread handle does not block a Codex continuation", async t => {
@@ -246,7 +303,30 @@ test("ACP admission in another workspace protects a dead worker's live prompt", 
   assert.ok(alive(original.acpProcessPid));
 });
 
-test("implicit resume and cancel apply ACP recovery to the selected worker", async () => {
+test("ACP admission blocks on a missing private job in another workspace", async t => {
+  const f = fixture(), { jobId } = f.launch("survive-eof");
+  await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
+  const job = f.job(jobId);
+  t.after(() => { if (alive(job.acpProcessPid)) process.kill(job.acpProcessPid, "SIGKILL"); });
+  await killWorker(f, jobId);
+  const file = resolveJobFile(f.repo, jobId);
+  fs.unlinkSync(file);
+  t.after(() => fs.writeFileSync(file, JSON.stringify(job), { mode: 0o600 }));
+  const other = makeTempDir("acp-missing-record-");
+  initGitRepo(other);
+  const blocked = f.command(["task", "--backend", "antigravity", "--thread", job.threadId,
+    "--cwd", other, "--sandbox", "danger-full-access", "--direct", "Continue elsewhere."], { direct: true, status: 2 });
+  const blocker = blocked.blockers.find(item => item.code === "thread_busy");
+  assert.equal(blocked.status, "blocked");
+  assert.match(blocker.message, /ownership.*unknown.*incomplete/i);
+  assert.equal(blocker.predecessorJobId, undefined);
+  assert.equal(blocker.cancelCommand, undefined);
+  assert.equal(blocker.recoveryCommand, undefined);
+  assert.equal(f.requests("session/load").length, 0);
+  assert.equal(f.requests("session/prompt").length, 1);
+});
+
+test("implicit resume and cancel apply ACP recovery to the selected worker", async t => {
   const f = fixture(), first = f.launch("hold");
   await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
   const original = f.job(first.jobId);
@@ -260,6 +340,8 @@ test("implicit resume and cancel apply ACP recovery to the selected worker", asy
   const orphan = f.launch("survive-eof");
   await waitForCondition(() => f.requests("session/prompt").length === 3, "new prompt", 10000);
   const pid = f.job(orphan.jobId).acpProcessPid;
+  t.after(() => { if (alive(pid)) process.kill(pid, "SIGKILL"); });
+  await recordLivePeer(f, orphan.jobId);
   await killWorker(f, orphan.jobId);
   const cancelled = f.command(["cancel", "--json"], { status: 2 });
   assert.equal(cancelled.jobId, orphan.jobId);
@@ -282,4 +364,31 @@ test("a submitted reservation of a dead ACP worker releases the next queued job 
   const observed = f.command(["status", first.jobId, "--json"]);
   assert.equal(observed.job.status, "failed");
   assert.equal(f.job(first.jobId).turnResolution, "unknown");
+});
+
+test("a legacy Codex submission recovers its missing turn ID alongside an unsubmitted ACP job", t => {
+  // Fake Codex allocates the same first thread in each fixture. Give its
+  // global thread inventory the same isolated home as this fixture's runtime.
+  const previous = process.env.CODEX_COMPANION_HOME;
+  process.env.CODEX_COMPANION_HOME = makeTempDir("codex-turn-attribution-");
+  t.after(() => { process.env.CODEX_COMPANION_HOME = previous; });
+  const f = fixture();
+  installFakeCodex(f.dir);
+  f.env.CODEX_COMPANION_BIN = path.join(f.dir, "codex");
+  const { jobId } = f.complete("--backend", "codex");
+  const original = f.job(jobId);
+  const acp = f.complete("--backend", "antigravity");
+  updateJob(f.repo, acp.jobId, () => ({ threadId: original.threadId, turnSubmission: null, turnId: null,
+    startedAt: original.startedAt, result: null, report: null, status: "running", pid: process.pid }));
+  const { backend, ...legacyRequest } = original.request;
+  const lost = updateJob(f.repo, jobId, () => ({ backend: undefined, request: legacyRequest, turnId: null,
+    result: null, report: null, status: "failed", pid: null }));
+  assert.ok(lost.turnSubmission);
+  assert.equal(unresolvedTask(lost), true);
+  f.command(["status", jobId, "--json"]);
+  const recovered = f.job(jobId);
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.recovery.source, "thread/read");
+  assert.equal(recovered.recovery.turnId, original.turnId);
+  assert.equal(f.job(acp.jobId).turnSubmission, null);
 });
