@@ -45,8 +45,8 @@ def banner(theme):
     body += f'<path d="M{right + 50} 172V412" stroke="{text}" stroke-width="6" stroke-linecap="round"/>'
     gl = Glyphs()
     title, w = gl.use(ITALIC, "Fugato", 128, left - 6, 112, text)
-    sub, _ = gl.use(ITALIC_LIGHT, "for Claude and any number of Codex voices", 40, left + w + 36, 112, muted)
-    return svg(1600, 470, gl.block() + body + title + sub, "Fugato, for Claude and any number of Codex voices")
+    sub, _ = gl.use(ITALIC_LIGHT, "for Claude and any number of voices", 40, left + w + 36, 112, muted)
+    return svg(1600, 470, gl.block() + body + title + sub, "Fugato, for Claude and any number of voices")
 
 
 def glyphs(theme):
