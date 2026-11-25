@@ -30,13 +30,13 @@ export function registerSteering(on, hasRoleHeader) {
         return matches[0].status === 'running' ? { isDelivered: false, reason: GEMINI_BUSY } : next(e);
       }
       if (matches.length !== 1 || !isNativeType(matches[0].type) || matches[0].status !== 'running') return next(e);
-      if (typeof e.text === 'string' && hasRoleHeader(e.text)) return { isDelivered: false, reason: FRESH_ROLE_ERROR };
       // Only the main conversation steers. Subagent and teammate sends keep the
       // ordinary queue, where the teammate mailbox guard judges them.
       if (e.agentId || typeof e.text !== 'string' || !e.text.trim() || e.text.length > 65536) return next(e);
       const session = await $.session.id();
       const state = await $.store.get(`native:v2:${session}:${matches[0].id}`);
       if (!state || state.session !== session || state.bindingPending || state.status === 'needs_answer' || state.answer?.status === 'needs_answer') return next(e);
+      if (hasRoleHeader(e.text)) return { isDelivered: false, reason: FRESH_ROLE_ERROR };
       // An early send can precede the progress lookup that publishes jobId.
       // Resolve its durable launch nonce; never spawn or mutate its binding.
       if (!state.jobId && state.intent?.kind === 'task') await resolveJob($, state);

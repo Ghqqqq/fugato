@@ -1436,7 +1436,8 @@ async function drive($, e, state, progress) {
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
       const hasRole = hasRoleFlag(parsed.flags);
-      if (hasRole && (state.answeredTurn || state.threadId || state.jobId || parsed.flags.includes('--roundtable') || parsed.flags.includes('--fork'))) {
+      // A prior launch intent survives a failed final answer write, even when it has no job handles.
+      if (hasRole && (state.intent || state.answeredTurn || state.threadId || state.jobId || parsed.flags.includes('--roundtable') || parsed.flags.includes('--fork'))) {
         return blocked(FRESH_ROLE_ERROR, state);
       }
       if (parsed.flags.includes('--roundtable')) {
