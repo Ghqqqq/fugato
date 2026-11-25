@@ -48,14 +48,23 @@ function direct(result, status = 0) {
 const prompts = f => f.requests().filter(message => message.method === "session/prompt");
 const assertNoCodex = f => assert.equal(fs.existsSync(f.codexCalls), false, "Google tasks must never invoke Codex");
 
+test("Google verification reports the run_command command line and uses legacy fallbacks in order", () => {
+  const f = fixture("command-precedence");
+  const done = direct(f.call("task", "--backend", "antigravity", "--direct", "Run the calculator tests."));
+  assert.equal(done.status, "completed");
+  const job = f.stored(done.jobId);
+  assert.deepEqual(job.result.commandExecutions.map(value => value.command), ["pwd", "ls -a", "ls -l", "python3 test_calc.py"]);
+  assert.ok(job.report.verification.includes("python3 test_calc.py: exit 0, completed"));
+});
+
 test("Google tasks run without Codex and continuations retain their backend and session", () => {
   const f = fixture();
-  const first = direct(f.call("task", "--backend", "antigravity", "--model", "fixture-gemini", "--effort", "high",
+  const first = direct(f.call("task", "--backend", "antigravity", "--model", "gemini-4-neon", "--effort", "high",
     "--name", "GeminiWorker", "--direct", "Complete the fixture assignment."));
   assert.equal(first.status, "completed");
   const original = f.stored(first.jobId);
   assert.equal(original.request.backend, "antigravity");
-  assert.equal(original.request.model, "fixture-gemini");
+  assert.equal(original.request.model, "gemini-4-neon");
   assert.equal(original.request.effort, "high");
   assert.equal(original.request.sandbox, "danger-full-access");
   assert.ok(original.threadId);
@@ -77,7 +86,7 @@ test("Google tasks run without Codex and continuations retain their backend and 
     const saved = f.stored(next.jobId);
     assert.equal(saved.threadId, original.threadId);
     assert.equal(saved.request.backend, "antigravity");
-    assert.deepEqual([saved.request.model, saved.request.effort], ["fixture-gemini", "high"]);
+    assert.deepEqual([saved.request.model, saved.request.effort], ["gemini-4-neon", "high"]);
   }
   assert.equal(prompts(f).length, 3);
   assert.equal(f.requests().filter(message => message.method === "session/load").length, 2);
@@ -92,18 +101,56 @@ test("Google model discovery uses the ACP catalog without a Codex default or a m
   const f = fixture(); f.env.CODEX_COMPANION_BIN = f.codexTrap;
   const setup = json(f.call("setup", "--backend", "antigravity", "--json"));
   assert.equal(setup.backend, "antigravity");
+  assert.equal(setup.ready, true);
   assert.equal(prompts(f).length, 0);
   assert.equal(fs.existsSync(path.join(f.env.CODEX_COMPANION_HOME, "config.toml")), false);
   const catalog = json(f.call("models", "--backend", "antigravity", "--json"));
-  assert.deepEqual(catalog.models.map(model => model.slug), ["fixture-gemini", "fixture-gemini-fast"]);
+  const gemini = ["gemini-4-neon", "gemini-4-carbon", "gemini-pro-orchestrator", "gemini-3.8-flash"];
+  assert.deepEqual(catalog.models.map(model => model.slug), gemini);
+  assert.deepEqual(catalog.configOptions.find(value => value.id === "model").options.map(option => option.value), gemini);
   assert.equal(prompts(f).length, 0);
   const done = direct(f.call("task", "--backend", "antigravity", "--direct", "Complete a default-model assignment."));
   assert.equal(done.status, "completed");
   const saved = f.stored(done.jobId);
-  assert.equal(saved.result.model, "fixture-gemini");
+  assert.equal(saved.result.model, "gemini-4-neon");
   assert.notEqual(saved.request.effort, "xhigh");
   assert.ok(!f.requests().some(message => message.method === "session/set_config_option" && /^gpt-|xhigh/.test(String(message.params?.value))));
   assertNoCodex(f);
+});
+
+test("Google tasks submit only with an allowed Gemini model", () => {
+  const f = fixture("non-gemini-default");
+  const task = (...flags) => f.call("task", "--backend", "antigravity", "--direct", ...flags, "Check the model selection.");
+  const rejected = task("--model", "claude-opus-5-5");
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr + rejected.stdout, /only Gemini models/);
+  assert.equal(prompts(f).length, 0);
+  const offset = f.requests().length;
+  const completed = direct(task());
+  assert.equal(completed.status, "completed");
+  assert.equal(f.stored(completed.jobId).result.model, "gemini-4-neon");
+  const requests = f.requests().slice(offset);
+  assert.deepEqual(requests.map(value => value.method), ["initialize", "session/new", "session/set_config_option", "session/prompt"]);
+  assert.equal(requests[2].params.value, "gemini-4-neon");
+
+  const none = fixture("no-gemini");
+  const unavailable = none.call("task", "--backend", "antigravity", "--direct", "Check the model selection.");
+  assert.notEqual(unavailable.status, 0);
+  assert.match(unavailable.stderr + unavailable.stdout, /did not advertise a Gemini model/);
+  assert.equal(prompts(none).length, 0);
+});
+
+test("Google task launches use the ACP handshake for readiness without a help probe", () => {
+  const f = fixture();
+  assert.equal(direct(f.call("task", "--backend", "antigravity", "--direct", "Check readiness.")).status, "completed");
+  assert.deepEqual(f.acp.state().launches.map(launch => launch.args), [["acp"]]);
+  const bad = fixture("no-acp");
+  const failed = bad.call("task", "--backend", "antigravity", "--direct", "Check readiness.");
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr + failed.stdout, /Install Antigravity CLI/);
+  assert.match(failed.stderr + failed.stdout, /agy acp --login/);
+  assert.equal(prompts(bad).length, 0);
+  assert.deepEqual(bad.acp.state().launches.map(launch => launch.args), [["acp"]]);
 });
 
 test("a Google server without session loading cannot silently replace a continued worker", () => {
@@ -177,9 +224,9 @@ test("owned Google permission requests wait for the parent's exact single-use ap
     const outcome = responses[0].result.outcome;
     if (answer === "Allow once") {
       assert.equal(outcome.outcome, "selected");
-      assert.equal(outcome.optionId, "allow-this");
+      assert.equal(outcome.optionId, "allow");
     } else {
-      assert.ok(outcome.outcome === "cancelled" || outcome.optionId === "deny-this");
+      assert.ok(outcome.outcome === "cancelled" || outcome.optionId === "deny");
     }
     assertNoCodex(f);
   });
