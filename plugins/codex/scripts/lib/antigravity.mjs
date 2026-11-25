@@ -295,6 +295,11 @@ function observeTool(tools, update) {
   }
   const diffs = toolDiffs(update);
   if (diffs.length) call.diffs = diffs;
+  else if (call.diffs.length && ["rawInput", "args", "locations"].some(field => !isDeepStrictEqual(tool[field], call.tool[field]))) {
+    call.diffs = [];
+    // A partial update can also inherit the previous proposal's diff blocks.
+    if (Array.isArray(tool.content)) tool.content = tool.content.filter(block => block?.type !== "diff");
+  }
   call.tool = tool;
   tools.set(update.toolCallId, call);
   return call;
@@ -482,11 +487,11 @@ export async function runAntigravityTurn(cwd, options = {}) {
             if (typeof update.toolCallId !== "string") break;
             {
             const { tool, diffs } = observeTool(tools, update);
-            toolSinceChunk = true;
-            publishAnonymous();
             const lifecycle = ["completed", "failed", "cancelled"].includes(tool.status) ? "completed" : "started";
             if (activityLifecycles.get(tool.toolCallId) === lifecycle || activityLifecycles.get(tool.toolCallId) === "completed") break;
             activityLifecycles.set(tool.toolCallId, lifecycle);
+            toolSinceChunk = true;
+            publishAnonymous();
             let item = toolActivityItem(tool, diffs);
             const descriptor = activityDescriptors.get(tool.toolCallId);
             // Keep a metadata-only start paired with its completion even if

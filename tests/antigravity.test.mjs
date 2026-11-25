@@ -123,6 +123,22 @@ test("a revised pending edit reports only the file presented for approval", asyn
   assert.deepEqual(activity.filter(item => item.type === "fileChange").map(item => item.path), ["/fixture/b.txt"]);
 });
 
+test("revised edits without diffs report the new locations from updates and permission requests", async t => {
+  const target = path => ({ rawInput: { Path: path }, locations: [{ path }] });
+  const proposal = (toolCallId, path) => ({ sessionUpdate: "tool_call", toolCallId, name: "edit_file", kind: "edit",
+    status: "pending", ...target(path), content: [{ type: "diff", path, oldText: "before", newText: "after" }] });
+  const completed = toolCallId => ({ sessionUpdate: "tool_call_update", toolCallId, status: "completed" });
+  const review = { toolCallId: "review", ...target("/fixture/b.txt"), content: [{ type: "content", content: { type: "text", text: "Revised edit." } }] };
+  const fake = fixture(t, { serverRequests: [{ ...permissionRequest(review), beforeUpdates: [proposal("review", "/fixture/a.txt")] }],
+    turnUpdates: [completed("review"), proposal("edit", "/A"),
+      { sessionUpdate: "tool_call_update", toolCallId: "edit", ...target("/B"), content: [] }, completed("edit")] });
+  const activity = [];
+  const result = await fake.run({ onApprovalRequest: () => "once", onProgress: event => activity.push(...(event.activity ?? [])) });
+  assert.deepEqual(result.touchedFiles, ["/fixture/b.txt", "/B"]);
+  assert.deepEqual(result.fileChanges.map(tool => tool.content), [review.content, []]);
+  assert.deepEqual(activity.filter(item => item.type === "fileChange").map(item => item.path), ["/fixture/b.txt", "/B"]);
+});
+
 test("a tool status update separates anonymous progress from the final report", async t => {
   const chunk = text => ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
   const notice = "Waiting for the command.";
@@ -130,6 +146,24 @@ test("a tool status update separates anonymous progress from the final report", 
   const fake = fixture(t, { turnUpdates: [
     { ...commandCall("list", "ls"), status: "in_progress" }, chunk(notice),
     { sessionUpdate: "tool_call_update", toolCallId: "list", status: "completed" }, chunk(body)
+  ] });
+  const messages = [];
+  const result = await fake.run({ onProgress: event => messages.push(...(event.activity ?? []).filter(item => item.type === "agentMessage")) });
+  assert.equal(result.finalMessage, body);
+  assert.equal(parseStructuredReport(result.finalMessage)?.summary, "Command finished.");
+  assert.deepEqual(messages.map(item => item.body), [notice, "Command finished."]);
+});
+
+test("repeated tool statuses and late output preserve an anonymous report", async t => {
+  const chunk = text => ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+  const status = value => ({ sessionUpdate: "tool_call_update", toolCallId: "active", status: value });
+  const body = JSON.stringify({ status: "completed", summary: "Command finished." });
+  const notice = "Waiting for the command.";
+  const fake = fixture(t, { turnUpdates: [
+    { ...commandCall("finished", "ls"), status: "completed" }, chunk(notice),
+    status("in_progress"), chunk(body.slice(0, 12)),
+    status("in_progress"), status("pending"), status("in_progress"), chunk(body.slice(12, 24)),
+    { sessionUpdate: "tool_call_update", toolCallId: "finished", rawOutput: { exitCode: 0 } }, chunk(body.slice(24))
   ] });
   const messages = [];
   const result = await fake.run({ onProgress: event => messages.push(...(event.activity ?? []).filter(item => item.type === "agentMessage")) });
