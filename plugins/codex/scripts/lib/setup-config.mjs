@@ -642,12 +642,12 @@ export function effectiveRoleTable({ env = process.env, cwd = process.cwd() } = 
   return roleTableFromConfig(advisoryRoleConfig(env), env, cwd);
 }
 
-/** @param {{ models?: string[], env?: NodeJS.ProcessEnv, dryRun?: boolean }} [options] */
-export function roleModelsSetup({ models = [], env = process.env, dryRun = false } = {}) {
+/** @param {{ models?: string[], env?: NodeJS.ProcessEnv, cwd?: string, dryRun?: boolean }} [options] */
+export function roleModelsSetup({ models = [], env = process.env, cwd = process.cwd(), dryRun = false } = {}) {
   const warnings = [], changes = modelMappingChanges(models, "role", env, warnings);
   const { root, file } = duetConfig(env), before = read(root, file);
   const after = applyModelMappings(before, ["roles"], changes);
-  return { file, table: roleTableFromConfig(after, env, process.cwd()), warnings, ...apply(root, [{ file, before, after }], dryRun) };
+  return { file, table: roleTableFromConfig(after, env, cwd), warnings, ...apply(root, [{ file, before, after }], dryRun) };
 }
 
 function checkedWorkerPreference(key, value, env, warnings, catalog = readModelCache(env)) {

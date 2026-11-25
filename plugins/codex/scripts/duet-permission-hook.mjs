@@ -9,8 +9,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS } from "./lib/command-options.mjs";
+import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS, NON_FRESH_ROLE_FLAGS } from "./lib/command-options.mjs";
 import { SANDBOX_MODES, isSupportedReasoningEffort, normalizeRequestedModel } from "./lib/setup-config.mjs";
+import { ROLE_IDS } from "./lib/roles.mjs";
 import { PERSONA_IDS } from "./lib/roundtable-personas.mjs";
 import { budgetLimit } from "./lib/job-budget.mjs";
 import { readHookInput } from "./lib/fs.mjs";
@@ -133,6 +134,7 @@ export function approveDuet(input, env = process.env) {
       if (!value || value.startsWith("-") || !value.trim()) return {};
       if (["to", "thread", "continue"].includes(name) && !target(value)) return {};
       if (name === "backend" && !["codex", "antigravity"].includes(value)) return {};
+      if (name === "role" && !ROLE_IDS.includes(value)) return {};
       if (name === "model" && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(normalizeRequestedModel(value))) return {};
       if (name === "session" && value !== input.session_id) return {};
       if (name === "effort" && !isSupportedReasoningEffort(value, env)) return {};
@@ -145,6 +147,8 @@ export function approveDuet(input, env = process.env) {
       flags.set(name, value);
     } else return {};
   }
+  if ((flags.has("role") || flags.has("high-stakes")) && NON_FRESH_ROLE_FLAGS.some(key => flags.get(key))) return {};
+  if (flags.get("high-stakes") && (flags.has("model") || flags.has("effort"))) return {};
   if (verb === "task" && (flags.has("roundtable") !== flags.has("persona") ||
       (flags.has("roundtable") && (!/^rt-[a-z0-9]+-[a-z0-9-]+$/.test(flags.get("roundtable")) || !PERSONA_IDS.includes(flags.get("persona")))))) return {};
   const forumReadOnly = verb === "roundtable" || verb === "forum";

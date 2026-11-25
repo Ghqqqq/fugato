@@ -218,6 +218,8 @@ export function continuationReport(job) {
 export function fullReport(payload, job = {}) {
   const reason = budgetReason(payload.interruptionReason ?? job.result?.interruptionReason ?? job.cancelRequested?.reason);
   const report = { ...payload,
+    ...(job.request?.role ? { role: job.request.role } : {}),
+    ...(job.request?.highStakes ? { highStakes: true } : {}),
     ...(job.request?.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity", ...(job.result?.acpUsage ? { acpUsage: job.result.acpUsage } : {}) } : {}),
     ...(reason ? { reason: { ...reason, ...(job.budget ? {
       maximum: reason.limit === "max_minutes" ? job.budget.maxMinutes * 60000 : job.budget.maxTokens,
