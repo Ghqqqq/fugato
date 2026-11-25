@@ -221,19 +221,28 @@ test("a newer detached agy acp survives cancellation of a job that recorded the 
   await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
   const original = f.job(jobId);
   assert.ok(Number.isFinite(Date.parse(original.acpProcessRecordedAt)));
+  assert.equal(typeof original.acpProcessStart, "string");
+  assert.ok(original.acpProcessStart.length > 0);
   await killWorker(f, jobId);
   await waitForCondition(() => !alive(original.acpProcessPid), "ACP exit on EOF", 5000);
 
-  const submissionSecond = Math.floor(Date.parse(original.turnSubmission.at) / 1000);
-  await waitForCondition(() => Math.floor(Date.now() / 1000) > submissionSecond, "later replacement start second");
+  if (original.acpProcessStart.startsWith("ps:")) {
+    // ps -o lstart= has whole-second resolution on macOS/other POSIX.
+    const originalSecond = Math.floor(Date.parse(original.acpProcessStart.slice(3) + " GMT") / 1000);
+    await waitForCondition(() => Math.floor(Date.now() / 1000) > originalSecond, "later ps lstart second");
+  }
   const replacement = spawn(f.executable, ["acp"], { detached: true, stdio: ["pipe", "ignore", "ignore"],
     env: f.env });
   t.after(() => replacement.kill("SIGKILL"));
   replacement.stdin.write(JSON.stringify({ id: 1, method: "initialize" }) + "\n");
   await waitForCondition(() => f.requests("initialize").some(request => request.pid === replacement.pid), "replacement ACP startup");
   updateJob(f.repo, jobId, () => ({ acpProcessPid: replacement.pid }));
+  assert.notEqual(f.job(jobId).acpProcessStart, original.acpProcessStart);
   // Changing the fixture PID stamps a new observation. Restore the original job's proof.
-  updateJob(f.repo, jobId, () => ({ acpProcessRecordedAt: original.acpProcessRecordedAt }));
+  updateJob(f.repo, jobId, () => ({
+    acpProcessRecordedAt: original.acpProcessRecordedAt,
+    acpProcessStart: original.acpProcessStart
+  }));
   f.command(["cancel", jobId, "--json"], { status: 2 });
   assert.ok(alive(replacement.pid));
   assert.equal(f.job(jobId).acpProcessExited, true);
@@ -251,13 +260,43 @@ test("a matching ACP process born in the recorded POSIX second stays unresolved 
     { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
   assert.equal(start.status, 0, start.error?.message ?? start.stderr);
   const recordedAt = new Date(Date.parse(start.stdout.trim() + " GMT") + 500).toISOString();
-  updateJob(f.repo, jobId, job => ({ acpProcessRecordedAt: recordedAt, turnSubmission: { ...job.turnSubmission, at: recordedAt } }));
+  // Delete acpProcessStart to exercise the legacy timing rule for older records.
+  updateJob(f.repo, jobId, job => ({
+    acpProcessStart: undefined,
+    acpProcessRecordedAt: recordedAt,
+    turnSubmission: { ...job.turnSubmission, at: recordedAt }
+  }));
+  assert.equal(f.job(jobId).acpProcessStart, undefined);
   const response = f.command(["cancel", jobId, "--json"], { status: 2 });
   assert.equal(response.confirmation, "unconfirmed");
   assert.ok(alive(acpProcessPid));
   const job = f.job(jobId);
   assert.equal(job.acpProcessExited, false);
   assert.equal(unresolvedTask(job), true);
+});
+
+test("an orphaned ACP process whose recorded start identity matches is stopped by fugato cancel", async t => {
+  const f = fixture(), { jobId } = f.launch("survive-eof");
+  await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
+  const original = f.job(jobId);
+  assert.equal(typeof original.acpProcessStart, "string");
+  assert.ok(original.acpProcessStart.length > 0);
+  t.after(() => { if (alive(original.acpProcessPid)) process.kill(original.acpProcessPid, "SIGKILL"); });
+  await killWorker(f, jobId);
+  assert.ok(alive(original.acpProcessPid));
+  // Clear legacy timing fields so ownership is established solely by acpProcessStart.
+  updateJob(f.repo, jobId, job => ({
+    acpProcessRecordedAt: undefined,
+    turnSubmission: { ...job.turnSubmission, at: undefined }
+  }));
+  const cancelled = f.command(["cancel", jobId, "--json"], { script: fugato, status: 2 });
+  assert.equal(cancelled.confirmation, "unconfirmed");
+  await waitForCondition(() => !alive(original.acpProcessPid), "orphaned ACP exit", 3000);
+  assert.equal(alive(original.acpProcessPid), false);
+  const job = f.job(jobId);
+  assert.equal(job.acpProcessExited, true);
+  assert.equal(job.turnResolution, "unknown");
+  assert.equal(unresolvedTask(job), false);
 });
 
 test("a live ACP prompt sharing a Codex thread handle does not block a Codex continuation", async t => {

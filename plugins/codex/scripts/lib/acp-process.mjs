@@ -40,28 +40,80 @@ function pidExists(pid) {
   catch (error) { return error.code !== "ESRCH"; }
 }
 
+/** @type {import("node:child_process").SpawnSyncOptionsWithStringEncoding} */
+const INSPECT_OPTIONS = { encoding: "utf8", timeout: 1000, windowsHide: true };
+const LSTART_PATTERN = /^\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4}$/;
+
+export function parseProcStatStartTime(stat) {
+  if (typeof stat !== "string") return null;
+  const open = stat.indexOf("(");
+  const close = stat.lastIndexOf(")");
+  if (open === -1 || close <= open) return null;
+  const rest = stat.slice(close + 1);
+  if (!/^\s/.test(rest)) return null;
+  // Field 3 (state) is index 0 after the final ")", so field 22 (starttime) is index 19.
+  const startTime = rest.trim().split(/\s+/)[19];
+  return startTime && /^\d+$/.test(startTime) ? startTime : null;
+}
+
+function queryWindowsProcess(pid) {
+  const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const query = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($p) { @{ command=$p.CommandLine; started=$p.CreationDate.ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress }`;
+  const result = spawnSync(shell, ["-NoProfile", "-NonInteractive", "-Command", query], INSPECT_OPTIONS);
+  if (result.error || result.status !== 0 || !result.stdout?.trim()) return null;
+  try {
+    const row = JSON.parse(result.stdout);
+    const startedAt = typeof row?.started === "string" ? Date.parse(row.started) : NaN;
+    return {
+      command: row?.command,
+      startedAt,
+      startIdentity: Number.isFinite(startedAt) ? `win:${new Date(startedAt).toISOString()}` : null
+    };
+  } catch {
+    return { parseError: true };
+  }
+}
+
+export function processStartIdentity(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  if (process.platform === "linux") {
+    try {
+      const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      const startTime = parseProcStatStartTime(fs.readFileSync(`/proc/${pid}/stat`, "utf8"));
+      return bootId && startTime ? `linux:${bootId}:${startTime}` : null;
+    } catch {
+      return null;
+    }
+  }
+  if (process.platform === "win32") {
+    return queryWindowsProcess(pid)?.startIdentity ?? null;
+  }
+  const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)],
+    { ...INSPECT_OPTIONS, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
+  const lstart = !result.error && result.status === 0 ? (result.stdout ?? "").trim() : "";
+  return LSTART_PATTERN.test(lstart) ? `ps:${lstart}` : null;
+}
+
 // Inspection failure is distinct from a missing or reused PID. In particular
 // it cannot authorize a group signal or release a submitted reservation.
 function processIdentity(job) {
   const pid = job.acpProcessPid;
   if (!Number.isSafeInteger(pid) || pid <= 1) return "unknown";
   if (!pidExists(pid)) return "absent";
-  /** @type {import("node:child_process").SpawnSyncOptionsWithStringEncoding} */
-  const options = { encoding: "utf8", timeout: 1000, windowsHide: true };
-  let command, startedAt;
+  let command, startedAt, currentStart;
   if (process.platform === "win32") {
-    const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const query = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($p) { @{ command=$p.CommandLine; started=$p.CreationDate.ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress }`;
-    const result = spawnSync(shell, ["-NoProfile", "-NonInteractive", "-Command", query], options);
-    if (!result.error && result.status === 0 && result.stdout.trim()) {
-      try { const row = JSON.parse(result.stdout); command = row.command; startedAt = Date.parse(row.started); }
-      catch { return "unknown"; }
+    const row = queryWindowsProcess(pid);
+    if (row?.parseError) return "unknown";
+    if (row) {
+      command = row.command;
+      startedAt = row.startedAt;
+      currentStart = row.startIdentity;
     }
   } else {
     // lstart uses the locale's weekday/month and the process timezone.
     const result = spawnSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "pgid=,stat=,lstart=,args="],
-      { ...options, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
-    const row = !result.error && result.status === 0 &&
+      { ...INSPECT_OPTIONS, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
+    const row = !result.error && result.status === 0 && typeof result.stdout === "string" &&
       /^\s*(\d+)\s+(\S+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+?)\s*$/.exec(result.stdout);
     if (row) {
       if (row[2].startsWith("Z")) return "absent";
@@ -69,11 +121,17 @@ function processIdentity(job) {
       if (Number(row[1]) !== pid) return "reused";
       startedAt = Date.parse(row[3] + " GMT");
       command = row[4];
+      if (process.platform !== "linux") currentStart = `ps:${row[3]}`;
     }
   }
   if (!command) return pidExists(pid) ? "unknown" : "absent";
   const executable = job.acpExecutable ?? acpExecutable(job.request?.cwd ?? job.workspaceRoot ?? process.cwd());
   if (!matchesInvocation(command, executable)) return "reused";
+  if (typeof job.acpProcessStart === "string" && job.acpProcessStart) {
+    const start = currentStart !== undefined ? currentStart : processStartIdentity(pid);
+    if (!start) return "unknown";
+    return start === job.acpProcessStart ? "owned" : "reused";
+  }
   const observation = job.acpProcessRecordedAt ?? job.turnSubmission?.at;
   const recordedAt = typeof observation === "string" ? Date.parse(observation) : NaN;
   if (!Number.isFinite(startedAt) || !Number.isFinite(recordedAt)) return "unknown";

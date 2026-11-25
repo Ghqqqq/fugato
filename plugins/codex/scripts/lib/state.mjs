@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { acpProcessGone, isAntigravityJob } from "./acp-process.mjs";
+import { acpProcessGone, isAntigravityJob, processStartIdentity } from "./acp-process.mjs";
 
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { nearestGitBoundary, resolveWorkspaceRoot } from "./workspace.mjs";
@@ -1001,6 +1001,9 @@ export function updateJob(cwd, jobId, mutate, options = {}) {
     if (Number.isSafeInteger(patch.acpProcessPid) && patch.acpProcessPid > 0 &&
         patch.acpProcessPid !== current.acpProcessPid && isAntigravityJob(next)) {
       next.acpProcessRecordedAt = next.updatedAt;
+      const start = processStartIdentity(patch.acpProcessPid);
+      if (start) next.acpProcessStart = start;
+      else delete next.acpProcessStart;
     }
     writeJsonAtomically(file, next);
     publish(next);
