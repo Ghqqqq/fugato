@@ -61,6 +61,7 @@ import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 import { classifyRuntimeError } from "./runtime-errors.mjs";
 import { computerUseSetup, computerUseSessionFile, grantComputerAppsForThread, readTomlField, setTomlField } from "./setup-config.mjs";
+import { jobBackend } from "./backends.mjs";
 import { withJournalLock, tryAcquirePidLock, updateJob, unresolvedTask, resolveJobFile } from "./state.mjs";
 import { APPROVAL_CHOICES } from "./server-requests.mjs";
 import { mappedSandboxConfig, mappedSandboxPolicy } from "./permission-policy.mjs";
@@ -1861,7 +1862,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       };
       return { status: 0, threadId, turnId: null, finalMessage: blocker.message, blockers: [blocker], turnEnded: true };
     };
-    const recordedJobs = () => recordedThreadJobs(threadId).jobs.filter(job => job.id !== options.jobId);
+    const recordedJobs = () => recordedThreadJobs(threadId).jobs.filter(job => job.id !== options.jobId && jobBackend(job) === "codex");
     const recordedTurns = jobs => jobs.filter(job =>
       job.turnId && (ACTIVE.has(job.status) || unresolvedTask(job))).map(job => job.turnId);
     try {

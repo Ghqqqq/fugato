@@ -36,25 +36,35 @@ function processIdentity(job) {
   if (!Number.isSafeInteger(pid) || pid <= 1) return "unknown";
   if (!pidExists(pid)) return "absent";
   const options = { encoding: "utf8", timeout: 1000, windowsHide: true };
-  let command;
+  let command, startedAt;
   if (process.platform === "win32") {
     const shell = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const query = `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`;
+    const query = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'; if ($p) { @{ command=$p.CommandLine; started=$p.CreationDate.ToUniversalTime().ToString('o') } | ConvertTo-Json -Compress }`;
     const result = spawnSync(shell, ["-NoProfile", "-NonInteractive", "-Command", query], options);
-    if (!result.error && result.status === 0) command = result.stdout.trim();
+    if (!result.error && result.status === 0 && result.stdout.trim()) {
+      try { const row = JSON.parse(result.stdout); command = row.command; startedAt = Date.parse(row.started); }
+      catch { return "unknown"; }
+    }
   } else {
-    const result = spawnSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "pgid=,stat=,args="], options);
-    const row = !result.error && result.status === 0 && /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(result.stdout);
+    // lstart uses the locale's weekday/month and the process timezone.
+    const result = spawnSync("/bin/ps", ["-ww", "-p", String(pid), "-o", "pgid=,stat=,lstart=,args="],
+      { ...options, env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
+    const row = !result.error && result.status === 0 &&
+      /^\s*(\d+)\s+(\S+)\s+(\w{3}\s+\w{3}\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(.+?)\s*$/.exec(result.stdout);
     if (row) {
       if (row[2].startsWith("Z")) return "absent";
       // AcpClient spawns detached. A different process group proves PID reuse.
       if (Number(row[1]) !== pid) return "reused";
-      command = row[3];
+      startedAt = Date.parse(row[3] + " GMT");
+      command = row[4];
     }
   }
   if (!command) return pidExists(pid) ? "unknown" : "absent";
   const executable = job.acpExecutable ?? acpExecutable(job.request?.cwd ?? job.workspaceRoot ?? process.cwd());
-  return matchesInvocation(command, executable) ? "owned" : "reused";
+  if (!matchesInvocation(command, executable)) return "reused";
+  const recordedAt = Date.parse(job.acpProcessRecordedAt ?? job.turnSubmission?.at);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(recordedAt)) return "unknown";
+  return startedAt <= recordedAt ? "owned" : "reused";
 }
 
 const gone = identity => identity === "absent" || identity === "reused";

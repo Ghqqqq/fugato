@@ -258,6 +258,7 @@ test("lost Google outcomes never send ACP session handles to Codex recovery", ()
   const first = direct(f.call("task", "--backend", "antigravity", "--direct", "Complete the fixture."));
   const saved = f.stored(first.jobId), before = prompts(f).length;
   // Model loss of the wrapper's outcome receipt after session/prompt was sent.
+  fs.unlinkSync(saved.resultFile);
   f.patch(first.jobId, { status: "failed", pid: null, result: null, report: null,
     recovered: false, turnResolution: null, launcherPid: null, ownerAttached: false,
     errorMessage: "Worker exited before its outcome was recorded.",
