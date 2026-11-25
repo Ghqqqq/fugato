@@ -871,6 +871,14 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const jobs = workspaceJobs.filter((job) => job.id !== options.excludeJobId && job.title !== "Codex Stop Gate Review"
     && jobBackend(job) === backend);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
+  if (backend === "antigravity") {
+    for (const [index, job] of visibleJobs.entries()) {
+      if (!ACTIVE.has(job.status)) continue;
+      const stored = restoreMissingTaskRecord(workspaceRoot, job);
+      if (needsAcpRecovery(stored)) await reconcileLostTurn(workspaceRoot, stored);
+      visibleJobs[index] = readStoredJob(workspaceRoot, job.id) ?? stored;
+    }
+  }
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /fugato:status before continuing it.`);
@@ -1024,11 +1032,20 @@ function taskBrief(request) {
   return prompt?.trim() || (request.threadId || request.resumeLast ? DEFAULT_CONTINUE_PROMPT : "");
 }
 
-function threadBlocker(workspaceRoot, jobs, threadId, jobId) {
+function admissionJobs(workspaceRoot, jobs, threadId, backend) {
+  const local = jobs.filter(job => job.threadId === threadId && jobBackend(job) === backend);
+  if (backend !== "antigravity") return local;
+  // ACP session handles span workspaces. A crashed wrapper can leave a
+  // submitted prompt alive after its PID-based session lock is reclaimed.
+  const foreign = recordedThreadJobs(threadId).jobs.filter(job => job.workspaceRoot !== workspaceRoot && isAntigravityJob(job));
+  return local.concat(foreign);
+}
+
+function threadBlocker(workspaceRoot, jobs, threadId, jobId, backend) {
   const order = (a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")) || a.id.localeCompare(b.id);
   const current = jobs.find(job => job.id === jobId);
-  const candidates = jobs.filter(job => job.id !== jobId && job.threadId === threadId)
-    .map(job => readStoredJob(workspaceRoot, job.id) ?? job)
+  const candidates = admissionJobs(workspaceRoot, jobs, threadId, backend).filter(job => job.id !== jobId)
+    .map(job => job.workspaceRoot && job.workspaceRoot !== workspaceRoot ? job : readStoredJob(workspaceRoot, job.id) ?? job)
     .filter(job => job.status !== "blocked" && (ACTIVE.has(job.status) || ((job.turnId || job.turnSubmission || job.status === "failed") && unresolvedTask(job))));
   // Prefer the actual turn over queued follow-ups that will themselves be
   // refused. With no turn yet, the oldest reservation wins admission.
@@ -1053,7 +1070,9 @@ function threadBusyBlocker(workspaceRoot, stored) {
     ? `node ${quote(path.join(ROOT_DIR, "bin", "fugato"))} cancel ${quote(stored.id)} --cwd ${quote(workspaceRoot)} --json` : null;
   const ownerReport = directReport(progressSnapshot(stored), stored);
   const blocker = { code: "thread_busy", predecessorJobId: stored.id, predecessorStatus: stored.status,
-    message: `Codex thread ${stored.threadId} ${condition} in task ${stored.id}. ${cancelCommand ? "Use recoveryCommand to check it, or cancelCommand to interrupt that exact turn and confirm it stopped." : "Resolve that predecessor with the recovery command before continuing."}`,
+    message: isAntigravityJob(stored)
+      ? `Antigravity session ${stored.threadId} ${condition} in task ${stored.id}. Check that task with recoveryCommand or stop its ACP process with cancelCommand.`
+      : `Codex thread ${stored.threadId} ${condition} in task ${stored.id}. ${cancelCommand ? "Use recoveryCommand to check it, or cancelCommand to interrupt that exact turn and confirm it stopped." : "Resolve that predecessor with the recovery command before continuing."}`,
     recoveryCommand, ...(cancelCommand ? { cancelCommand } : {}),
     ...(ownerReport.status === "needs_answer" && ownerReport.question?.id
       ? { question: ownerReport.question, answerCommand: ownerReport.next } : {}) };
@@ -1089,26 +1108,28 @@ async function executeTaskRun(request) {
   }
 
   if (resumeThreadId) {
-    for (const candidate of listJobs(workspaceRoot).filter(job => job.threadId === resumeThreadId && job.id !== request.jobId)) {
-      const stored = restoreMissingTaskRecord(workspaceRoot, candidate);
-      if (needsAcpRecovery(stored)) await reconcileLostTurn(workspaceRoot, stored);
+    for (const candidate of admissionJobs(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, backend)) {
+      if (candidate.id === request.jobId) continue;
+      const root = candidate.workspaceRoot ?? workspaceRoot;
+      const stored = restoreMissingTaskRecord(root, candidate);
+      if (needsAcpRecovery(stored)) await reconcileLostTurn(root, stored);
     }
-    const predecessor = threadBlocker(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, request.jobId);
+    const predecessor = threadBlocker(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, request.jobId, backend);
     // A lost turn/start response leaves no turn ID. Read that predecessor's
     // thread before admission, just as we reconcile an exact recorded turn.
-    if (predecessor) await reconcileLostTurn(workspaceRoot, predecessor, { admittingJobId: request.jobId });
+    if (predecessor) await reconcileLostTurn(predecessor.workspaceRoot ?? workspaceRoot, predecessor, { admittingJobId: request.jobId });
     // Claim the target before starting a turn. updateState serializes competing
     // workers; unrelated threads remain free to run in parallel. Recovery does
     // network I/O outside this lock; always recheck all blockers after it.
     let blocker;
     updateState(workspaceRoot, (state) => {
-      blocker = threadBlocker(workspaceRoot, state.jobs, resumeThreadId, request.jobId);
+      blocker = threadBlocker(workspaceRoot, state.jobs, resumeThreadId, request.jobId, backend);
       if (blocker) return;
       const current = state.jobs.find((job) => job.id === request.jobId);
       if (!current) throw new Error("The current task record is missing; refusing to resume a thread without tracking its active turn.");
       current.threadId = resumeThreadId;
     });
-    if (blocker) return threadBusyExecution(workspaceRoot, blocker, request, taskMetadata);
+    if (blocker) return threadBusyExecution(blocker.workspaceRoot ?? workspaceRoot, blocker, request, taskMetadata);
   }
 
   const before = snapshotWorkspace(workspaceRoot);
@@ -1132,7 +1153,7 @@ async function executeTaskRun(request) {
     executionCwd: fs.realpathSync(request.cwd),
     jobId: request.jobId,
     onThreadBusy: (threadId, turnIds) => {
-      const owner = recordedThreadJobs(threadId).jobs.find(job => job.id !== request.jobId && (turnIds.includes(job.turnId) || (!turnIds.length && ACTIVE.has(job.status))));
+      const owner = recordedThreadJobs(threadId).jobs.find(job => job.id !== request.jobId && jobBackend(job) === backend && (turnIds.includes(job.turnId) || (!turnIds.length && ACTIVE.has(job.status))));
       const blocker = owner ? threadBusyBlocker(owner.workspaceRoot, owner) : { code: "thread_busy" };
       return { ...blocker, turnId: turnIds[0], message: `Codex thread ${threadId} ${turnIds.length ? `has in-progress or unresolved turn ${turnIds.join(", ")}` : "has a turn awaiting acceptance"}. ${blocker.message ?? "Resolve that turn before continuing."}` };
     },
@@ -2270,9 +2291,38 @@ function needsAcpRecovery(job) {
     && !processAlive(job.pid);
 }
 
+function readEndedAcpResult(job, artifacts) {
+  if (!job.threadId || !job.turnId) return null;
+  try {
+    const result = JSON.parse(fs.readFileSync(artifacts.resultFile, "utf8"));
+    if (result?.backend !== "antigravity" || result.jobId !== job.id || result.threadId !== job.threadId ||
+        result.turnId !== job.turnId || result.turnEnded !== true || !Number.isInteger(result.status) ||
+        typeof result.rawOutput !== "string") return null;
+    const report = buildWorkerReport(result, { jobId: job.id, ...artifacts });
+    const reason = result.interruptionReason;
+    const status = reason ? reason === "cancelled_by_user" ? "cancelled" : "interrupted" : report.status;
+    const turnResolution = result.turnResolution ?? (reason ? result.interruptionConfirmed ? "interrupted" : "unknown"
+      : result.status === 0 ? "completed" : "failed");
+    const recovery = result.recovery ?? { status: "recovered", source: "result-artifact", threadId: job.threadId,
+      turnId: job.turnId, turnStatus: turnResolution, detail: "Recovered the matching final Antigravity result saved before the worker exited." };
+    const completedAt = job.completedAt ?? nowIso();
+    return { ...artifacts, status, phase: status === "completed" ? "done" : status, completedAt, pid: null,
+      recovered: true, recoveredAt: nowIso(), recovery, turnEnded: true, turnResolution,
+      interruptionConfirmed: result.interruptionConfirmed === true, errorMessage: result.error ?? null,
+      result: { ...result, ...artifacts, workerStatus: status }, report: { ...report, status, recovery },
+      summary: snippet(firstMeaningfulLine(redactActivity(result.rawOutput), result.error ?? recovery.detail), 300) };
+  } catch (error) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError || error instanceof TypeError) return null;
+    throw error;
+  }
+}
+
 function reconcileAcpTurn(workspaceRoot, stored, isCurrent) {
   const current = updateJob(workspaceRoot, stored.id, latest => {
     if (!isCurrent(latest) || !needsAcpRecovery(latest)) return null;
+    const artifacts = taskArtifactPaths(workspaceRoot, latest.id);
+    const ended = readEndedAcpResult(latest, artifacts);
+    if (ended) return ended;
     const stopped = ACTIVE.has(latest.status)
       ? { status: "failed", phase: "failed", completedAt: nowIso(), pid: null } : {};
     const gone = acpProcessGone(latest);
@@ -2283,7 +2333,6 @@ function reconcileAcpTurn(workspaceRoot, stored, isCurrent) {
     const end = acpTurnEnd(latest), status = stopped.status ?? latest.status;
     const result = { status: 1, backend: "antigravity", threadId: latest.threadId ?? null, turnId: latest.turnId ?? null,
       error: latest.errorMessage ?? end.recovery.detail, ...latest.result, ...end, workerStatus: status };
-    const artifacts = taskArtifactPaths(workspaceRoot, latest.id);
     // A crash between the artifact write and terminal publication can leave
     // captured output on disk. Keep it available for inspection.
     if (!fs.existsSync(artifacts.rawOutputFile)) fs.writeFileSync(artifacts.rawOutputFile, result.rawOutput ?? "", { mode: 0o600 });
@@ -2728,6 +2777,9 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
     const target = resolveWorkerTarget(cwd, reference, { command: "cancel", nameState: "cancel", legacyReferences: true });
     namedWorker = target.job.agentName?.toLowerCase() === reference.toLowerCase();
     ({ cwd, reference } = target);
+  } else {
+    selectedTarget = resolveCancelableJob(cwd, reference, { env: process.env });
+    if (isAntigravityJob(selectedTarget.job)) reference = selectedTarget.job.id;
   }
   if (reference) {
     const snapshot = buildSingleJobSnapshot(cwd, reference);
@@ -2741,7 +2793,7 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
     if (namedWorker && stored?.status === "blocked" && stored.threadId) {
       const predecessorId = stored.result?.blockers?.find(blocker => blocker.code === "thread_busy")?.predecessorJobId;
       const predecessor = predecessorId && readStoredJob(snapshot.workspaceRoot, predecessorId);
-      if (predecessor?.threadId === stored.threadId && unresolvedTask(predecessor)) stored = predecessor;
+      if (predecessor?.threadId === stored.threadId && jobBackend(predecessor) === jobBackend(stored) && unresolvedTask(predecessor)) stored = predecessor;
     }
     if (stored) selectedTarget = { workspaceRoot: snapshot.workspaceRoot, job: stored };
     if (stored && expect && !expect(stored)) {

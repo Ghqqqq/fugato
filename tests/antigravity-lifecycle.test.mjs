@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { buildEnv } from "./fake-codex-fixture.mjs";
+import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, waitForCondition, writeExecutable } from "./helpers.mjs";
 import { resolveJobFile, unresolvedTask, updateJob } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -21,16 +21,19 @@ function fixture() {
 const fs = require("node:fs"), readline = require("node:readline"), { spawn } = require("node:child_process");
 if (process.argv.includes("--help")) process.exit(0);
 const { ACP_MODE: mode, ACP_EVENTS: file } = process.env;
-let sessionId = "session-" + process.pid;
+let sessionId = process.env.ACP_SESSION_ID || "session-" + process.pid;
+const configOptions = [{ id: "model", type: "select", currentValue: "gemini-fixture",
+  options: [{ value: "gemini-fixture", name: "Gemini fixture" }] }];
 const send = message => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...message }) + "\n");
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const { id, method, params } = JSON.parse(line);
   fs.appendFileSync(file, JSON.stringify({ pid: process.pid, method, params }) + "\n");
-  if (method === "initialize") send({ id, result: { protocolVersion: 1, agentCapabilities: { loadSession: true } } });
-  if (method === "session/new") send({ id, result: { sessionId } });
+  if (method === "initialize") send({ id, result: { protocolVersion: 1, agentInfo: { name: "agy", version: "1.5.16" },
+    agentCapabilities: { loadSession: true } } });
+  if (method === "session/new") send({ id, result: { sessionId, configOptions } });
   if (method === "session/load") {
     sessionId = params.sessionId;
-    if (mode !== "hold-load") send({ id, result: {} });
+    if (mode !== "hold-load") send({ id, result: { configOptions } });
   }
   if (method === "session/prompt" && mode === "orphan") {
     // The group leader exits on SIGTERM. Its tool survives until SIGKILL.
@@ -39,10 +42,13 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       { stdio: "ignore" });
   }
   if (method === "session/prompt" && mode === "complete") {
+    const answer = { status: "completed", summary: "The assignment is complete.", key_findings: ["Fixture finding"],
+      assumptions: [], verification: ["Fixture check"], blockers: [], question: null };
     send({ method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "The assignment is complete." } } } });
-    send({ id, result: { stopReason: "end_turn" } });
+      content: { type: "text", text: JSON.stringify(answer) } } } });
+    send({ id, result: { stopReason: "end_turn", usage: { inputTokens: 9, outputTokens: 3, totalTokens: 12 } } });
   }
+  if (method === "session/prompt" && mode === "survive-eof") setInterval(() => {}, 1000);
   // A held prompt deliberately receives no session/cancel acknowledgement.
 });
 `);
@@ -59,7 +65,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     .filter(request => request.method === method);
   const launch = (mode, ...flags) => command(["task", "--backend", "antigravity", "--detached", "--json", ...flags, "Run the assignment."], { mode });
   const complete = (...flags) => command(["task", ...flags, "--direct", "Finish the follow-up."], { direct: true });
-  return { command, complete, launch, job, requests, repo, events, executable };
+  return { command, complete, launch, job, requests, dir, repo, env, events, executable };
 }
 
 const alive = pid => {
@@ -150,6 +156,116 @@ test("a reused ACP PID leaves the unrelated process running and releases the tur
   assert.equal(lost.turnResolution, "unknown");
   assert.equal(unresolvedTask(lost), false);
   assert.equal(f.complete("--continue", jobId).status, "completed");
+});
+
+test("recovery publishes only the ended result artifact for the exact ACP assignment", () => {
+  const f = fixture(), { jobId } = f.complete("--backend", "antigravity");
+  const original = f.job(jobId), bytes = fs.readFileSync(original.resultFile, "utf8");
+  const saved = JSON.parse(bytes);
+  const losePublication = () => updateJob(f.repo, jobId, () => ({ status: "running", phase: "working",
+    pid: original.acpProcessPid, completedAt: null, recovered: false, result: null, report: null, recovery: null, turnResolution: null }));
+  losePublication();
+  const report = f.command(["result", jobId, "--details"]);
+  const recovered = f.job(jobId);
+  assert.equal(report.status, "completed");
+  assert.equal(recovered.turnResolution, "completed");
+  assert.equal(recovered.result.status, 0);
+  assert.equal(recovered.result.turnEnded, true);
+  assert.deepEqual(recovered.result.structured.keyFindings, ["Fixture finding"]);
+  assert.deepEqual(recovered.result.usage, { inputTokens: 9, outputTokens: 3, totalTokens: 12 });
+  assert.equal(fs.readFileSync(original.resultFile, "utf8"), bytes);
+
+  for (const mismatch of [{ jobId: "other-job" }, { threadId: "other-session" }, { turnId: "other-turn" }, { turnEnded: false }]) {
+    losePublication();
+    fs.writeFileSync(original.resultFile, JSON.stringify({ ...saved, ...mismatch }));
+    f.command(["status", jobId, "--json"]);
+    assert.equal(f.job(jobId).turnResolution, "unknown");
+  }
+  assert.equal(f.requests("session/prompt").length, 1);
+});
+
+test("a newer detached agy acp survives cancellation of a job that recorded the same PID", async t => {
+  const f = fixture(), { jobId } = f.launch("hold");
+  await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
+  const original = f.job(jobId);
+  assert.ok(Number.isFinite(Date.parse(original.acpProcessRecordedAt)));
+  await killWorker(f, jobId);
+  await waitForCondition(() => !alive(original.acpProcessPid), "ACP exit on EOF", 5000);
+
+  const replacement = spawn(f.executable, ["acp"], { detached: true, stdio: ["pipe", "ignore", "ignore"],
+    env: f.env });
+  t.after(() => replacement.kill("SIGKILL"));
+  replacement.stdin.write(JSON.stringify({ id: 1, method: "initialize" }) + "\n");
+  await waitForCondition(() => f.requests("initialize").some(request => request.pid === replacement.pid), "replacement ACP startup");
+  updateJob(f.repo, jobId, () => ({ acpProcessPid: replacement.pid }));
+  // Give the stale record an unambiguous upper bound across ps's whole-second
+  // precision. The replacement otherwise has the exact same group and argv.
+  const earlier = new Date(Date.parse(original.acpProcessRecordedAt) - 60000).toISOString();
+  updateJob(f.repo, jobId, () => ({ acpProcessRecordedAt: earlier }));
+  f.command(["cancel", jobId, "--json"], { status: 2 });
+  assert.ok(alive(replacement.pid));
+  assert.equal(f.job(jobId).acpProcessExited, true);
+  assert.equal(f.job(jobId).turnResolution, "unknown");
+});
+
+test("a live ACP prompt sharing a Codex thread handle does not block a Codex continuation", async t => {
+  const f = fixture();
+  installFakeCodex(f.dir);
+  f.env.CODEX_COMPANION_BIN = path.join(f.dir, "codex");
+  const first = f.complete("--backend", "codex");
+  const threadId = f.job(first.jobId).threadId;
+  f.env.ACP_SESSION_ID = threadId;
+  const acp = f.launch("hold");
+  await waitForCondition(() => f.requests("session/prompt").length, "colliding ACP prompt", 10000);
+  t.after(() => f.command(["cancel", acp.jobId, "--json"], { status: 2 }));
+  assert.equal(f.job(acp.jobId).threadId, threadId);
+  const next = f.complete("--continue", first.jobId);
+  assert.equal(next.status, "completed");
+  assert.equal(f.job(next.jobId).threadId, threadId);
+  assert.equal(f.job(acp.jobId).status, "running");
+  assert.equal(f.requests("session/cancel").length, 0);
+  assert.equal(f.requests("session/prompt").length, 1);
+});
+
+test("ACP admission in another workspace protects a dead worker's live prompt", async t => {
+  const f = fixture(), { jobId } = f.launch("survive-eof");
+  await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
+  const original = f.job(jobId);
+  t.after(() => { if (alive(original.acpProcessPid)) process.kill(original.acpProcessPid, "SIGKILL"); });
+  await killWorker(f, jobId);
+  const other = makeTempDir("acp-other-workspace-");
+  initGitRepo(other);
+  const blocked = f.command(["task", "--backend", "antigravity", "--thread", original.threadId,
+    "--cwd", other, "--sandbox", "danger-full-access", "--direct", "Continue elsewhere."], { direct: true, status: 2 });
+  assert.equal(blocked.status, "blocked");
+  const blocker = blocked.blockers.find(item => item.code === "thread_busy");
+  assert.ok(blocker?.cancelCommand.includes(jobId));
+  assert.ok(blocker.recoveryCommand.includes(jobId));
+  assert.equal(f.requests("session/load").length, 0);
+  assert.equal(f.requests("session/prompt").length, 1);
+  assert.ok(alive(original.acpProcessPid));
+});
+
+test("implicit resume and cancel apply ACP recovery to the selected worker", async () => {
+  const f = fixture(), first = f.launch("hold");
+  await waitForCondition(() => f.requests("session/prompt").length, "prompt", 10000);
+  const original = f.job(first.jobId);
+  await killWorker(f, first.jobId);
+  await waitForCondition(() => !alive(original.acpProcessPid), "ACP exit on EOF", 5000);
+  const next = f.complete("--backend", "antigravity", "--resume-last");
+  assert.equal(next.status, "completed");
+  assert.equal(f.job(next.jobId).threadId, original.threadId);
+  assert.equal(f.job(first.jobId).turnResolution, "unknown");
+
+  const orphan = f.launch("survive-eof");
+  await waitForCondition(() => f.requests("session/prompt").length === 3, "new prompt", 10000);
+  const pid = f.job(orphan.jobId).acpProcessPid;
+  await killWorker(f, orphan.jobId);
+  const cancelled = f.command(["cancel", "--json"], { status: 2 });
+  assert.equal(cancelled.jobId, orphan.jobId);
+  assert.equal(cancelled.confirmation, "unconfirmed");
+  assert.equal(f.job(orphan.jobId).acpProcessExited, true);
+  assert.equal(alive(pid), false);
 });
 
 test("a submitted reservation of a dead ACP worker releases the next queued job at limit one", async () => {

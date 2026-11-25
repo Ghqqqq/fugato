@@ -998,6 +998,10 @@ export function updateJob(cwd, jobId, mutate, options = {}) {
       return current;
     }
     const next = { ...current, ...patch, updatedAt: nowIso() };
+    if (Number.isSafeInteger(patch.acpProcessPid) && patch.acpProcessPid > 0 &&
+        patch.acpProcessPid !== current.acpProcessPid && isAntigravityJob(next)) {
+      next.acpProcessRecordedAt = next.updatedAt;
+    }
     writeJsonAtomically(file, next);
     publish(next);
     return next;
