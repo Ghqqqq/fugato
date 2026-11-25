@@ -2,7 +2,7 @@
 // No Node globals/imports in this sandbox; all host work goes through $.
 import { cleanDisplayText } from '../scripts/lib/display-text.mjs';
 import { lifecycleStoreSize, forgetLifecycle, pendingLifecycle, captureStartContext, lifecycleBrief, observeStop, prepareLifecycleStep, abandonLifecycleStop } from './lifecycle-hooks.mjs';
-import { geminiMessage, registerSteering, returnedQuestion } from './steering.mjs';
+import { GEMINI_BUSY, registerSteering } from './steering.mjs';
 import { registerRoundtableNotifier, startRoundtableNotifier, stopRoundtableMember, roundtableNotice, settleRoundtableNotice, isRoundtableNoticeTurn } from './roundtable-notifier.mjs';
 import { PERSONA_IDS } from '../scripts/lib/roundtable-personas.mjs';
 import { AGENT_TYPE, GEMINI_AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
@@ -136,10 +136,16 @@ const COORDINATOR_SUFFIX = '\n\nAddress this before completing your current task
 // exact framing so run-log binding can still match them.
 const coordinatorBody = text => text.startsWith(COORDINATOR_PREFIX) && text.endsWith(COORDINATOR_SUFFIX)
   ? text.slice(COORDINATOR_PREFIX.length, -COORDINATOR_SUFFIX.length) : text;
-function incomingMessage(state, text) {
-  if (!(state?.jobId || state?.intent || state?.answeredTurn)) return { text };
-  const body = coordinatorBody(text);
-  return state.type === GEMINI_AGENT_TYPE ? geminiMessage(body) : { text: body };
+const incomingBody = (state, text) => state?.jobId || state?.intent || state?.answeredTurn ? coordinatorBody(text) : text;
+function geminiAnswer(text) {
+  const newline = text.indexOf('\n');
+  const header = (newline < 0 ? text : text.slice(0, newline)).trim();
+  const match = /^Answer (\S+)$/.exec(header);
+  return match && { id: match[1], body: newline < 0 ? '' : text.slice(newline + 1) };
+}
+function geminiAnswerNext(state, question) {
+  const approval = question.kind === 'action-approval';
+  return `SendMessage to ${state.name || state.agentId}: "Answer ${question.id}\n${approval ? 'Allow once' : '<your answer>'}"${approval ? ' (or Deny)' : ''}`;
 }
 const logKey = (agentId, turnId) => JSON.stringify([agentId, turnId]);
 const invalidateProgress = $ => {
@@ -769,7 +775,7 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   const options = strings(question?.options).map((option, index) => `${index + 1}. ${option}`);
   if (count(question?.optionsOmitted)) options.push(`+${question.optionsOmitted} more`);
   if (report.backend === 'antigravity' && report.notice) add('notice', [[span(plain(report.notice), 'warning')]], 'warning');
-  if (question?.kind === 'action-approval' && typeof question.text === 'string') {
+  if (report.backend === 'antigravity' && question?.kind === 'action-approval' && typeof question.text === 'string') {
     // Keep the operation and its choices together. Let the host wrap literal
     // text so fact clipping cannot change a path or hide the end of an edit.
     groups.push({ label: 'question', rows: [{ type: 'Box', props: { flexDirection: 'column' }, children: [
@@ -781,7 +787,9 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
     if (options.length) questionLines.push([span(options.join('  '), 'warning')]);
     add('question', questionLines, 'warning');
   }
-  if (report.backend === 'antigravity' && report.next === GEMINI_FALLBACK) add('next', [[span(report.next)]]);
+  if (report.backend === 'antigravity' && report.status === 'needs_answer' && report.next) {
+    groups.push({ label: 'next', rows: [span(report.next, 'text', { wrap: 'wrap' })] });
+  } else if (report.backend === 'antigravity' && report.next === GEMINI_FALLBACK) add('next', [[span(report.next)]]);
   // Reserve the last status and essential facts before allocating summary rows.
   const summary = typeof report.summary === 'string' && report.summary.trim() ? report.summary : '';
   let budget = Math.max(0, lineLimit - (summary ? 1 : 0) - (summary && groups.length ? 1 : 0)
@@ -1235,9 +1243,9 @@ const save = ($, state, { fields, valid = () => true, close = false,
 async function saveReport($, state, report) {
   try { await save($, state); }
   catch (error) {
-    // A terminal companion report may already be marked delivered. Preserve
-    // it on cache failure; pending questions still need their routing state.
-    if (!report || report.status === 'needs_answer' || UNSETTLED.includes(report.status)) throw error;
+    // Terminal reports may already be marked delivered. Gemini can recover
+    // its pending question from the job. Codex needs its routing state saved.
+    if (!report || UNSETTLED.includes(report.status) || (state.type !== GEMINI_AGENT_TYPE && report.status === 'needs_answer')) throw error;
   }
 }
 async function handles($, state, jobId, recovery = false, persist = true, { waitMs = 0, report, ...timing } = {}) {
@@ -1276,6 +1284,26 @@ async function reconcile($, state, recovery = false, allowAbsent = false, { pers
   if (matches.length !== 1) throw new Error('Native launch intent has no unique recorded job. Refusing to redispatch; inspect fugato status before retrying.');
   return handles($, state, matches[0].id, recovery, persist, { ...timing, report });
 }
+// An addressed answer is reserved syntax even after its job has ended. For
+// live jobs the companion projects the unexpired question and atomically
+// checks that same ID again when the answer command attaches.
+async function geminiMessageRefusal($, state, job, reply, oversized) {
+  if (!job || !ACTIVE.includes(job.status)) {
+    if (job && !ended(job, state)) return blocked(GEMINI_BUSY, state);
+    if (reply || oversized === 'answer') return blocked('That answer is stale. Its question is no longer pending.', state);
+    if (oversized) return admissionBlocked('native_message_too_large', state);
+    return;
+  }
+  const current = await snapshot($, state, ['result', job.id, '--report']);
+  if (current.jobId !== job.id) throw new Error('Fugato report does not match the recorded job handle.');
+  if (current.status !== 'needs_answer') return blocked(GEMINI_BUSY, state);
+  const { question } = current;
+  const body = reply?.body ?? '', decision = body.trim();
+  if (reply && reply.id === question.id && decision && body.length <= 8000
+    && (question.kind !== 'action-approval' || decision === 'Allow once' || decision === 'Deny')) return;
+  const reason = oversized === 'answer' || body.length > 8000 ? 'The answer exceeds the 8000-character limit.' : 'This message did not answer the pending question.';
+  return { ...current, notice: reason + ' ' + geminiAnswerNext(state, question) };
+}
 async function drive($, e, state, progress) {
   if (state.isTeammate && state.v === undefined && !state.incoming && !state.intent && !state.jobId) {
     return blocked(`The host delivered no local loop start for this ${runtimeLabel(state)} teammate; use in-process teammate mode or a local subagent.`, state, 'native_teammate_unsupported');
@@ -1310,30 +1338,29 @@ async function drive($, e, state, progress) {
   } else {
     // Only later SendMessage turns carry host framing. An initial Agent brief
     // may contain that exact text as a literal example.
-    const message = incomingMessage(state, state.incoming.text);
-    let input = message.text, args, questionChanged = false, resumedWait = false;
-    const notice = state.incoming.notice, previousAnswer = state.answer;
+    let input = incomingBody(state, state.incoming.text), args, questionChanged = false, resumedWait = false;
+    const { notice, oversized } = state.incoming, previousAnswer = state.answer;
     if (notice?.duplicate) return previousAnswer || blocked('Roundtable notice already received; no work was repeated.', state);
+    const gemini = state.type === GEMINI_AGENT_TYPE && !notice;
     const answeringDisplayedQuestion = !notice && state.answer?.status === 'needs_answer';
-    const gemini = state.type === GEMINI_AGENT_TYPE;
-    const decision = input === 'Allow once' || input === 'Deny';
-    if (!input.trim() && !(gemini && (answeringDisplayedQuestion || state.status === 'needs_answer'))) {
-      return blocked('Empty native-agent message; nothing was dispatched.', state);
-    }
-    let answerRefused = false;
-    // Overlapping stop handlers may have saved a stale status; the job record
-    // decides before a new message is routed as a dispatch or an answer.
-    if (state.jobId && (notice || answeringDisplayedQuestion || ACTIVE.includes(state.status) || state.status === 'needs_answer')) {
-      // Read only: the save below persists it together with the new intent.
-      const job = await handles($, state, state.jobId, false, false);
-      // questionId is the question last returned to Claude, never merely the
-      // latest one read by a heartbeat, recovery or this pre-answer refresh.
-      const pending = ACTIVE.includes(job.status) && job.pendingQuestion?.answer === undefined ? job.pendingQuestion : null;
-      questionChanged = pending?.id !== state.questionId;
-      if (gemini && pending && !notice) {
-        answerRefused = !answeringDisplayedQuestion || questionChanged || previousAnswer.question?.id !== pending.id
-          || message.questionId !== pending.id || (pending.kind === 'action-approval' && !decision) || !input.trim();
+    if (!gemini && !input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
+    const refresh = gemini || notice || answeringDisplayedQuestion || ACTIVE.includes(state.status) || state.status === 'needs_answer';
+    const job = state.jobId && refresh ? await handles($, state, state.jobId, false, false) : null;
+    let answerId;
+    if (gemini) {
+      const reply = geminiAnswer(input);
+      const refusal = await geminiMessageRefusal($, state, job, reply, oversized);
+      if (refusal) return refusal;
+      if (reply) {
+        answerId = reply.id;
+        input = reply.body;
+        state.status = 'needs_answer';
       }
+    } else if (job) {
+      // Codex answers remain bound to the question last returned to Claude.
+      const pending = ACTIVE.includes(job.status) && job.pendingQuestion?.answer === undefined ? job.pendingQuestion : null;
+      answerId = state.questionId;
+      questionChanged = pending?.id !== answerId;
       // A pending question keeps the job running; its report says needs_answer.
       if (pending) state.status = 'needs_answer';
       if (notice) {
@@ -1345,8 +1372,7 @@ async function drive($, e, state, progress) {
         if (ACTIVE.includes(job.status) || !ended(job, state)) return blocked('Roundtable notice is waiting for the current job to end.', state);
         await settleRoundtableNotice($, notice, 'accepted');
       }
-      const expiredAnswer = answeringDisplayedQuestion && !pending
-        && !(gemini && message.questionId && !decision && ended(job, state));
+      const expiredAnswer = answeringDisplayedQuestion && !pending;
       if (expiredAnswer) {
         // The persisted displayed result fixes this message's intent, even if
         // another answer path completed the job while the adapter was unloaded.
@@ -1369,6 +1395,8 @@ async function drive($, e, state, progress) {
         return { ...current, next: nativeNext(state, current.status),
           notice: 'The earlier question was already resolved or ended. Send a new brief to start new work.' };
       }
+    }
+    if (job && (!gemini || answerId)) {
       if (job.request?.permissionPolicy && job.request.permissionPolicy.mode !== (state.claudePermissionMode ?? state.permissionMode ?? 'unknown')) {
         await companion($, state, ['cancel', state.jobId, '--json']);
         return blocked(`Native permission mode changed; the live ${runtimeLabel(state)} turn must stop before continuing.`, state, 'native_permission_mode_changed');
@@ -1384,12 +1412,12 @@ async function drive($, e, state, progress) {
     else if (state.status === 'needs_answer') {
       // Headers are task settings only. A question answer's body is verbatim.
       state.intent = { session: state.session, agentId: e.agentId, turnId: e.turnId, kind: 'answer', nonce: nonceFor(state.session, e.agentId, e.turnId) };
-      args = questionChanged || answerRefused
+      args = questionChanged
         ? ['wait', state.jobId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC]
-        : ['answer', state.jobId, '--question', state.questionId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
-      if (questionChanged || answerRefused) input = '';
+        : ['answer', state.jobId, '--question', answerId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
+      if (questionChanged) input = '';
     } else {
-      if (message.questionId && decision) return blocked('That permission question has ended. The reply was not delivered.', state);
+      if (!input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
       if (parsed.flags.includes('--roundtable')) {
@@ -1445,13 +1473,17 @@ async function drive($, e, state, progress) {
       catch (error) { error.launchNotStarted = true; throw error; }
       if (state.intent.kind === 'task') input = await lifecycleBrief($, state, input);
       report = await companion($, state, args, input, progress);
-      if (answerRefused) report = { ...report,
-        notice: 'Your message was not delivered as an assignment. ' + (report.question?.kind === 'action-approval'
-          ? 'Answer the displayed permission question with exactly Allow once or Deny.' : 'Reply to the current question.') };
       if (resumedWait && report && typeof report === 'object') report = { ...report,
         notice: `The earlier question had already expired or been answered; this message was not delivered to ${runtimeLabel(state)}. Waited for the running job instead.` };
     }
     catch (error) {
+      if (gemini && args[0] === 'answer' && error.message === 'Question is no longer pending; no answer was sent.') {
+        // Another answer won the companion lock after validation. Re-read the
+        // question for display only; never retry the submission.
+        const latest = await handles($, state, state.jobId, false, false);
+        const refusal = await geminiMessageRefusal($, state, latest, { id: answerId, body: input });
+        if (refusal) return refusal;
+      }
       if (error.launchNotStarted || (state.intent.kind === 'task' && error.launchRejected
         && await reconcile($, state, true, true) === null)) {
         // An exited companion's error AND an authoritative empty nonce lookup close
@@ -1573,7 +1605,8 @@ async function recheck($, state) {
   const job = state.jobId ? await handles($, state, state.jobId, true)
     : state.intent?.kind === 'task' ? await reconcile($, state, true) : null;
   if (job?.pendingQuestion && ACTIVE.includes(job.status)) {
-    // A displayed question's final save may have been lost. Admit a message
+    if (state.type === GEMINI_AGENT_TYPE) return true;
+    // A displayed Codex question's final save may have been lost. Admit a message
     // only to re-show the current question, never guess which one was shown.
     state.status = 'needs_answer'; state.questionId = null;
     await save($, state);
@@ -1766,8 +1799,7 @@ function progressFor($, e, state, publish, currentFlight) {
 }
 
 export function register(on) {
-  const resolvingSends = new Set();
-  registerSteering(on, dispatching, resolvingSends);
+  registerSteering(on);
   registerRoundtableNotifier(on);
   guidanceCache = null;
   teammateReceive(on);
@@ -1970,7 +2002,7 @@ export function register(on) {
         // One small durable guard (not the admission scan) until turn.start
         // persists the binding, so a reload in between still fails closed.
         await $.store.set(bindingFailedKey(session, result.agentId), { bindingPending: true, at: await $.clock.now(),
-          type: e.subagentType, ...(e.subagentType === GEMINI_AGENT_TYPE ? { session, agentId: result.agentId, name } : {}),
+          type: e.subagentType,
           ...(isTeammate ? { isTeammate: true } : {}) }).catch(() => {});
       }
       return result;
@@ -2029,17 +2061,18 @@ export function register(on) {
           await Promise.all(own.map(binding => binding.pending));
           state = await $.store.get(key);
         }
-        // A sender can still be resolving the recipient of an earlier send.
-        // Preserve its address before this admission replaces the old report.
-        if (agent.type === GEMINI_AGENT_TYPE) {
-          for (const routes of resolvingSends) if (!routes.has(key)) routes.set(key, returnedQuestion(state));
-        }
-        let incomingText = e.text;
-        if (incomingText.length > 65536 && incomingMessage(state, incomingText).text.length > 65536) {
-          // Neither permission choice can be oversized. Re-show the question
-          // through the ordinary invalid-answer path without retaining the text.
-          if (agent.type !== GEMINI_AGENT_TYPE || state?.answer?.status !== 'needs_answer') return await refuse('native_message_too_large');
-          incomingText = '';
+        let incomingText = e.text, oversized;
+        if (incomingText.length > 65536) {
+          const body = incomingBody(state, incomingText);
+          if (body.length > 65536) {
+            if (agent.type !== GEMINI_AGENT_TYPE || !(state?.jobId || state?.intent)) return await refuse('native_message_too_large');
+            // Keep oversized input out of the binding. The live question at
+            // receipt decides which refusal to show. A padded valid header
+            // still counts only its extracted answer body.
+            const reply = geminiAnswer(body);
+            if (reply && reply.id.length <= 128 && reply.body.length <= 8000) incomingText = `Answer ${reply.id}\n${reply.body}`;
+            else { oversized = reply ? 'answer' : 'brief'; incomingText = ''; }
+          }
         }
         rememberPrompt($, e);
         if (state) restoreBinding(key, state);
@@ -2054,11 +2087,16 @@ export function register(on) {
           return;
         }
         if (state?.intent && state.intent.turnId !== state.answeredTurn && !await isClosed($, state)
-          && !await recheck($, state).catch(() => false)) return;
+          && !await recheck($, state).catch(() => false)) {
+          if (agent.type === GEMINI_AGENT_TYPE && ACTIVE.includes(state.status)) {
+            refusals.set(key, { turnId: e.turnId, report: blocked(GEMINI_BUSY, state) });
+          }
+          return;
+        }
         if (refusals.get(key)?.report.blockers[0].code === 'native_binding_gone') return await refuse('native_binding_gone');
         refusals.delete(key);
         candidate = { ...(state || { type: agent.type || AGENT_TYPE, session, agentId: e.agentId, name: (agent.name !== e.agentId && agent.name) || observedBindings.get(key)?.name,
-          bindingPending: !observedBindings.has(key) }), turnId: e.turnId, incoming: { turnId: e.turnId, text: incomingText, ...(notice ? { notice } : {}) } };
+          bindingPending: !observedBindings.has(key) }), turnId: e.turnId, incoming: { turnId: e.turnId, text: incomingText, ...(oversized ? { oversized } : {}), ...(notice ? { notice } : {}) } };
         bindingFailed = await $.store.get(bindingFailedKey(session, e.agentId));
         if (bindingFailed) candidate.bindingPending = true;
         restoreBinding(key, candidate);
@@ -2086,7 +2124,7 @@ export function register(on) {
             ...(candidate.bindingPending ? { bindingPending: true } : {}) };
           delete value.finishedAt;
           restoreBinding(key, value);
-          if (value.type === GEMINI_AGENT_TYPE) value.returnedTurn = null;
+          if (value.type === GEMINI_AGENT_TYPE) delete value.returnedTurn; // Discard the obsolete sender routing marker.
           if (budget.count + Number(!budget.keepSize) > MAX_RECORDS
             || budget.size - budget.keepSize + stateSize(value) > MAX_STORE_SIZE) return 'native_capacity';
           if (!latest && (resumedSpawns.has(key) || (!observedBindings.has(key) && !bindingFailed))) return 'native_binding_gone';
@@ -2116,14 +2154,12 @@ export function register(on) {
     const flight = `${key}:${e.turnId}`;
     const listener = observer();
     let running = flights.get(flight);
-    const releaseFlight = () => {
-      if (flights.get(flight) === running) flights.delete(flight);
-      if (dispatching.get(key) === running) dispatching.delete(key);
-    };
     if (!running) {
       // Do not wait on another turn's stream (which spends this hook's budget).
       // One agent owns the dispatch lock; a concurrent turn is refused.
-      if (dispatching.has(key)) return yield* finish(e, blocked('Another turn is active for this native agent; retry after it finishes.', { agentId: e.agentId }));
+      if (dispatching.has(key)) return yield* finish(e, agent.type === GEMINI_AGENT_TYPE
+        ? blocked(GEMINI_BUSY, { agentId: e.agentId, type: agent.type })
+        : blocked('Another turn is active for this native agent; retry after it finishes.', { agentId: e.agentId }));
       running = { listeners: new Set(), done: false,
         feed: { agentId: e.agentId, turnId: e.turnId, entries: [], omitted: 0 },
         display: { turnId: e.turnId, name: agent.name || e.agentId, elapsedMs: 0, status: 'running' } };
@@ -2171,6 +2207,9 @@ export function register(on) {
         let report, uncertain = false, stopping = false;
         try {
           report = await drive($, e, state, progress);
+          if (state.type === GEMINI_AGENT_TYPE && report.status === 'needs_answer') {
+            report = { ...report, next: geminiAnswerNext(state, report.question) };
+          }
           if (report.status === 'owner_stopped') {
             stopping = true;
             report = await stoppedReport($, state) || report;
@@ -2206,12 +2245,21 @@ export function register(on) {
           // previous intent's closure as it was.
           if (!uncertain && (!state.intent || state.intent.turnId === e.turnId)) state.answeredTurn = e.turnId;
           if (!uncertain && report.status !== 'needs_answer' && !UNSETTLED.includes(state.status)) state.finishedAt = await $.clock.now();
-          if (state.type === GEMINI_AGENT_TYPE) {
-            // A finished producer can still have unread progress. Commit the
-            // returned report when the consumer reaches its text chunk.
-            running.returnState = state;
-          } else {
-            await saveFinalReport($, state, report);
+          // questionId means shown to Claude, not observed in the job. Earlier
+          // saves can fail and turn the response into blocked; only this path
+          // commits the question whose needs_answer report we actually return.
+          if (state.type !== GEMINI_AGENT_TYPE && report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
+          try { await save($, state); }
+          catch (error) {
+            // The companion may already have marked a terminal report as
+            // delivered. A failed adapter cache write must not replace it.
+            if (UNSETTLED.includes(report.status)) throw error;
+            if (report.status === 'needs_answer') {
+              // A store may commit and then throw. Still return the question;
+              // retry pre-commit failures so it remains answerable. Persistent
+              // failure is repaired by re-showing the current question.
+              await save($, state).catch(() => {});
+            }
           }
         }
         running.display.status = report.status;
@@ -2231,7 +2279,8 @@ export function register(on) {
           if (Number.isFinite(running.display.startedAt)) running.display.elapsedMs = Math.max(0, await $.clock.now() - running.display.startedAt);
         } catch { /* Keep the last tick. */ }
         for (const item of running.listeners) item.close();
-        if (!running.returnState || !running.listeners.size) releaseFlight();
+        if (flights.get(flight) === running) flights.delete(flight);
+        if (dispatching.get(key) === running) dispatching.delete(key);
         if (liveProgress.get(e.agentId) === running.feed) {
           liveProgress.delete(e.agentId);
           rememberDisplay(agentDisplays, e.agentId, running.display);
@@ -2243,18 +2292,8 @@ export function register(on) {
     } else running.listeners.add(listener);
     try {
       yield* listener.read(running);
-      const report = await running.result;
-      if (!running.returnState) return yield* finish(e, report);
-      running.returnState.returnedTurn = e.turnId;
-      running.returning ??= saveFinalReport($, running.returnState, report);
-      return yield* finish(e, await running.returning, () => {
-        for (const routes of resolvingSends) if (!routes.has(key)) routes.set(key, undefined);
-        releaseFlight();
-      });
-    } finally {
-      running.listeners.delete(listener); listener.close();
-      if (running.done && !running.listeners.size) releaseFlight();
-    }
+      return yield* finish(e, await running.result);
+    } finally { running.listeners.delete(listener); listener.close(); }
   }).catch(async function* ($, e, next) {
     if (!e.agentId || (!await isRoundtableNoticeTurn($, e) && knownTypes.has(e.agentId) && !isNativeType(knownTypes.get(e.agentId)))) return yield* next(e);
     return yield* finish(e, blocked('Native adapter hook failed; inspect fugato status before retrying.', { agentId: e.agentId }));
@@ -2324,28 +2363,10 @@ export function register(on) {
   registered = true;
 }
 
-async function saveFinalReport($, state, report) {
-  if (report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
-  try { await save($, state); }
-  catch (error) {
-    if (UNSETTLED.includes(report.status)) throw error;
-    if (report.status === 'needs_answer') {
-      try { await save($, state); }
-      catch {
-        if (state.type !== GEMINI_AGENT_TYPE) return report;
-        const target = report.worker || report.jobId;
-        return { ...report, next: null, notice: `SendMessage answers may be refused because the returned question could not be saved. Continue with fugato answer ${target} --question '${state.questionId}' and the answer on stdin.` };
-      }
-    }
-  }
-  return report;
-}
-
-async function* finish(e, report, onYield) {
+async function* finish(e, report) {
   // 2.1.302 d.ts 14211-14214 calls usage "What the request cost as the API
   // reported it". Codex tokens belong in the report/notice, never this ledger.
   const text = JSON.stringify(report);
-  onYield?.();
   yield { kind: 'text', index: 1, text };
   yield { kind: 'stop', stopReason: 'end_turn', usage: null };
   return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage: null };

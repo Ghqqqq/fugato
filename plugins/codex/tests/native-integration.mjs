@@ -305,6 +305,8 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
       return { model: 'haiku', agentId, ...(options.teammateId ? { teammateId: options.teammateId } : {}) };
     });
     await spawning;
+    const recipient = agents.find(agent => agent.id === agentId);
+    if (recipient?.type === 'fugato:gemini-native') recipient.status = 'running';
     await options.afterSpawn?.();
     await invoke('turn.start', { agentId, turnId: `turn-${number}`, text: rewritten }, async e => ({ turnId: e.turnId }));
     const result = await invoke('turn.step', { agentId, turnId: `turn-${number}`, index: 0, model: 'haiku', effort: 'low', messageCount: 1 }, async function* () {
@@ -316,6 +318,7 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
       answer: aborted ? '' : result.answer, durationMs: 1, isAborted: aborted, reason: aborted ? 'aborted' : 'answer' }, async e => ({ text: e.answer }));
     if (!aborted) assert.equal(completion.text, result.answer);
     assert.equal(modelCalls, 0);
+    if (recipient?.type === 'fugato:gemini-native') recipient.status = 'completed';
     return JSON.parse(result.answer);
   }
   function save() {
@@ -1440,7 +1443,7 @@ test('native Gemini usage identifies Google Antigravity and the reported model o
   assert.match(await renderCard(f, report), /Google Antigravity · gemini-4-neon · 9.65k tokens/);
 });
 
-const busyGemini = { isDelivered: false, reason: 'This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again; answer a displayed permission question with exactly Allow once or Deny.' };
+const busyGemini = { isDelivered: false, reason: 'This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again.' };
 function geminiInbox(f) {
   const messages = [];
   const send = (text, to = 'native-agent') => f.invoke('session.send', { to, text, origin: { kind: 'model' } }, async e => {
@@ -1454,112 +1457,123 @@ function geminiInbox(f) {
   return { send, receive, messages };
 }
 
-const tagged = (id, text) => `[Fugato Gemini answer ${id}]\n${text}`;
+const answerTo = (id, body) => `Answer ${id}\n${body}`;
 const permissionRequest = (toolCallId, content = 'replacement') => ({ method: 'session/request_permission', params: {
   toolCall: { toolCallId, name: 'edit_file', kind: 'edit', rawInput: { Path: 'report  file.txt', Replacement: content } },
   options: [{ optionId: 'allow', kind: 'allow_once', name: 'Allow' }, { optionId: 'deny', kind: 'reject_once', name: 'Deny' }]
 } });
 
-test('two Gemini decisions sent for Q1 cannot answer Q2 or start another job', async () => {
+test('queued Gemini answers keep their question ID across a reload and a second permission request', async () => {
   const f = fixture('review-ok', 'gemini-two-questions');
   const acp = installFakeAntigravity(`${f.root}/acp`, { serverRequests: [permissionRequest('one'), permissionRequest('two')] });
   f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
   const inbox = geminiInbox(f);
   const q1 = await f.turn('Review both changes.', 1, false, { agentType: geminiType });
   assert.equal(q1.status, 'needs_answer');
-  await inbox.send('Allow once');
-  await inbox.send('Deny');
-  assert.deepEqual(inbox.messages, [tagged(q1.question.id, 'Allow once'), tagged(q1.question.id, 'Deny')]);
-  // A third send began at Q1, but its roster lookup completes after Q2.
+  assert.equal(q1.next, `SendMessage to ${q1.worker}: "Answer ${q1.question.id}\nAllow once" (or Deny)`);
+  const allow = answerTo(q1.question.id, 'Allow once'), deny = answerTo(q1.question.id, 'Deny');
+  for (const message of [allow, deny]) assert.deepEqual(await inbox.send(message), { isDelivered: true });
+  assert.deepEqual(inbox.messages, [allow, deny]);
+  // Leave another Q1 send in roster lookup while the first answer opens Q2
+  // and the host re-registers the hooks.
+  const list = f.$.agent.list;
   let release;
   const gate = new Promise(resolve => { release = resolve; });
-  const list = f.$.agent.list;
   f.$.agent.list = async () => { f.$.agent.list = list; await gate; return list(); };
-  const delayed = inbox.send('Allow once');
-  const q2 = await inbox.receive(2).finally(release);
+  const delayed = inbox.send(allow);
+  let q2;
+  try { q2 = await inbox.receive(2); f.reload(); } finally { release(); }
   assert.deepEqual(await delayed, { isDelivered: true });
-  assert.deepEqual(inbox.messages.pop(), tagged(q1.question.id, 'Allow once'));
+  assert.deepEqual(inbox.messages, [deny, allow]);
   assert.equal(q2.status, 'needs_answer');
   assert.notEqual(q2.question.id, q1.question.id);
-  f.reload();
-  const stale = await inbox.receive(3);
-  assert.equal(stale.question.id, q2.question.id);
-  assert.match(stale.notice, /not delivered/);
-  const literal = tagged(q2.question.id, 'Allow once');
-  await inbox.send(literal);
-  assert.deepEqual(inbox.messages, ['[Fugato Gemini assignment]\n' + literal]);
-  assert.equal((await inbox.receive(4)).question.id, q2.question.id);
-  const untagged = await f.turn('Allow once', 5, false, { wake: true });
-  assert.equal(untagged.question.id, q2.question.id);
-  assert.match(untagged.notice, /not delivered/);
+  for (const turn of [3, 4]) {
+    const stale = await inbox.receive(turn);
+    assert.equal(stale.question.id, q2.question.id);
+    assert.equal(stale.next, `SendMessage to ${q2.worker}: "Answer ${q2.question.id}\nAllow once" (or Deny)`);
+    assert.ok(stale.notice.includes(stale.next));
+    assert.equal(f.jobs()[0].pendingQuestion.id, q2.question.id);
+  }
   assert.deepEqual(acp.state().serverResponses.map(r => r.result.outcome.optionId), ['allow']);
-  await inbox.send('Deny');
-  await inbox.send('Allow once');
-  assert.equal((await inbox.receive(6)).blockers[0].code, 'approval_denied');
-  assert.equal((await inbox.receive(7)).status, 'blocked');
+  // Old hook versions retained the last displayed question in the binding.
+  // Even a stale completed report cannot change the recipient of this answer.
+  const store = f.readStore(), binding = store['native:v2:native-session:native-agent'];
+  Object.assign(binding, { status: 'completed', answer: { status: 'completed' }, questionId: q1.question.id, returnedTurn: null });
+  f.setStore(store);
+  await inbox.send(answerTo(q2.question.id, 'Deny'));
+  assert.equal((await inbox.receive(5)).blockers[0].code, 'approval_denied');
   assert.deepEqual(acp.state().serverResponses.map(r => r.result.outcome.optionId), ['allow', 'deny']);
   assert.equal(f.jobs().length, 1);
 });
 
-test('Gemini busy refusal and question addressing survive missing roster entries by id or name', async () => {
-  const f = fixture('review-ok', 'gemini-lookup', { hostOnly: true });
-  const state = { v: 2, session: 'native-session', agentId: 'g1', type: geminiType, name: 'Curie', status: 'running' };
-  const key = 'native:v2:native-session:g1';
-  f.setStore({ [key]: state, 'native:v2:elsewhere:g2': { ...state, session: 'elsewhere', agentId: 'g2', name: 'other' } });
-  const inbox = geminiInbox(f);
-  for (const list of [async () => [], async () => { throw new Error('Roster unavailable'); }]) {
+test('a Gemini answer that loses the companion lock re-shows the new question', async () => {
+  const f = fixture('review-ok', 'gemini-answer-race');
+  const acp = installFakeAntigravity(`${f.root}/acp`, { serverRequests: [permissionRequest('one'), permissionRequest('two')] });
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  const first = await f.turn('Review both changes.', 1, false, { agentType: geminiType });
+  const inbox = geminiInbox(f), spawn = f.$.process.spawn;
+  await inbox.send(answerTo(first.question.id, 'Deny'));
+  let second;
+  f.$.process.spawn = request => {
+    if (request.argv[2] === 'answer') {
+      f.$.process.spawn = spawn;
+      const winner = spawnSync(process.execPath, [plugin + '/bin/fugato', 'answer', first.jobId, '--question', first.question.id,
+        '--cwd', `${f.root}/repo`, '--session', 'native-session'], { env: f.env, input: 'Allow once', encoding: 'utf8' });
+      assert.equal(winner.status, 0, winner.stderr || winner.stdout);
+      second = JSON.parse(winner.stdout.trim().split('\n').at(-1)).question.id;
+    }
+    return spawn(request);
+  };
+  const retry = await inbox.receive(2);
+  assert.equal(retry.status, 'needs_answer', JSON.stringify(retry));
+  assert.equal(retry.question.id, second);
+  assert.notEqual(second, first.question.id);
+  assert.ok(retry.notice.includes(retry.next));
+  assert.deepEqual(acp.state().serverResponses.map(r => r.result.outcome.optionId), ['allow']);
+  await inbox.send(answerTo(second, 'Deny'));
+  assert.equal((await inbox.receive(3)).blockers[0].code, 'approval_denied');
+  assert.equal(f.jobs().length, 1);
+});
+
+test('Codex queue preserves the original event through a roster gap and an ambiguous name', async () => {
+  const f = fixture('review-ok', 'codex-recipient', { hostOnly: true });
+  const event = { to: 'codex-id', text: '[Fugato Gemini assignment]\nKeep this literal brief.', origin: { kind: 'model' } };
+  const queued = [];
+  for (const list of [
+    async () => { throw new Error('Roster unavailable'); },
+    async () => [{ id: 'codex-id', type: AGENT_TYPE, name: 'Curie', status: 'running' },
+      { id: 'gemini-id', type: geminiType, name: 'codex-id', status: 'running' }]
+  ]) {
     f.$.agent.list = list;
-    assert.deepEqual(await inbox.send('another brief', 'g1'), busyGemini);
-    assert.deepEqual(await inbox.send('another brief', 'CURIE'), busyGemini);
+    assert.deepEqual(await f.invoke('session.send', event, async e => {
+      queued.push(e); return { isDelivered: true };
+    }), { isDelivered: true });
   }
-  assert.deepEqual(inbox.messages, []);
-  assert.deepEqual(await inbox.send('ordinary host delivery', 'other'), { isDelivered: true });
-  state.status = 'needs_answer';
-  state.answer = { status: 'needs_answer', question: { id: 'q1' } };
-  state.questionId = 'q1';
-  f.setStore({ [key]: state });
-  assert.deepEqual(await inbox.send('Deny', 'curie'), { isDelivered: true });
-  assert.deepEqual(inbox.messages, ['ordinary host delivery', tagged('q1', 'Deny')]);
+  assert.deepEqual(queued, [event, event]);
   assert.equal(f.capture.processes.length, 0);
 });
 
-test('a Gemini question opens at the report chunk and gives CLI recovery when its returned marker cannot be saved', async () => {
-  for (const failSave of [false, true]) {
-    const f = fixture('review-ok', 'gemini-yield');
-    f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`, { behavior: 'permission' }).binary;
-    const inbox = geminiInbox(f), store = f.$.store.set;
-    let before, after, rejected = 0;
-    f.$.store.set = async (key, value) => {
-      if (failSave && value.answer?.status === 'needs_answer') { rejected++; throw new Error('Store full'); }
-      return store(key, value);
-    };
-    const question = await f.turn('Wait for review.', 1, false, { agentType: geminiType, onChunk: async chunk => {
-      if (!before && chunk.kind === 'thinking') {
-        // Leave the consumer paused while the producer finishes the job lookup,
-        // stops its display timer and accumulates the rest of the progress.
-        await until(() => f.jobs()[0]?.pendingQuestion && f.timers.size === 0);
-        before = await inbox.send('Allow once');
-      }
-      if (chunk.kind === 'text') after = await inbox.send('Deny');
-    } });
-    assert.equal(question.status, 'needs_answer');
-    assert.deepEqual(before, busyGemini);
-    if (failSave) {
-      assert.equal(rejected, 2);
-      assert.deepEqual(after, busyGemini);
-      assert.equal(question.next, null);
-      assert.match(question.notice, /answers may be refused.*fugato answer gemini-yield/);
-      assert.match(await renderCard(f, question), /fugato\s+answer gemini-yield/);
-      const fallback = spawnSync(process.execPath, [plugin + '/bin/fugato', 'answer', question.worker, '--question', question.question.id,
-        '--cwd', `${f.root}/repo`, '--session', 'native-session'], { env: f.env, input: 'Allow once', encoding: 'utf8' });
-      assert.equal(fallback.status, 0, fallback.stderr || fallback.stdout);
-      assert.equal(f.jobs()[0].status, 'completed');
-    } else {
-      assert.deepEqual(after, { isDelivered: true });
-      assert.deepEqual(inbox.messages, [tagged(question.question.id, 'Deny')]);
-      assert.equal((await inbox.receive(2)).blockers[0].code, 'approval_denied');
-    }
-  }
+test('a lost final adapter write leaves both a Gemini question and its completed job reachable', async () => {
+  const f = fixture('review-ok', 'gemini-save');
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`, { behavior: 'permission' }).binary;
+  const inbox = geminiInbox(f), set = f.$.store.set;
+  const rejected = new Set();
+  f.$.store.set = async (key, value) => {
+    if (value.answer) { rejected.add(value.answer.status); throw new Error('Final cache write failed'); }
+    return set(key, value);
+  };
+  const question = await f.turn('Wait for review.', 1, false, { agentType: geminiType });
+  assert.equal(question.status, 'needs_answer');
+  assert.ok(question.next.includes(answerTo(question.question.id, 'Allow once')));
+  f.reload();
+  await inbox.send(answerTo(question.question.id, 'Allow once'));
+  assert.equal((await inbox.receive(2)).status, 'completed');
+  assert.deepEqual([...rejected], ['needs_answer', 'completed']);
+  f.reload();
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/next-acp`).binary;
+  await inbox.send('Continue after the failed cache write.');
+  assert.equal((await inbox.receive(3)).status, 'completed');
+  assert.equal(f.jobs().length, 2);
 });
 
 test('background delivery exempts only action-approval text through 16 KiB', async () => {
@@ -1571,13 +1585,17 @@ test('background delivery exempts only action-approval text through 16 KiB', asy
   assert.equal(attached.question.text, q.question.text);
   assert.ok(attached.question.text.includes('x'.repeat(2521)));
   const accepts = (text, kind = 'action-approval', extra = {}) => isC2Report({ ...attached, ...extra, question: { ...attached.question, text, kind } });
+  const { backend, provider, model, ...codex } = attached;
+  const question = { ...attached.question, text: 'x'.repeat(3000) };
+  assert.equal(isC2Report({ ...codex, question }), false);
+  assert.equal(isC2Report({ ...attached, question }), true);
   assert.equal(accepts('é'.repeat(8192)), true);
   assert.equal(accepts('é'.repeat(8192) + 'x'), false);
   assert.equal(accepts(q.question.text, 'question'), false);
   assert.equal(accepts(q.question.text, 'action-approval', { next: 'x'.repeat(2001) }), false);
   f.reload();
   const inbox = geminiInbox(f);
-  await inbox.send('Deny');
+  await inbox.send(answerTo(q.question.id, 'Deny'));
   assert.equal((await inbox.receive(2)).blockers[0].code, 'approval_denied');
 });
 
@@ -1599,7 +1617,7 @@ test('the native follow-up size limit counts the extracted body on Gemini and Co
   }
 });
 
-test('a Gemini ask_parent question accepts a tagged free-text answer', async () => {
+test('a Gemini ask_parent question remains answerable after oversized input and rejects a late answer', async () => {
   const f = fixture('review-ok', 'gemini-parent-question');
   const acp = installFakeAntigravity(`${f.root}/acp`, { behavior: 'hold' });
   f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
@@ -1608,7 +1626,7 @@ test('a Gemini ask_parent question accepts a tagged free-text answer', async () 
   const [config] = acp.requests().find(request => request.method === 'session/new').params.mcpServers;
   const env = { ...f.env, ...Object.fromEntries(config.env.map(item => [item.name, item.value])) };
   const bridge = spawn(config.command, config.args, { cwd: job.workspaceRoot, env, stdio: ['pipe', 'pipe', 'pipe'] });
-  let output = '', answer;
+  let output = '', answer, expiredId;
   bridge.stdout.on('data', chunk => { output += chunk; });
   try {
     bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
@@ -1616,11 +1634,26 @@ test('a Gemini ask_parent question accepts a tagged free-text answer', async () 
     const question = await first;
     assert.equal(question.question.kind, 'question');
     const inbox = geminiInbox(f);
-    await inbox.send('docs');
-    assert.deepEqual(inbox.messages, [tagged(question.question.id, 'docs')]);
-    answer = inbox.receive(2);
+    assert.equal(question.next, `SendMessage to ${question.worker}: "Answer ${question.question.id}\n<your answer>"`);
+    const before = f.capture.processes.filter(p => p.request.argv[2] === 'answer').length;
+    await inbox.send(answerTo(question.question.id, 'x'.repeat(8001)));
+    const retry = await inbox.receive(2);
+    assert.equal(retry.question.id, question.question.id);
+    assert.match(retry.notice, /8000-character limit/);
+    assert.equal(f.capture.processes.filter(p => p.request.argv[2] === 'answer').length, before);
+    const body = '[Fugato Gemini] docs\nSecond line.'.padEnd(8000, 'x');
+    await inbox.send(answerTo(question.question.id, body));
+    answer = inbox.receive(3);
     await until(() => output.includes('\n'));
-    assert.equal(JSON.parse(output).result.content[0].text, 'docs');
+    assert.equal(JSON.parse(output).result.content[0].text, body);
+    // End the job outside the adapter with another ordinary question still
+    // displayed. Its cached report will survive the reload below.
+    bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call',
+      params: { name: 'ask_parent', arguments: { question: 'Which directory next?' } } }) + '\n');
+    const pending = await answer;
+    assert.equal(pending.status, 'needs_answer');
+    expiredId = pending.question.id;
+    assert.notEqual(expiredId, question.question.id);
   } finally {
     bridge.stdin.end();
     const cancelled = spawnSync(process.execPath, [plugin + '/bin/fugato', 'cancel', job.id, '--json', '--cwd', job.workspaceRoot],
@@ -1628,9 +1661,19 @@ test('a Gemini ask_parent question accepts a tagged free-text answer', async () 
     assert.equal(cancelled.status, 0, cancelled.stderr);
     if (answer) assert.equal((await answer).jobId, job.id);
   }
+
+  const inbox = geminiInbox(f);
+  f.reload();
+  await inbox.send(answerTo(expiredId, 'docs'));
+  assert.match((await inbox.receive(4)).summary, /stale/);
+  assert.equal(f.jobs().length, 1);
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/next-acp`).binary;
+  await inbox.send('Inspect the docs.');
+  assert.equal((await inbox.receive(5)).status, 'completed');
+  assert.equal(f.jobs().length, 2);
 });
 
-test('a running Gemini turn refuses SendMessage without queuing work, even across a slow lookup', async () => {
+test('a running Gemini turn refuses a send and a delivery that slipped past roster discovery', async () => {
   const f = fixture('review-ok', 'gemini-busy');
   const acp = installFakeAntigravity(`${f.root}/acp`, { behavior: 'exit' });
   const gate = `${f.root}/allow-start`;
@@ -1638,16 +1681,20 @@ test('a running Gemini turn refuses SendMessage without queuing work, even acros
   fs.writeFileSync(f.env.FUGATO_ANTIGRAVITY_BIN, `#!/bin/sh\nif [ "$2" != "--help" ]; then while [ ! -e "${gate}" ]; do sleep 0.05; done; fi\nexec "${acp.binary}" "$@"\n`, { mode: 0o755 });
   const inbox = geminiInbox(f);
   const running = f.turn('Run until the fixture exits.', 1, false, { agentType: geminiType });
-  await until(() => f.jobs().some(job => job.status === 'running'));
-  let release;
-  const gateLookup = new Promise(resolve => { release = resolve; });
-  const list = f.$.agent.list;
-  f.$.agent.list = async () => { f.$.agent.list = list; await gateLookup; return list(); };
-  const early = inbox.send('Another assignment');
-  fs.writeFileSync(gate, '');
-  const ended = await running.finally(release);
-  assert.equal(ended.status, 'failed');
-  assert.deepEqual(await early, busyGemini);
+  try {
+    await until(() => f.jobs().some(job => job.status === 'running'));
+    assert.deepEqual(await inbox.send('During the turn', 'GEMINI-BUSY'), busyGemini);
+    const list = f.$.agent.list, get = f.$.store.get;
+    f.$.agent.list = async () => { throw new Error('Roster unavailable'); };
+    f.$.store.get = async () => { throw new Error('Binding unavailable'); };
+    assert.deepEqual(await inbox.send('Another assignment'), { isDelivered: true });
+    assert.deepEqual(inbox.messages, ['Another assignment']);
+    f.$.store.get = get; f.$.agent.list = list;
+    f.reload(); // force the receiver to consult the job, without a local flight
+    const refused = await inbox.receive(2);
+    assert.equal(refused.summary, busyGemini.reason);
+    assert.equal(f.capture.processes.filter(p => p.kind === 'spawn' && ['task', 'answer'].includes(p.request.argv[2])).length, 1);
+  } finally { fs.writeFileSync(gate, ''); await running; }
   assert.deepEqual(inbox.messages, []);
   assert.equal(f.jobs().length, 1);
 });
@@ -1668,7 +1715,7 @@ test('a Gemini permission notice cannot accept an answer until the question is r
   assert.deepEqual(receipt, busyGemini);
   assert.deepEqual(inbox.messages, []);
   assert.deepEqual(acp.state().serverResponses, []);
-  await inbox.send('Allow once');
+  await inbox.send(answerTo(question.question.id, 'Allow once'));
   assert.equal((await inbox.receive(2)).status, 'completed');
   assert.equal(acp.state().serverResponses[0].result.outcome.optionId, 'allow');
   assert.equal(f.jobs().length, 1);
@@ -1682,9 +1729,9 @@ test('a Gemini answer followed by a brief before the host drains either runs the
   const question = await f.turn('Request permission.', 1, false, { agentType: geminiType });
   assert.equal(question.status, 'needs_answer');
   const brief = 'Inspect the second file.';
-  await inbox.send('Allow once');
+  await inbox.send(answerTo(question.question.id, 'Allow once'));
   await inbox.send(brief);
-  assert.deepEqual(inbox.messages, [tagged(question.question.id, 'Allow once'), tagged(question.question.id, brief)]);
+  assert.deepEqual(inbox.messages, [answerTo(question.question.id, 'Allow once'), brief]);
   const spawn = f.$.process.spawn;
   let duringAnswer;
   f.$.process.spawn = request => {
@@ -1693,7 +1740,7 @@ test('a Gemini answer followed by a brief before the host drains either runs the
   };
   const answered = await inbox.receive(2);
   assert.deepEqual(await duringAnswer, busyGemini);
-  assert.deepEqual(inbox.messages, [tagged(question.question.id, brief)]);
+  assert.deepEqual(inbox.messages, [brief]);
   assert.equal(answered.jobId, question.jobId);
   assert.equal(answered.status, 'completed');
   assert.equal(acp.state().serverResponses[0].result.outcome.optionId, 'allow');
@@ -1718,19 +1765,19 @@ test('invalid Gemini permission replies re-show the question, including after an
   const list = f.$.agent.list;
   f.$.agent.list = async () => [];
   let turn = 1;
-  for (const input of ['Allow once ', '   ', 'x'.repeat(65537)]) {
+  for (const input of ['Allow once', '   ', answerTo(question.question.id, 'allow'), 'x'.repeat(65537)]) {
     assert.deepEqual(await inbox.send(input), { isDelivered: true });
-    assert.deepEqual(inbox.messages, [tagged(question.question.id, input)]);
+    assert.deepEqual(inbox.messages, [input]);
     f.$.agent.list = list;
     const again = await inbox.receive(++turn);
     assert.equal(again.status, 'needs_answer');
     assert.deepEqual([again.jobId, again.question.id, again.question.text], [question.jobId, question.question.id, question.question.text]);
-    assert.match(again.notice, /not delivered as an assignment/);
-    assert.match(await renderCard(f, again), /not delivered as an assignment/);
+    assert.ok(again.notice.includes(again.next));
+    assert.ok((await renderCard(f, again)).includes(again.next));
   }
   assert.equal(f.capture.processes.filter(p => p.request.argv[2] === 'answer').length, 0);
   assert.deepEqual(acp.state().serverResponses, []);
-  await inbox.send('Deny');
+  await inbox.send(` Answer ${question.question.id}  \r\n Deny `);
   const denied = await inbox.receive(++turn);
   assert.equal(denied.jobId, question.jobId);
   assert.equal(denied.blockers[0].code, 'approval_denied', JSON.stringify(denied));
@@ -1804,7 +1851,7 @@ test('native Gemini permission answers and /tasks stop retain the ACP job bindin
   assert.match(question.question.text, /Antigravity/);
   f.reload();
   let delivered;
-  await f.invoke('session.send', { to: 'native-agent', text: 'Allow once', origin: { kind: 'model' } },
+  await f.invoke('session.send', { to: 'native-agent', text: answerTo(question.question.id, 'Allow once'), origin: { kind: 'model' } },
     async e => { delivered = e.text; return { isDelivered: true }; });
   const answer = await f.turn(delivered, 2, false, { wake: true });
   assert.equal(answer.status, 'completed', JSON.stringify(answer));
