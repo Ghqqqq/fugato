@@ -1153,7 +1153,9 @@ async function executeTaskRun(request) {
   try {
     if (!request.detached) runtime.abort.signal.throwIfAborted();
     result = await (backend === "antigravity" ? runAntigravityTurn : runAppServerTurn)(workspaceRoot, {
-    ...(executable ? { executable, requestCwd: request.cwd } : {}),
+    // Without a resolved path the runner checks the request directory again and
+    // fails before launch; it never falls back to the workspace root.
+    ...(backend === "antigravity" ? { requestCwd: request.cwd, ...(executable ? { executable } : {}) } : {}),
     executionCwd: fs.realpathSync(request.cwd),
     jobId: request.jobId,
     onThreadBusy: (threadId, turnIds) => {
