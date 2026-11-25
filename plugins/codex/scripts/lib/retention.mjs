@@ -89,6 +89,9 @@ function readJson(file, cache = null) {
 // is not evidence that it is safe to reconcile automatically.
 function staleTask(job, now, requireUnresolved = true) {
   if (!job || job.jobClass !== "task" || active(job) || job.ownerAttached || alive(job.pid) || alive(job.launcherPid) || (requireUnresolved && !unresolvedTask(job))) return false;
+  // ACP has no exact-turn recovery API. Exclude Google records from both
+  // the bounded candidate scan and the child's final check before recovery.
+  if ([job.backend, job.request?.backend, job.result?.backend].includes("antigravity")) return false;
   if (!job.threadId || !job.turnId || typeof job.workspaceRoot !== "string" || !path.isAbsolute(job.workspaceRoot)) return false;
   const times = [job.createdAt, job.startedAt, job.updatedAt, job.completedAt].filter(value => value != null).map(value => Date.parse(value));
   if (job.leaseRenewedAt != null) times.push(Number(job.leaseRenewedAt));
@@ -114,9 +117,6 @@ export async function reconcileAutomaticTask(file, now, deadline) {
   };
   const job = read();
   if (!job || Date.now() >= deadline) return false;
-  // ACP has no exact-turn recovery API. Keep unknown Google outcomes intact;
-  // their session identifiers must never reach the Codex app-server.
-  if (job.request?.backend === "antigravity" || job.backend === "antigravity") return false;
   const { readAppServerTurn } = await import("./codex.mjs");
   const result = await readAppServerTurn(job.workspaceRoot, job, { env, deadline });
   // Unavailable/in-progress turns remain byte-for-byte unchanged. Do not let

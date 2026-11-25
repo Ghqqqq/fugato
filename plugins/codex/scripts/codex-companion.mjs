@@ -401,7 +401,7 @@ Tasks run through /fugato:roundtable <task>. Room commands: start, status <roomI
   "task-worker": `Usage: fugato task-worker --job-id <id> [--cwd <dir>]
 Internal detached worker entry point; --job-id selects a stored task.
   --cwd, -C  Workspace; --help, -h  Show help without starting a worker.`,
-  "task-resume-candidate": `Usage: fugato task-resume-candidate [--cwd <dir>] [--json]
+  "task-resume-candidate": `Usage: fugato task-resume-candidate [--backend <codex|antigravity>] [--cwd <dir>] [--json]
 Find the latest resumable task in this session; --json prints its handles.
   --cwd, -C  Workspace; --help, -h  Show help.`
 };
@@ -865,9 +865,10 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
+  const backend = normalizeBackend(options.backend);
   const workspaceJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const jobs = workspaceJobs.filter((job) => job.id !== options.excludeJobId && job.title !== "Codex Stop Gate Review"
-    && (!options.backend || jobBackend(job) === options.backend));
+    && jobBackend(job) === backend);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -879,7 +880,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
     return { id: trackedTask.threadId };
   }
 
-  if (sessionId || options.backend === "antigravity") {
+  if (sessionId || backend === "antigravity") {
     return null;
   }
 
@@ -1364,7 +1365,6 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   // Reserve the name under the same workspace lock that publishes job state.
   // Concurrent dispatches see this queued reservation before either launches.
   const stored = listJobs(workspaceRoot);
-  const inheritedPrevious = !identity.continued && identity.threadId ? resolveThreadInheritance(workspaceRoot, identity.threadId).job : null;
   let duplicateDispatch, releaseReservation;
   updateState(workspaceRoot, state => {
     const currentIds = new Set(state.jobs.map(candidate => candidate.id));
@@ -1373,12 +1373,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
       duplicateDispatch = candidates.find(candidate => candidate.dispatchNonce === identity.dispatchNonce && candidate.sessionId === record.sessionId);
       if (duplicateDispatch) return;
     }
-    const threadCandidates = identity.threadId ? [...candidates, inheritedPrevious]
-      .filter(candidate => candidate?.threadId === identity.threadId)
+    const threadCandidates = identity.threadId ? [...candidates, identity.sourceJob]
+      .filter(candidate => candidate?.threadId === identity.threadId && jobBackend(candidate) === identity.backend)
       .sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")) || b.id.localeCompare(a.id)) : [];
     // Another session may use a different name on this thread. Preserve this
     // session's identity while retaining explicit --continue job semantics.
-    const previous = identity.continued ?? (record.sessionId ? threadCandidates.find(candidate => candidate.agentName &&
+    const previous = identity.selectedJob ?? (record.sessionId ? threadCandidates.find(candidate => candidate.agentName &&
       (candidate.sessionId === undefined ? candidate.ownerId : candidate.sessionId) === record.sessionId) : null) ?? threadCandidates[0];
     const recent = Date.now() - 24 * 60 * 60 * 1000;
     const previousSession = (previous?.sessionId === undefined ? previous?.ownerId : previous.sessionId) || null;
@@ -1781,13 +1781,15 @@ async function handleTask(argv) {
     seconds(options["timeout-sec"], WAIT_MAX_SEC, "--timeout-sec", WAIT_MAX_SEC);
   }
   let cwd = resolveCommandCwd(options);
-  let explicitJob = false;
+  let selectedJob = null;
+  let threadBackend = options.backend;
   if (options.to !== undefined) {
     for (const flag of ["thread", "continue", "fresh", "resume", "resume-last"]) {
       if (options[flag] !== undefined) throw new Error(`--to cannot be combined with --${flag}.`);
     }
     const selected = resolveWorkerTarget(cwd, options.to.trim());
-    explicitJob = selected.job.id === options.to.trim();
+    if (selected.job.id === options.to.trim()) selectedJob = selected.job;
+    threadBackend = jobBackend(selected.job);
     if (selected.job.jobClass !== "task" || !selected.job.threadId) throw new Error(`Worker ${options.to} has no resumable Codex thread.`);
     options.thread = selected.job.threadId;
     cwd = selected.cwd;
@@ -1797,21 +1799,15 @@ async function handleTask(argv) {
   // Bind the handle once so a later lookup cannot select a different thread.
   if (options.resume || options["resume-last"]) {
     if (options.thread !== undefined || options.continue !== undefined || options.fresh) throw new Error("Choose --thread, --continue, --fresh, or --resume/--resume-last; these options cannot be combined.");
-    const latest = await resolveLatestTrackedTaskThread(resolveWorkspaceRoot(cwd), { backend: options.backend });
-    if (!latest) throw new Error(`No previous ${options.backend === "antigravity" ? "Antigravity" : "Codex"} task session was found for this repository.`);
+    threadBackend = normalizeBackend(options.backend);
+    const latest = await resolveLatestTrackedTaskThread(resolveWorkspaceRoot(cwd), { backend: threadBackend });
+    if (!latest) throw new Error(`No previous ${threadBackend === "antigravity" ? "Antigravity task session" : "Codex task thread"} was found for this repository.`);
     options.thread = latest.id;
   }
-  let inheritance = options.thread ? resolveThreadInheritance(cwd, options.thread.trim(), { allowCrossSessionFallback: explicitThread || explicitJob }) : null;
-  const inherited = inheritance?.job;
-  if (inherited && options.to === undefined && options.cwd === undefined) cwd = inherited.request?.cwd ?? inherited.workspaceRoot ?? cwd;
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  // Run choice belongs to this dispatch, independently of inherited runtime
-  // settings and grants. Reject invalid selections before any worker starts.
-  validateTaskRun(cwd, options.run);
   // --continue <job-id>: one more turn on a stopped/finished job's own thread,
   // inheriting that job's recorded authorization and runtime choices so a
   // replacement worker does not have to reconstruct them.
-  const continued = options.continue === undefined ? null : readStoredJob(workspaceRoot, String(options.continue).trim());
+  const continued = options.continue === undefined ? null : readStoredJob(resolveWorkspaceRoot(cwd), String(options.continue).trim());
   if (options.continue !== undefined) {
     if (!continued) throw new Error(`No stored job found for --continue ${options.continue}.`);
     if (continued.jobClass !== "task" || !continued.threadId) throw new Error(`Job ${continued.id} has no resumable Codex thread; nothing to continue.`);
@@ -1821,29 +1817,32 @@ async function handleTask(argv) {
     }
     if (options["approve-browser-origin"]?.length) throw new Error("--continue inherits the original job's approved browser origins; do not pass --approve-browser-origin.");
     if (options["approve-computer-app"]?.length) throw new Error("--continue inherits the original job's approved Computer Use apps; do not pass --approve-computer-app.");
+    selectedJob = continued;
   }
-  const sourceJob = continued ? startedThreadSettings(continued) ? continued
-    : resolveThreadInheritance(cwd, continued.threadId, { allowCrossSessionFallback: true }).job : inherited;
+  let threadId = continued ? continued.threadId : options.thread?.trim() ?? null;
+  const inheritance = threadId ? resolveThreadInheritance(cwd, threadId, {
+    selectedJob, backend: threadBackend, allowCrossSessionFallback: explicitThread || Boolean(selectedJob)
+  }) : null;
+  const sourceJob = inheritance?.job;
   const previousRequest = sourceJob?.request;
+  if (sourceJob && !continued && options.to === undefined && options.cwd === undefined) cwd = previousRequest?.cwd ?? sourceJob.workspaceRoot ?? cwd;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  validateTaskRun(cwd, options.run);
   if (continued && options.sandbox !== undefined && startedThreadSettings(continued) && recordedThreadSettings(continued).sandbox) {
     throw new Error("--continue inherits the original job's sandbox setting; do not pass --sandbox.");
   }
-  const sourceSession = (sourceJob?.sessionId === undefined ? sourceJob?.ownerId : sourceJob.sessionId) || null;
-  const sameSession = sourceSession === (getCurrentClaudeSessionId()?.trim() || null);
   // Handles select thread settings, not another Claude session's permission.
   // Never copy grants added only to the job by runtime answers.
   const grants = requestGrantsInSession(sourceJob);
   const grantRequest = grants ? previousRequest : null;
-  if (continued) inheritance = { details: {
-    jobId: sourceJob?.id ?? null, scope: sameSession ? "session" : "workspace",
-    settingsInherited: Boolean(sourceJob), requestGrantsInherited: grants,
-    note: grants ? "Inherited settings and recorded request grants from this session's job; runtime-only grants were excluded."
-      : "Inherited settings from the continued job; no request grants recorded in this session were inherited."
-  } };
   const recordedSettings = recordedThreadSettings(sourceJob);
-  const backend = normalizeBackend(options.backend ?? recordedSettings.backend ?? "codex");
-  if (sourceJob && backend !== jobBackend(sourceJob)) {
+  const backend = normalizeBackend(options.backend ?? inheritance?.backend);
+  if (inheritance?.backend && backend !== inheritance.backend) {
     throw new Error("A worker session keeps its original backend. Start a fresh task to change --backend.");
+  }
+  if (backend === "antigravity" && options["max-tokens"] === undefined && budget.maxTokens !== null) {
+    budget.maxTokens = null;
+    process.stderr.write("Ignoring the saved default max-tokens for Antigravity because ACP does not report per-turn token usage.\n");
   }
   const recordedSandbox = recordedSettings.sandbox;
   if ((continued || options.thread?.trim()) && !SANDBOX_MODES.includes(recordedSandbox) && options.sandbox === undefined) {
@@ -1860,8 +1859,9 @@ async function handleTask(argv) {
   const approvedComputerApps = normalizeBundleIds(options["approve-computer-app"] ?? grantRequest?.approvedComputerApps ?? []);
   const lifecycle = { budget, owner: options.owner, leaseSec: seconds(options["lease-sec"] ?? process.env.CODEX_COMPANION_LEASE_SEC, options.direct ? 1800 : 180, "--lease-sec"), questionTimeoutSec: seconds(options["question-timeout-sec"], 900, "--question-timeout-sec") };
   if ((options.roundtable !== undefined) !== (options.persona !== undefined)) throw new Error("--roundtable and --persona must be supplied together.");
-  const previousRoundtable = continued?.request?.roundtable ?? previousRequest?.roundtable
-    ?? (options.thread ? latestThreadJob(cwd, options.thread)?.request?.roundtable : null);
+  const latestRequest = threadId && !selectedJob && !previousRequest?.roundtable
+    ? latestThreadJob(cwd, threadId, { backend })?.request : null;
+  const previousRoundtable = continued?.request?.roundtable ?? previousRequest?.roundtable ?? latestRequest?.roundtable;
   const roundtable = options.roundtable !== undefined ? { roomId: options.roundtable, persona: options.persona } : previousRoundtable;
   if ((continued || options.thread) && options.roundtable !== undefined &&
       (!previousRoundtable || previousRoundtable.roomId !== roundtable.roomId || previousRoundtable.persona !== roundtable.persona)) {
@@ -1892,14 +1892,13 @@ async function handleTask(argv) {
 
   const resumeLast = false;
   const fresh = Boolean(options.fresh);
-  let threadId = continued ? continued.threadId : options.thread?.trim() ?? null;
   if (options.thread !== undefined && (!threadId || threadId.startsWith("--"))) {
     throw new Error("Provide a non-empty thread ID for --thread.");
   }
   if (threadId && fresh) {
     throw new Error("Choose --thread, --fresh, or --resume/--resume-last; these options cannot be combined.");
   }
-  const contextRequest = previousRequest ?? (threadId ? latestThreadJob(cwd, threadId)?.request : null);
+  const contextRequest = previousRequest ?? latestRequest;
   const claudeInstructions = prepareClaudeInstructions({
     sessionId: process.env[SESSION_ID_ENV], cwd, sessionCwd: options["session-cwd"],
     previousRequest: contextRequest?.claudeInstructionsBase !== undefined ? { ...contextRequest, developerInstructions: contextRequest.claudeInstructionsBase } : contextRequest,
@@ -1986,7 +1985,7 @@ async function handleTask(argv) {
     else ensureCodexAvailable(cwd);
 
     if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, selectedJob, sourceJob, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
     if (job.dispatchReused) {
       await waitForJob(workspaceRoot, job, { owner: job.ownerId, timeoutSec: options["timeout-sec"], direct: true, quiet: options.quiet, toolUseId: dispatchToolUseId });
       return;
@@ -2039,7 +2038,7 @@ async function handleTask(argv) {
   }
 
   if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, selectedJob, sourceJob, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
   job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
   if (options.run !== undefined) job.request.run = options.run;
   if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
@@ -2553,7 +2552,7 @@ async function handleResult(argv) {
 
 function handleTaskResumeCandidate(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["backend", "cwd"],
     booleanOptions: ["json"]
   });
   validatePositionalArity(positionals, 0, "task-resume-candidate");
@@ -2562,7 +2561,8 @@ function handleTaskResumeCandidate(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
+  const backend = normalizeBackend(options.backend);
+  const candidate = findLatestResumableTaskJob(jobs.filter(job => jobBackend(job) === backend));
 
   const payload = {
     available: Boolean(candidate),
