@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Support explicit Google Gemini (`agy acp`, `fugato:gemini-native`) roundtable
+  seats alongside Codex members via `--persona-model id=gemini-*[:effort]` (per
+  room or saved in setup). `roundtable start` prints each member's `backend`,
+  `agentType` and `header`, refuses read-only Gemini seats, auto-allows and
+  audits parent-bridge forum tools in agy default mode, delivers forum notices
+  to Gemini members only between turns (holding notices during parked
+  approvals), and updates `fugato-live` provider/model and mixed-usage labels
+  to follow each job's backend.
+
 ## 1.9.0
 
 - Replace the routine and strong worker models with a role table. Routine

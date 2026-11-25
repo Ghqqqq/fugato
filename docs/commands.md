@@ -245,7 +245,7 @@ outcomes. See [duel](duel.md) for flows, convergence and quota costs.
 
 ### `/fugato:roundtable`
 
-Persistent Codex personas pursue one goal through experiments, implementation
+Persistent Codex or Gemini personas pursue one goal through experiments, implementation
 and a public forum; Claude chairs and accepts the final candidate on evidence.
 The chair recommends intensity and roster for confirmation unless supplied.
 
@@ -259,7 +259,12 @@ Usage: /fugato:roundtable [on [--intensity light|standard|deep|full] [--roles id
 
 Intensities seat 2/3/5/6 members. `--roles` selects a nonempty unique subset of
 `conjecturer,critic,steward,improver,integrator,calibrator`; invalid intensity or
-persona ids fail before dispatch. There is no token cap; members are Codex-only.
+persona ids fail before dispatch. Role-derived seats use Codex; explicit
+`--persona-model id=gemini-*[:effort]` (per room or via setup) selects Gemini
+seats when `agy` is installed (no read-only Gemini seats). `fugato roundtable start --json`
+returns each member's `backend`, `agentType` (`fugato:codex-native` or
+`fugato:gemini-native`) and `header`, and text output shows the agent type per
+member. There is no token cap; Claude subagents cannot take member seats.
 See [Roundtable](roundtable.md) for the research, mapping, forum and chair.
 
 ### Orchestration controls
@@ -427,8 +432,8 @@ fresh Claude sessions and `/clear` (default `off`); run it separately from other
 setup changes, with `--dry-run` to preview. See
 [default orchestration mode](configuration.md#default-orchestration-mode).
 
-`fugato setup --persona-model id=model[:effort]` saves a persona mapping;
-repeat the flag for different ids, or use `id=default` to remove both fields.
+`fugato setup --persona-model id=model[:effort]` saves a persona mapping (Codex
+or `gemini-*` model); repeat the flag for different ids, or use `id=default` to remove both fields.
 Run it separately from other setup changes; `--dry-run --json` previews without
 writes. Setup JSON includes `personaModels` with effective model/effort values
 and per-field `saved`/`built-in` sources. Model-only changes clear the saved
@@ -560,7 +565,7 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | `fugato pair [on\|off\|status]` | Pair session controls; one primary Codex thread |
 | `fugato duel [on\|off\|status]` | Duel session controls; `on --rounds <n>` sets 1–3 total rounds |
 | `fugato roundtable [on\|off\|status]` | Roundtable session mode controls; `on --intensity … --roles …` selects defaults |
-| `fugato roundtable start [--intensity …] [--roles id,id] [--persona-model id=model[:effort]]… [--high-stakes] [--run <runId>] [--json]` | Goal on stdin; returns room, member headers and chair card |
+| `fugato roundtable start [--intensity …] [--roles id,id] [--persona-model id=model[:effort]]… [--high-stakes] [--run <runId>] [--json]` | Goal on stdin; returns room, chair card and member entries with `backend`, `agentType` (`fugato:codex-native` or `fugato:gemini-native`), `header` and `workspace` |
 | `fugato roundtable status <roomId> [--json]` / `pause\|resume <roomId>` | Inspect or control the room |
 | `fugato roundtable close <roomId> [--title t] [--label l] [--selects n] [--unreviewed reason]` | Close the room; with a title, `--selects` or a body on stdin, first records the chair's closing decision under the review gate. Closing does not cancel jobs |
 | `fugato forum read <roomId> [--after n] [--thread n] [--limit n] [--json]` | Chair index/thread reads |

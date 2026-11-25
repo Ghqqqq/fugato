@@ -1,6 +1,6 @@
 ---
 name: gemini-native
-description: Google Gemini worker for bounded local assignments authorized for full access. Uses the signed-in Antigravity CLI (agy) over ACP. Select a Gemini-backed role with a fresh DUET header or pass an advertised Gemini model and thinking level explicitly. Supports native report cards, SendMessage follow-ups and stop. Continuation requires agy 1.5.15 or later. Use codex-reviewer or codex-investigator for enforced read-only work.
+description: Google Gemini worker for bounded local assignments authorized for full access. Uses the signed-in Antigravity CLI (agy) over ACP. Select a Gemini-backed role with a fresh DUET header or pass an advertised Gemini model and thinking level explicitly. Supports native report cards, SendMessage follow-ups, roundtable seats and stop. Continuation requires agy 1.5.15 or later. Use codex-reviewer or codex-investigator for enforced read-only work.
 model: haiku
 effort: low
 omitClaudeMd: true
@@ -51,6 +51,13 @@ line. For `action-approval`, use exactly `Allow once` or `Deny`. For an
 ordinary question, send up to 8,000 characters of answer text. The report's
 `next` field shows the format for that question. Once the job ends, send a
 plain brief to continue the same Antigravity session.
+
+Roundtable seats are supported when `fugato roundtable start` assigns this
+agent (`--roundtable <roomId> --persona <id>`). Forum notices arrive only
+between turns, never mid-turn, and parked approvals hold that member's notices.
+Parent-bridge calls (`ask_parent`, `forum_read`, `forum_post`) are auto-allowed
+one call at a time and audited in job activity without arguments; edits and
+commands still require approval. Gemini roundtable seats cannot be read-only.
 
 If a model reads this prompt, the native adapter is unavailable or failed.
 Return exactly this blocked report without performing the assignment:

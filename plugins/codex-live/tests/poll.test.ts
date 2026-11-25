@@ -1703,3 +1703,34 @@ test('roundtable discovery caches unchanged and foreign metadata while advancing
   expect(roomReads().length).toBe(before + 1);
   expect(f.latest()?.forumRooms?.map(room => room.roomId)).toEqual(['rt-079-old', 'rt-000-old']);
 });
+
+test('mixed Codex and Gemini usage groups by backend and model while preserving legacy caches', async () => {
+  const f = scrollFixture();
+  const codexUsage = { inputTokens: 200, cachedInputTokens: 50, outputTokens: 30, totalTokens: 230 };
+  const geminiUsage = { inputTokens: 400, cachedInputTokens: 100, outputTokens: 60, totalTokens: 460 };
+  f.add('codex-seat', -2);
+  patchJob(f.files, 'codex-seat', { status: 'completed', completedAt: created(epoch),
+    request: { model: 'gpt-6-astra', roundtable: { persona: 'improver' } }, result: { usage: codexUsage } });
+  f.add('gemini-seat', -1);
+  patchJob(f.files, 'gemini-seat', { status: 'completed', completedAt: created(epoch),
+    request: { backend: 'antigravity', model: 'gemini-4-neon', effort: 'high', roundtable: { persona: 'critic' } },
+    result: { model: 'gemini-4-neon', effort: 'high', usage: geminiUsage } });
+  await f.poll(true);
+  const entries = f.latest().usageByJob!;
+  expect(entries['codex-seat']?.backend).toBe('codex');
+  expect(entries['gemini-seat']?.backend).toBe('antigravity');
+  expect(usageLines(entries)).toEqual([
+    'Antigravity session total (provider: Google Antigravity, model gemini-4-neon): 400 input · 100 cached · 60 output · 460 total',
+    'Codex session total (provider: OpenAI Codex, model gpt-6-astra): 200 input · 50 cached · 30 output · 230 total',
+  ]);
+  expect(usageLines({
+    legacyCodex: { model: 'unknown', usage: codexUsage },
+    explicitCodex: { backend: 'codex', model: 'unknown', usage: codexUsage },
+    antigravityUnknown: { backend: 'antigravity', model: 'unknown', usage: geminiUsage },
+  })).toEqual([
+    'Codex session total (provider: OpenAI Codex, model unknown): 400 input · 100 cached · 60 output · 460 total',
+    'Antigravity session total (provider: Google Antigravity, model unknown): 400 input · 100 cached · 60 output · 460 total',
+  ]);
+  expect(validView(f.latest())).toBe(true);
+  expect(f.forbidden).toEqual([]);
+});
