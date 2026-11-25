@@ -1,6 +1,7 @@
 // session.send runs in the sender before the recipient's queue (host d.ts
 // SessionSendInput/Result). session.receive runs inside the recipient's turn;
 // it is not our interception point while turn.step owns that turn's wait.
+import { FRESH_ROLE_ERROR } from '../scripts/lib/command-options.mjs';
 import { GEMINI_AGENT_TYPE, isNativeType } from './presets.mjs';
 export const GEMINI_BUSY = 'This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again.';
 const UNKNOWN_REASON = 'Codex steering outcome unknown; the message may or may not have reached the running turn and will not be resent automatically. Inspect the Fugato job before resending.';
@@ -19,7 +20,7 @@ async function resolveJob($, state) {
   const matches = jobs.filter(job => job.sessionId === state.session && job.dispatchNonce === state.intent.nonce);
   if (matches.length === 1) Object.assign(state, { jobId: matches[0].id, ownerId: matches[0].ownerId });
 }
-export function registerSteering(on) {
+export function registerSteering(on, hasRoleHeader) {
   on('session.send', async ($, e, next) => {
     let attempted = false;
     try {
@@ -28,10 +29,11 @@ export function registerSteering(on) {
       if (matches.length === 1 && matches[0].type === GEMINI_AGENT_TYPE) {
         return matches[0].status === 'running' ? { isDelivered: false, reason: GEMINI_BUSY } : next(e);
       }
+      if (matches.length !== 1 || !isNativeType(matches[0].type) || matches[0].status !== 'running') return next(e);
+      if (typeof e.text === 'string' && hasRoleHeader(e.text)) return { isDelivered: false, reason: FRESH_ROLE_ERROR };
       // Only the main conversation steers. Subagent and teammate sends keep the
       // ordinary queue, where the teammate mailbox guard judges them.
       if (e.agentId || typeof e.text !== 'string' || !e.text.trim() || e.text.length > 65536) return next(e);
-      if (matches.length !== 1 || !isNativeType(matches[0].type) || matches[0].status !== 'running') return next(e);
       const session = await $.session.id();
       const state = await $.store.get(`native:v2:${session}:${matches[0].id}`);
       if (!state || state.session !== session || state.bindingPending || state.status === 'needs_answer' || state.answer?.status === 'needs_answer') return next(e);

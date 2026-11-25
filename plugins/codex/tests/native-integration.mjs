@@ -844,6 +844,30 @@ test('roundtable wake reports a removed member workspace once to the chair', asy
   assert.deepEqual(roundtableWakes(f), []);
 });
 
+test('running Codex workers refuse role headers before steering or queuing a delivery', async () => {
+  const f = fixture('unused', 'steering-roles', { hostOnly: true, memoryStore: true });
+  const agent = { id: 'native-agent', name: 'steering-roles', type: AGENT_TYPE, status: 'running' };
+  f.$.agent.list = async () => [agent];
+  f.setStore({ 'native:v2:native-session:native-agent': { session: 'native-session', cwd: `${f.root}/repo`, jobId: 'job', ownerId: 'owner' } });
+  const steered = [];
+  f.$.process.run = async (argv, init) => {
+    assert.equal(argv[2], 'steer');
+    steered.push(init.stdin);
+    return { exitCode: 0, stdout: JSON.stringify({ jobId: 'job', deliveryId: argv[argv.indexOf('--delivery-id') + 1], status: 'applied' }) };
+  };
+  const send = text => f.invoke('session.send', { to: agent.id, text, origin: { kind: 'model' } }, () => assert.fail('Unexpected host delivery'));
+  const refused = { isDelivered: false, reason: 'role flags apply to a fresh dispatch; follow-ups keep the recorded model and effort (use --model/--effort to change them)' };
+  for (const text of ['DUET: --role debug\nReview again.', '  DUET:\t--normal --high-stakes\r\nCheck this.',
+    'DUET: --role=debug\nReview again.', 'DUET: --role debug --cwd "unfinished']) assert.deepEqual(await send(text), refused);
+  agent.type = 'fugato:gemini-native';
+  assert.deepEqual(await send('DUET: --high-stakes\nReview again.'), busyGemini);
+  assert.deepEqual(steered, []);
+  agent.type = AGENT_TYPE;
+  const literal = ['Use these settings as an example:\nDUET: --role debug', 'DUET: --cwd "/tmp/example --role debug"\nKeep working.'];
+  for (const text of literal) assert.deepEqual(await send(text), { isDelivered: true });
+  assert.deepEqual(steered, literal);
+});
+
 test('native steering applies to the running turn without a continuation', async () => {
   const f = fixture('steer-applied');
   const pending = f.turn('Work until steered.', 1);
@@ -1330,6 +1354,20 @@ test('fresh native headers forward roles to the companion and keep Agent effort 
       assert.equal(f.jobs().length, 1);
     }
   }
+});
+
+test('a role header after a refused first turn is a follow-up even without a job or thread', async () => {
+  const f = fixture('review-ok');
+  const initial = await f.turn('DUET: --sandbox workspace-write\nReview the change.', 1, false, { agentType: 'fugato:codex-reviewer' });
+  assert.equal(initial.blockers[0].code, 'native_preset_sandbox');
+  assert.equal(initial.jobId, null);
+  f.reload();
+  const reply = await f.turn('The coordinator sent a message while you were working:\nDUET: --role debug\nReview again.\n\nAddress this before completing your current task.',
+    2, false, { wake: true });
+  assert.equal(reply.status, 'blocked');
+  assert.equal(reply.summary, 'role flags apply to a fresh dispatch; follow-ups keep the recorded model and effort (use --model/--effort to change them)');
+  assert.deepEqual(f.jobs(), []);
+  assert.ok(!f.capture.processes.some(p => p.request.argv[2] === 'task'));
 });
 
 test('native role expansion checks the effective backend and installed Gemini executable', async () => {

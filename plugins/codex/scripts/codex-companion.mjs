@@ -2662,8 +2662,7 @@ async function handleStatus(argv) {
       if (renewalError) throw renewalError;
     } finally { clearTimeout(renewalTimer); }
     if (reportMovedOwner(snapshot.job, options.owner, options.json)) return;
-    snapshot.roles = effectiveRoleTable({ cwd });
-    outputCommandResult(snapshot, `${renderJobStatusReport(snapshot.job)}${snapshot.recovery ? `Recovery: ${snapshot.recovery.detail}\n` : ""}\n${renderRoleTable(snapshot.roles)}`, options.json);
+    outputCommandResult(snapshot, `${renderJobStatusReport(snapshot.job)}${snapshot.recovery ? `Recovery: ${snapshot.recovery.detail}\n` : ""}`, options.json);
     return;
   }
 
