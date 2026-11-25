@@ -23,10 +23,12 @@ before validating advertised choices and rejects an unadvertised Gemini
 model or thinking level before prompt submission. Use `fugato:codex-native`
 for `--high-stakes`.
 
-The parent can retry on Codex only after a classified authentication failure
-before prompt submission. Use a fresh `fugato:codex-native` job with explicit
-fallback model and effort and no role flag. Blocked jobs, permission denials
-and submitted turns never trigger an automatic fallback.
+The automatic Codex fallback applies only after a classified authentication
+failure before prompt submission: the parent uses a fresh
+`fugato:codex-native` job with the explicit fallback model and effort and no
+role flag. Blocked jobs, permission denials and submitted turns never trigger
+it. Escalating a resolved job that still fails after a rework is a separate
+fresh `fugato:codex-native` dispatch with `--high-stakes`.
 
 The worker requires `danger-full-access`, Fugato's built-in sandbox default.
 If a different sandbox is saved, pass `--sandbox danger-full-access` in the

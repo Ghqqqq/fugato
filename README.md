@@ -176,7 +176,7 @@ Open-ended goals explored by persistent Codex personas in a shared forum, chaire
   <img src="docs/assets/fugato-score-ultra-light.svg" alt="Ultra drawn as a score: Claude's stave above five Codex voices in flight; each short phrase is accepted as it arrives while the next starts, across understand, design, implement, review and verify" width="100%">
 </picture>
 
-Claude splits the work-list across parallel Codex readers, independent designs
+Claude splits the work-list across parallel readers, independent designs
 with judges, one implementer per disjoint area, area × lens reviews and
 adversarial verification. Accepted items advance as slots open. After one failed
 live fix, competing hypotheses and a separate live diagnostic come before

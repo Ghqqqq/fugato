@@ -125,11 +125,14 @@ A mismatched role fails before launch and names the agent to dispatch.
 For `--high-stakes` use `fugato:codex-native`. The Claude shell's effort
 and saved Codex defaults do not select Gemini settings.
 
-Retry on Codex only for a classified authentication failure before prompt
-submission (`notStarted` with an auth error before `session/prompt`).
-Dispatch the same brief fresh on `fugato:codex-native` with the fallback
-row's explicit `--model` and `--effort` and no role flag. Blocked jobs,
-permission denials and submitted turns never trigger an automatic fallback.
+The automatic Codex fallback applies only to a classified authentication
+failure before prompt submission (`notStarted` with an auth error before
+`session/prompt`). Dispatch the same brief fresh on `fugato:codex-native`
+with the fallback row's explicit `--model` and `--effort` and no role flag.
+Blocked jobs, permission denials and submitted turns never trigger this
+fallback. Escalating a resolved Gemini job that still fails after a rework is
+a separate step: a fresh `fugato:codex-native` dispatch with `--high-stakes`
+(see the protocol's Worker roles section).
 
 Wait for the worker's report before using `SendMessage`. A running turn
 refuses messages, even if a progress notice already shows a question.

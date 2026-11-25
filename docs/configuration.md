@@ -250,9 +250,11 @@ normalization (`spark` maps to `gpt-5.3-codex-spark`). An unknown Codex
 model fails validation when the cache is fresh (within 24 hours). A stale or
 unavailable cache yields a warning. Refresh it with `fugato models`. Use
 `fugato models --backend antigravity` to check advertised Gemini models.
-Effort accepts `none`, `minimal`, `low`, `medium`, `high`,
-`xhigh` or `max` and efforts listed in Codex's isolated model cache.
-Confirm the selected model and runtime support the requested effort.
+For Codex models, effort accepts `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh` or `max` and efforts listed in Codex's isolated model cache. For a
+Gemini model on a role, effort accepts `low`, `medium`, `high` or `xhigh`
+(any case). Confirm the selected model and runtime support the requested
+effort.
 
 ## Worker dispatch
 
