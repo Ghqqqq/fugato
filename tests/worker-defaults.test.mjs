@@ -91,13 +91,23 @@ model = "gemini-custom"
   assert.deepEqual(personaModels.critic, { model: { value: "gpt-6.2-astra", source: "fallback" }, effort: { value: "high", source: "built-in" } });
 });
 
-test("persona setup rejects a Gemini model before writing any part of an uncached batch", () => {
-  const f = fixture(), before = snapshot(f.dir);
-  assert.equal(fs.existsSync(path.join(f.env.CODEX_COMPANION_HOME, "models_cache.json")), false);
-  const result = f.call("setup", "--persona-model", "critic=valid-model", "--persona-model", "calibrator=gemini-4-neon");
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /calibrator.*Codex model/i);
-  assert.deepEqual(snapshot(f.dir), before);
+test("persona setup saves Gemini models with provider efforts and rejects invalid Gemini entries before writes", () => {
+  const f = fixture(), cache = path.join(f.env.CODEX_COMPANION_HOME, "models_cache.json");
+  fs.mkdirSync(path.dirname(cache), { recursive: true });
+  fs.writeFileSync(cache, JSON.stringify({ fetched_at: new Date().toISOString(), models: [{ slug: "valid-model" }] }));
+  const before = snapshot(f.dir);
+  for (const bad of ["calibrator=gemini-4-neon:max", "calibrator=gemini-bad/model"]) {
+    const rejected = f.call("setup", "--persona-model", "critic=valid-model", "--persona-model", bad);
+    assert.equal(rejected.status, 1, bad);
+    assert.deepEqual(snapshot(f.dir), before);
+  }
+  const saved = json(f.call("setup", "--persona-model", "calibrator=gemini-4-neon:XHigh", "--persona-model", "conjecturer=gemini-4-neon", "--json"));
+  assert.ok(saved.warnings.some(warning => /gemini-4-neon.*Antigravity/.test(warning)));
+  assert.deepEqual(readPersonaModels(f.env), {
+    conjecturer: { model: "gemini-4-neon" }, calibrator: { model: "gemini-4-neon", effort: "xhigh" }
+  });
+  assert.deepEqual(saved.personaModels.calibrator, { model: { value: "gemini-4-neon", source: "saved" }, effort: { value: "xhigh", source: "saved" } });
+  assert.deepEqual(saved.personaModels.conjecturer, { model: { value: "gemini-4-neon", source: "saved" }, effort: { value: "medium", source: "built-in" } });
 });
 
 test("worker defaults preview, save and reset together while preserving unrelated preferences", () => {

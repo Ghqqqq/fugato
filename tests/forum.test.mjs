@@ -6,9 +6,9 @@ import assert from "node:assert/strict";
 import childProcess, { spawn } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { createInterface } from "node:readline";
-import { createRoom, postEvent, readRoom, readIndex, readThread, readResource, openItems, pending, ack, setStatus, updateMember, roundtableStatus, renderForum } from "../plugins/codex/scripts/lib/forum.mjs";
+import { createRoom, postEvent, readRoom, readIndex, readThread, readResource, openItems, pending, ack, setStatus, updateMember, releaseMemberClaim, roundtableStatus, renderRoundtableStatus, renderForum } from "../plugins/codex/scripts/lib/forum.mjs";
 import { resolveStateDirForRoot } from "../plugins/codex/scripts/lib/state.mjs";
-import { resolveRoster, personaInstructions, CHAIR_CARD } from "../plugins/codex/scripts/lib/roundtable-personas.mjs";
+import { resolveRoster, clampGeminiEffort, personaInstructions, CHAIR_CARD } from "../plugins/codex/scripts/lib/roundtable-personas.mjs";
 import { effectiveRoleTable, personaModelsSetup, readPersonaModels } from "../plugins/codex/scripts/lib/setup-config.mjs";
 import { approveDuet } from "../plugins/codex/scripts/duet-permission-hook.mjs";
 import { parentBridgeConfig } from "../plugins/codex/scripts/lib/codex.mjs";
@@ -458,7 +458,7 @@ test("roundtable roles supply Codex models while persona defaults and intensity 
     [high, "high"], ["room-critic", "high"], [high, "max"], [high, "xhigh"], [high, "low"], [high, "high"]
   ]);
   const [lightCritic] = resolveRoster({ roles: ["critic"], intensity: "light", roleModels, mapping, overrides: { critic: { effort: "low" } } });
-  assert.deepEqual(lightCritic, { persona: "critic", name: "critic", model: "saved-critic", effort: "low" });
+  assert.deepEqual(lightCritic, { persona: "critic", name: "critic", model: "saved-critic", effort: "low", backend: "codex" });
   assert.equal(resolveRoster({ intensity: "light" })[0].effort, "medium");
 });
 
@@ -722,4 +722,109 @@ test("closing with a decision records it and closes the room without waking memb
   assert.equal(json(f.call(["forum", "read", f.room.roomId, "--json"])).events.at(-1).kind, "decision");
   assert.deepEqual(json(f.call(["forum", "pending", "--json"])), []);
   assert.deepEqual(json(f.call(["roundtable", "status", f.room.roomId, "--json"])).attention, []);
+});
+
+test("resolveRoster seats explicit Gemini personas, validates explicit efforts, clamps inherited efforts and ignores cross-backend saved effort", () => {
+  const roster = resolveRoster({
+    intensity: "full",
+    roles: ["critic", "improver", "conjecturer"],
+    roleModels: { implement: "gemini-from-role", investigate: "codex-investigate" },
+    mapping: { critic: { model: "gpt-6.2-astra", effort: "max" }, conjecturer: { model: "gemini-4-neon", effort: " High " } },
+    overrides: { critic: { model: "gemini-4-neon" } }
+  });
+  assert.deepEqual(roster, [
+    { persona: "critic", name: "critic", model: "gemini-4-neon", effort: "xhigh", backend: "antigravity" },
+    { persona: "improver", name: "improver", model: "gpt-6.2-sol", effort: "xhigh", backend: "codex" },
+    { persona: "conjecturer", name: "conjecturer", model: "gemini-4-neon", effort: "high", backend: "antigravity" }
+  ]);
+  const [codexOverride] = resolveRoster({ roles: ["conjecturer"], mapping: { conjecturer: { model: "gemini-4-neon", effort: "low" } }, overrides: { conjecturer: { model: "gpt-6.2-sol" } } });
+  assert.deepEqual(codexOverride, { persona: "conjecturer", name: "conjecturer", model: "gpt-6.2-sol", effort: "medium", backend: "codex" });
+  const [hs] = resolveRoster({ roles: ["conjecturer"], highStakes: true, mapping: { conjecturer: { model: "gemini-4-neon", effort: "low" } } });
+  assert.deepEqual(hs, { persona: "conjecturer", name: "conjecturer", model: "gpt-6.2-astra", effort: "medium", backend: "codex" });
+  assert.deepEqual(["max", "ultra", "minimal", "none", " XHigh "].map(clampGeminiEffort), ["xhigh", "xhigh", "low", "low", "xhigh"]);
+  assert.throws(() => resolveRoster({ roles: ["critic"], overrides: { critic: { model: "gemini-4-neon", effort: "max" } } }), /Gemini effort/);
+  assert.throws(() => resolveRoster({ roles: ["critic"], overrides: { improver: { model: "gemini-4-neon", effort: "max" } } }), /Gemini effort/);
+  assert.throws(() => resolveRoster({ roles: ["critic"], mapping: { critic: { model: "gemini-4-neon", effort: "max" } } }), /Gemini effort/);
+  assert.throws(() => resolveRoster({ roles: ["critic"], overrides: { critic: { model: "gemini-4-neon" } }, geminiAvailable: false }), /critic/);
+  assert.equal(resolveRoster({ roles: ["critic"], mapping: { calibrator: { model: "gemini-4-neon" } }, geminiAvailable: false })[0].backend, "codex");
+});
+
+test("room records derive and persist member backend, default older rooms to codex and surface backend/model in status and resources", () => {
+  const f = fixture();
+  const mixed = createRoom({
+    sessionId: f.env.CODEX_COMPANION_SESSION_ID, workspaceRoot: f.dir, goal: "Mixed backend room",
+    members: [{ persona: "critic", model: "gemini-4-neon", effort: "high" }, { persona: "improver", model: "gpt-6.2-sol", effort: "high" }]
+  }, f.env);
+  assert.deepEqual(mixed.members.map(({ persona, backend, model }) => [persona, backend, model]), [
+    ["critic", "antigravity", "gemini-4-neon"], ["improver", "codex", "gpt-6.2-sol"]
+  ]);
+  const resource = readResource(mixed.roomId, "chair", "member/critic", f.env);
+  assert.equal(resource.member.backend, "antigravity"); assert.equal(resource.member.model, "gemini-4-neon");
+  assert.match(renderForum(resource), /antigravity gemini-4-neon/);
+  const status = roundtableStatus({ roomId: mixed.roomId, sessionId: mixed.sessionId }, f.env);
+  assert.equal(status.members[0].backend, "antigravity"); assert.equal(status.members[0].model, "gemini-4-neon");
+  assert.match(renderRoundtableStatus(status), /critic: seated; antigravity gemini-4-neon;/);
+  const file = path.join(f.env.CODEX_COMPANION_HOME, "duet", "roundtables", f.room.roomId, "room.json");
+  const legacy = JSON.parse(fs.readFileSync(file, "utf8"));
+  for (const member of legacy.members) delete member.backend;
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  const loaded = readRoom(f.room.roomId, f.env);
+  assert.ok(loaded.members.every(member => member.backend === "codex" && member.abandonedJobIds === undefined));
+  legacy.members[0].abandonedJobIds = ["../bad"];
+  fs.writeFileSync(file, JSON.stringify(legacy));
+  assert.throws(() => readRoom(f.room.roomId, f.env), /Invalid roundtable room record/);
+});
+
+test("updateMember claim lazily re-claims only after terminal notStarted jobs and refuses submitted, running or posted seats", () => {
+  const f = fixture(), dir = path.join(resolveStateDirForRoot(f.dir, f.env), "jobs");
+  fs.mkdirSync(dir, { recursive: true });
+  const writeJob = (id, patch) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, sessionId: f.room.sessionId, workspaceRoot: f.dir, ...patch }));
+  const first = updateMember(f.room.roomId, "critic", { claim: true }, f.env);
+  assert.equal(typeof first.claimedAt, "string");
+  writeJob("ns-1", { status: "failed", turnResolution: "notStarted" });
+  updateMember(f.room.roomId, "critic", { status: "active", jobIds: ["ns-1"] }, f.env);
+  const second = updateMember(f.room.roomId, "critic", { claim: true }, f.env);
+  assert.equal(second.status, "seated"); assert.deepEqual(second.jobIds, []); assert.deepEqual(second.abandonedJobIds, ["ns-1"]);
+  assert.notEqual(second.claimedAt, first.claimedAt);
+  writeJob("ns-2", { status: "cancelled", result: { turnStatus: "notStarted" } });
+  writeJob("ns-3", { status: "failed", recovery: { turnStatus: "notStarted" } });
+  updateMember(f.room.roomId, "critic", { status: "active", jobIds: ["ns-2", "ns-3"] }, f.env);
+  const third = updateMember(f.room.roomId, "critic", { claim: true }, f.env);
+  assert.deepEqual(third.abandonedJobIds, ["ns-1", "ns-2", "ns-3"]); assert.deepEqual(third.jobIds, []);
+  for (const [id, patch] of [
+    ["running-job", { status: "running", result: { turnStatus: "notStarted" } }],
+    ["submitted-job", { status: "completed", turnResolution: "completed" }],
+    ["unknown-fail", { status: "failed", turnResolution: "unknown" }]
+  ]) {
+    const g = fixture(), gdir = path.join(resolveStateDirForRoot(g.dir, g.env), "jobs");
+    fs.mkdirSync(gdir, { recursive: true });
+    fs.writeFileSync(path.join(gdir, `${id}.json`), JSON.stringify({ id, sessionId: g.room.sessionId, workspaceRoot: g.dir, ...patch }));
+    updateMember(g.room.roomId, "critic", { claim: true }, g.env);
+    updateMember(g.room.roomId, "critic", { status: "active", jobIds: [id] }, g.env);
+    assert.throws(() => updateMember(g.room.roomId, "critic", { claim: true }, g.env), /already dispatched/, id);
+  }
+  const posted = fixture(), pdir = path.join(resolveStateDirForRoot(posted.dir, posted.env), "jobs");
+  fs.mkdirSync(pdir, { recursive: true });
+  fs.writeFileSync(path.join(pdir, "ns-post.json"), JSON.stringify({ id: "ns-post", sessionId: posted.room.sessionId, workspaceRoot: posted.dir, status: "failed", turnResolution: "notStarted" }));
+  updateMember(posted.room.roomId, "critic", { claim: true }, posted.env);
+  updateMember(posted.room.roomId, "critic", { status: "active", jobIds: ["ns-post"] }, posted.env);
+  posted.post("critic", "idea", "Already posted");
+  assert.throws(() => updateMember(posted.room.roomId, "critic", { claim: true }, posted.env), /already dispatched/);
+});
+
+test("releaseMemberClaim clears claimedAt only when claimedAt matches, jobIds is empty and threadId is null", () => {
+  const f = fixture(), id = f.room.roomId;
+  assert.deepEqual(releaseMemberClaim(id, "critic", { claimedAt: undefined }, f.env), { released: false });
+  const claimed = updateMember(id, "critic", { claim: true }, f.env);
+  assert.deepEqual(releaseMemberClaim(id, "critic", { claimedAt: "2000-01-01T00:00:00.000Z" }, f.env), { released: false });
+  assert.equal(f.state().members.find(member => member.name === "critic").claimedAt, claimed.claimedAt);
+  assert.deepEqual(releaseMemberClaim(id, "critic", { claimedAt: claimed.claimedAt }, f.env), { released: true });
+  assert.equal(f.state().members.find(member => member.name === "critic").claimedAt, undefined);
+  assert.deepEqual(releaseMemberClaim(id, "critic", { claimedAt: claimed.claimedAt }, f.env), { released: false });
+  const next = updateMember(id, "critic", { claim: true }, f.env);
+  updateMember(id, "critic", { status: "active", jobIds: ["job-1"] }, f.env);
+  assert.deepEqual(releaseMemberClaim(id, "critic", { claimedAt: next.claimedAt }, f.env), { released: false });
+  const threaded = updateMember(id, "improver", { claim: true }, f.env);
+  updateMember(id, "improver", { threadId: "thread-1" }, f.env);
+  assert.deepEqual(releaseMemberClaim(id, "improver", { claimedAt: threaded.claimedAt }, f.env), { released: false });
 });
