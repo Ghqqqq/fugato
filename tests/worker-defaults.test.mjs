@@ -91,6 +91,15 @@ model = "gemini-custom"
   assert.deepEqual(personaModels.critic, { model: { value: "gpt-6.2-astra", source: "fallback" }, effort: { value: "high", source: "built-in" } });
 });
 
+test("persona setup rejects a Gemini model before writing any part of an uncached batch", () => {
+  const f = fixture(), before = snapshot(f.dir);
+  assert.equal(fs.existsSync(path.join(f.env.CODEX_COMPANION_HOME, "models_cache.json")), false);
+  const result = f.call("setup", "--persona-model", "critic=valid-model", "--persona-model", "calibrator=gemini-4-neon");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /calibrator.*Codex model/i);
+  assert.deepEqual(snapshot(f.dir), before);
+});
+
 test("worker defaults preview, save and reset together while preserving unrelated preferences", () => {
   const f = fixture(), file = preferenceFile(f), initial = snapshot(f.dir);
   assert.deepEqual(readWorkerDefaults(f.env), BUILTIN);

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { makeTempDir, writeExecutable } from "./helpers.mjs";
 import { backendForModel, BUILTIN_ROLES, expandRole, HIGH_STAKES, ROLE_IDS, ROUTINE_ROLES, STRONG_ROLES } from "../plugins/codex/scripts/lib/roles.mjs";
-import { effectiveRoleTable, readRoleOverrides, roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
+import { effectiveRoleTable, readRoleOverrides, readTomlField, roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 
 const codex = (model, effort) => ({ backend: "codex", model, effort });
 const gemini = (effort, fallback) => ({ backend: "antigravity", model: "gemini-4-neon", effort, fallback });
@@ -50,21 +50,16 @@ test("role expansion honors per-field choices and checks the selected backend", 
   assert.throws(() => expand({ highStakes: true, backend: "antigravity" }), /dispatch fugato:codex-native for --high-stakes/);
 });
 
-function fixture(t) {
+function fixture() {
   const dir = makeTempDir("roles-"), home = path.join(dir, "isolated"), env = { ...process.env, CODEX_COMPANION_HOME: home };
   const file = path.join(home, "duet", "config.toml"), agy = path.join(dir, "fixture-agy.exe");
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const original = process.env.FUGATO_ANTIGRAVITY_BIN;
-  process.env.FUGATO_ANTIGRAVITY_BIN = agy;
-  t.after(() => {
-    if (original === undefined) delete process.env.FUGATO_ANTIGRAVITY_BIN;
-    else process.env.FUGATO_ANTIGRAVITY_BIN = original;
-  });
+  env.FUGATO_ANTIGRAVITY_BIN = agy;
   return { env, file, agy, table: () => effectiveRoleTable({ env, cwd: dir }) };
 }
 
-test("saved role values inherit missing fields from Codex legacy models and built-in efforts", t => {
-  const f = fixture(t);
+test("saved role values inherit missing fields from Codex legacy models and built-in efforts", () => {
+  const f = fixture();
   fs.writeFileSync(f.file, `ultraRoutineModel = "old-routine"
 defaultModel = "old-strong"
 defaultEffort = "max"
@@ -87,8 +82,8 @@ effort = "low"
   for (const id of [...ROUTINE_ROLES, ...STRONG_ROLES]) assert.deepEqual(legacyGemini[id], { id, ...expected[id], source: "built-in" });
 });
 
-test("Gemini rows follow executable availability and carry each role's own Codex fallback", t => {
-  const f = fixture(t);
+test("Gemini rows follow executable availability and carry each role's own Codex fallback", () => {
+  const f = fixture();
   fs.writeFileSync(f.file, `[roles.implement]
 model = "gemini-custom"
 effort = "max"
@@ -105,17 +100,48 @@ model = "custom-codex"
   }
   assert.deepEqual(off.read, { id: "read", ...codex("custom-codex", "high"), source: "saved" });
   writeExecutable(f.agy, "");
-  process.env.FUGATO_ANTIGRAVITY_BIN = `.${path.sep}${path.basename(f.agy)}`;
+  f.env.FUGATO_ANTIGRAVITY_BIN = `.${path.sep}${path.basename(f.agy)}`;
   const present = f.table(), on = rowsById(present);
   assert.deepEqual(present.gemini, { installed: true, executable: f.agy });
-  assert.deepEqual(on.implement, { id: "implement", backend: "antigravity", model: "gemini-custom", effort: "max", fallback: expected.implement, source: "saved" });
+  assert.deepEqual(on.implement, { id: "implement", backend: "antigravity", model: "gemini-custom", effort: "high", fallback: expected.implement, source: "saved" });
   assert.deepEqual(on.media, { id: "media", backend: "antigravity", model: "gemini-other", effort: "low", fallback: expected.media.fallback, source: "saved" });
   for (const id of ["research", "alt-design"]) assert.deepEqual(on[id], { id, ...expected[id], source: "built-in" });
   assert.deepEqual(on.read, off.read);
 });
 
-test("malformed and unreadable preferences leave valid fields and built-ins available", t => {
-  const f = fixture(t);
+test("executable discovery uses the supplied PATH and binary override", () => {
+  const f = fixture(), dir = path.dirname(f.agy);
+  writeExecutable(f.agy, "");
+  f.env.FUGATO_ANTIGRAVITY_BIN = path.basename(f.agy);
+  f.env.PATH = dir;
+  assert.deepEqual(f.table().gemini, { installed: true, executable: f.agy });
+  f.env.PATH = path.join(dir, "empty");
+  assert.deepEqual(f.table().gemini, { installed: false, executable: null });
+  delete f.env.FUGATO_ANTIGRAVITY_BIN;
+  const defaultBin = path.join(dir, process.platform === "win32" ? "agy.EXE" : "agy");
+  writeExecutable(defaultBin, "");
+  f.env.PATH = dir;
+  assert.deepEqual(f.table().gemini, { installed: true, executable: defaultBin });
+});
+
+test("Gemini role efforts use the provider levels for saved fields and setup batches", () => {
+  const f = fixture();
+  writeExecutable(f.agy, "");
+  fs.writeFileSync(f.file, '[roles.read]\neffort = "Low"\n[roles.review]\nmodel = "gemini-custom"\neffort = "MeDiUm"\n');
+  assert.deepEqual(readRoleOverrides(f.env), { read: { effort: "low" }, review: { model: "gemini-custom", effort: "medium" } });
+  assert.equal(rowsById(f.table()).read.effort, "low");
+  for (const label of ["Low", "MEDIUM", "hIgH", "XHigh"]) {
+    const { table } = roleModelsSetup({ env: f.env, models: [`read=gemini-4-neon:${label}`] });
+    assert.equal(rowsById(table).read.effort, label.toLowerCase());
+    assert.equal(readTomlField(fs.readFileSync(f.file, "utf8"), ["roles", "read", "effort"]), label.toLowerCase());
+  }
+  assert.throws(() => roleModelsSetup({ env: f.env, models: ["read=gemini-4-neon:max"] }), /Gemini.*effort.*low.*xhigh/i);
+  const codex = roleModelsSetup({ env: f.env, models: ["read=custom-codex:max"] });
+  assert.equal(rowsById(codex.table).read.effort, "max");
+});
+
+test("malformed and unreadable preferences leave valid fields and built-ins available", () => {
+  const f = fixture();
   fs.writeFileSync(f.file, `[roles.debug]
 model = "../bad"
 effort = "low"
@@ -140,8 +166,8 @@ model = "two"
   assert.deepEqual(f.table().highStakes, fixed);
 });
 
-test("role setup previews, saves and resets a batch while preserving unrelated preferences", t => {
-  const f = fixture(t), initial = 'ultraRoutineModel = "legacy"\n# preserved\n';
+test("role setup previews, saves and resets a batch while preserving unrelated preferences", () => {
+  const f = fixture(), initial = 'ultraRoutineModel = "legacy"\n# preserved\n';
   fs.writeFileSync(f.file, initial);
   const models = ["implement=spark:max", "visual=gemini-custom:high"];
   const preview = roleModelsSetup({ env: f.env, models, dryRun: true });

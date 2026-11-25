@@ -86,9 +86,6 @@ export function resolveRoster({ intensity = "standard", roles = null, mapping = 
   if (!preset) throw new Error(`Unknown roundtable intensity: ${intensity}. Use ${Object.keys(INTENSITIES).join(", ")}.`);
   const ids = roles ?? preset.roster;
   if (!Array.isArray(ids) || !ids.length) throw new Error("A roundtable needs at least one persona.");
-  for (const [id, preference] of [...Object.entries(mapping), ...Object.entries(overrides)]) {
-    if (backendForModel(preference?.model) === "antigravity") throw new Error(`Roundtable persona ${id} requires a Codex model. Choose a Codex model instead of ${preference.model}.`);
-  }
   const seen = new Set();
   return ids.map(id => {
     const persona = PERSONAS[id];
@@ -96,6 +93,9 @@ export function resolveRoster({ intensity = "standard", roles = null, mapping = 
     if (seen.has(id)) throw new Error(`Persona ${id} is seated twice; each persona sits at most once.`);
     seen.add(id);
     const explicit = overrides[id] ?? {}, saved = mapping[id] ?? {};
+    for (const model of [saved.model, explicit.model]) {
+      if (backendForModel(model) === "antigravity") throw new Error(`Roundtable persona ${id} requires a Codex model. Choose a Codex model instead of ${model}.`);
+    }
     const model = explicit.model ?? (highStakes ? HIGH_STAKES.model : saved.model ?? roleModels[persona.role] ?? BUILTIN_ROLES[persona.role].model);
     const effort = explicit.effort ?? saved.effort
       ?? (preset.maxFor?.includes(id) ? "max" : shiftEffort(persona.effort, preset.effortShift));

@@ -17,7 +17,7 @@ export const ANTIGRAVITY_DEFAULT_EFFORT = "xhigh";
 const LOGIN_HELP = "Run `agy acp --login` (or an interactive `agy` session) to sign in, then retry.";
 const cancelledOutcome = () => ({ outcome: { outcome: "cancelled" } });
 const notStarted = error => Object.assign(error, { turnStatus: "notStarted", turnEnded: true });
-const binary = () => process.env.FUGATO_ANTIGRAVITY_BIN || "agy";
+const binary = (env = process.env) => env.FUGATO_ANTIGRAVITY_BIN || "agy";
 const INSTALL_HELP = "Install Antigravity CLI, check `agy acp --help`, or set FUGATO_ANTIGRAVITY_BIN to its executable path.";
 // ACP's default mode asks about edits and commands. Edit requests repeat the
 // changed text in the arguments and the diff, so they need more than Codex's 800 bytes.
@@ -30,13 +30,13 @@ function denyPermission(options) {
   return deny ? { outcome: { outcome: "selected", optionId: deny.optionId } } : cancelledOutcome();
 }
 
-export function resolveAntigravityExecutable(cwd) {
-  const command = binary();
+export function resolveAntigravityExecutable(cwd, env = process.env) {
+  const command = binary(env);
   if (process.platform === "win32") {
     const name = /[\\/]/.test(command) ? path.win32.resolve(cwd, command) : command;
-    return executableOnPath(name);
+    return executableOnPath(name, env);
   }
-  if (!command.includes("/")) return executableOnPath(command);
+  if (!command.includes("/")) return executableOnPath(command, env);
   const executable = path.isAbsolute(command) ? command : path.resolve(cwd, command);
   try {
     fs.accessSync(executable, fs.constants.X_OK);

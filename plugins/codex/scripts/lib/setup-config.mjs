@@ -422,13 +422,19 @@ export function defaultModeSetup({ mode, env = process.env, dryRun = false } = {
 }
 
 const DISPATCH_ROUTES = ["auto", "native", "bash"];
+function advisoryEntries(text) {
+  try { return scan(text); } catch { return []; }
+}
+function advisoryField(entries, keys) {
+  try { return fieldIn(entries, keys); } catch { return undefined; }
+}
 // Saved roundtable persona defaults live in [roundtable.personas.<id>] as
 // model and effort; resolveRoster falls back to built-in values per persona.
-export function readPersonaModels(env = process.env) {
-  const { root, file } = duetConfig(env), text = read(root, file), mapping = {};
+function savedPersonaModels(text) {
+  const entries = advisoryEntries(text), mapping = {};
   for (const id of PERSONA_IDS) {
-    const model = readTomlField(text, ["roundtable", "personas", id, "model"]);
-    const effort = readTomlField(text, ["roundtable", "personas", id, "effort"]);
+    const model = advisoryField(entries, ["roundtable", "personas", id, "model"]);
+    const effort = advisoryField(entries, ["roundtable", "personas", id, "effort"]);
     if (typeof model === "string" || typeof effort === "string") {
       mapping[id] = { ...(typeof model === "string" ? { model } : {}), ...(typeof effort === "string" ? { effort } : {}) };
     }
@@ -436,15 +442,25 @@ export function readPersonaModels(env = process.env) {
   return mapping;
 }
 
+export function readPersonaModels(env = process.env) {
+  return savedPersonaModels(advisoryConfigText(env));
+}
+
 function personaModelsSummary(text, env) {
-  const overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
+  const personas = savedPersonaModels(text), overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
   return Object.fromEntries(PERSONA_IDS.map(id => [id, Object.fromEntries(["model", "effort"].map(key => {
-    const saved = readTomlField(text, ["roundtable", "personas", id, key]);
-    if (typeof saved === "string") return [key, { value: saved, source: "saved" }];
+    const saved = personas[id]?.[key];
+    if (saved !== undefined) return [key, { value: key === "model" ? normalizeRequestedModel(saved) : saved.trim().toLowerCase(), source: "saved" }];
     if (key === "effort") return [key, { value: PERSONAS[id].effort, source: "built-in" }];
     const role = PERSONAS[id].role, row = configuredRoleModel(role, overrides[role]?.model, legacy);
     return [key, row.fallback ? { value: row.fallback.model, source: "fallback" } : { value: row.model, source: row.source }];
   }))]));
+}
+
+const GEMINI_EFFORTS = ["low", "medium", "high", "xhigh"];
+function geminiEffort(value) {
+  const effort = typeof value === "string" ? value.trim().toLowerCase() : null;
+  return GEMINI_EFFORTS.includes(effort) ? effort : null;
 }
 
 function modelMappingChanges(models, kind, env, warnings) {
@@ -461,19 +477,21 @@ function modelMappingChanges(models, kind, env, warnings) {
     if (setting === "default") return { id, model: undefined, effort: undefined };
     const colon = setting.lastIndexOf(":"), model = colon < 0 ? setting : setting.slice(0, colon), effort = colon < 0 ? undefined : setting.slice(colon + 1);
     if (!model || model.trim() === "default" || effort === "" || effort === "default") throw new Error(`${flag} needs id=model[:effort], or id=default to reset both values.`);
-    let checkedModel;
+    if (backendForModel(model) === "antigravity") {
+      if (kind === "persona") throw new Error(`Roundtable persona ${id} requires a Codex model.`);
+      const checkedModel = workerPreference("defaultModel", model, env);
+      if (!checkedModel) throw new Error(`${flag} requires a valid Gemini model name.`);
+      const checkedEffort = effort === undefined ? undefined : geminiEffort(effort);
+      if (checkedEffort === null) throw new Error(`${flag} Gemini effort must be ${GEMINI_EFFORTS.join(", ")}.`);
+      warnings.push(`Warning: model ${checkedModel} could not be checked against a cached Antigravity catalog.`);
+      return { id, model: checkedModel, effort: checkedEffort };
+    }
     try {
-      if (kind === "role" && backendForModel(model) === "antigravity") {
-        checkedModel = workerPreference("defaultModel", model, env);
-        if (!checkedModel) throw new Error(`${flag} requires a valid Gemini model name.`);
-        warnings.push(`Warning: model ${checkedModel} could not be checked against a cached Antigravity catalog.`);
-      } else {
-        checkedModel = checkedWorkerPreference("defaultModel", model, env, warnings, catalog);
-      }
+      const checkedModel = checkedWorkerPreference("defaultModel", model, env, warnings, catalog);
       if (effort !== undefined) checkedWorkerPreference("defaultEffort", effort, env, warnings, catalog);
+      return { id, model: checkedModel, effort };
     }
     catch (error) { throw new Error(error.message.replaceAll("--default-model", flag).replaceAll("--default-effort", `${flag} effort`)); }
-    return { id, model: checkedModel, effort };
   });
 }
 
@@ -592,7 +610,7 @@ export function readWorkerDefaults(env = process.env) {
   return { model: values.defaultModel.value, effort: values.defaultEffort.value, routineModel: values.ultraRoutineModel.value };
 }
 
-function advisoryRoleConfig(env) {
+function advisoryConfigText(env) {
   try {
     const { root, file } = duetConfig(env);
     return read(root, file);
@@ -600,22 +618,20 @@ function advisoryRoleConfig(env) {
 }
 
 function savedRoleOverrides(text, env) {
-  let entries;
-  try { entries = scan(text); } catch { return {}; }
-  const overrides = {};
+  const entries = advisoryEntries(text), overrides = {};
   for (const id of ROLE_IDS) {
-    for (const [field, preference] of [["model", "defaultModel"], ["effort", "defaultEffort"]]) {
-      try {
-        const value = workerPreference(preference, fieldIn(entries, ["roles", id, field]), env);
-        if (value && value !== "default") (overrides[id] ??= {})[field] = value;
-      } catch { /* A malformed preference leaves this field at its inherited value. */ }
-    }
+    const savedModel = workerPreference("defaultModel", advisoryField(entries, ["roles", id, "model"]), env);
+    const model = savedModel === "default" ? null : savedModel;
+    const value = advisoryField(entries, ["roles", id, "effort"]);
+    const effort = backendForModel(model ?? BUILTIN_ROLES[id].model) === "antigravity" ? geminiEffort(value) : workerPreference("defaultEffort", value, env);
+    if (model) overrides[id] = { model };
+    if (effort && effort !== "default") (overrides[id] ??= {}).effort = effort;
   }
   return overrides;
 }
 
 export function readRoleOverrides(env = process.env) {
-  return savedRoleOverrides(advisoryRoleConfig(env), env);
+  return savedRoleOverrides(advisoryConfigText(env), env);
 }
 
 function configuredRoleModel(id, savedModel, legacy) {
@@ -629,7 +645,7 @@ function configuredRoleModel(id, savedModel, legacy) {
 
 function roleTableFromConfig(text, env, cwd) {
   const overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
-  const executable = resolveAntigravityExecutable(cwd);
+  const executable = resolveAntigravityExecutable(cwd, env);
   const roles = ROLE_IDS.map(id => {
     const saved = overrides[id], row = configuredRoleModel(id, saved?.model, legacy);
     if (row.fallback && !executable) return { id, ...row.fallback, source: "fallback" };
@@ -639,7 +655,7 @@ function roleTableFromConfig(text, env, cwd) {
 }
 
 export function effectiveRoleTable({ env = process.env, cwd = process.cwd() } = {}) {
-  return roleTableFromConfig(advisoryRoleConfig(env), env, cwd);
+  return roleTableFromConfig(advisoryConfigText(env), env, cwd);
 }
 
 /** @param {{ models?: string[], env?: NodeJS.ProcessEnv, cwd?: string, dryRun?: boolean }} [options] */
