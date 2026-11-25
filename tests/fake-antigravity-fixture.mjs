@@ -4,13 +4,13 @@ import path from "node:path";
 // A real stdio peer exercises framing, bidirectional requests and process
 // ownership without installing agy or touching the user's Google credentials.
 export function installFakeAntigravity(directory, options = {}) {
-  const { behavior = "normal", version = "1.5.16", serverRequests = [], turnUpdates = null } = typeof options === "string" ? { behavior: options } : options;
+  const { behavior = "normal", version = "1.5.16", serverRequests = [], turnUpdates = null, loadPermission, promptUsage } = typeof options === "string" ? { behavior: options } : options;
   fs.mkdirSync(directory, { recursive: true });
   const statePath = path.join(directory, "antigravity-state.json");
   const script = path.join(directory, "fake-agy.mjs");
   fs.writeFileSync(statePath, JSON.stringify({ requests: [], serverResponses: [], sessions: [], launches: [], nextSession: 1 }));
-  const config = { statePath, behavior, version, serverRequests, turnUpdates };
-  fs.writeFileSync(script, `#!${process.execPath}\nconst { statePath, behavior, version, serverRequests, turnUpdates } = ${JSON.stringify(config)};\n` + String.raw`
+  const config = { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage };
+  fs.writeFileSync(script, `#!${process.execPath}\nconst { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage } = ${JSON.stringify(config)};\n` + String.raw`
 import fs from "node:fs";
 import readline from "node:readline";
 const read = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -19,7 +19,7 @@ const save = change => {
   const temp = statePath + "." + process.pid + ".tmp";
   fs.writeFileSync(temp, JSON.stringify(value)); fs.renameSync(temp, statePath);
 };
-save(value => value.launches.push({ pid: process.pid, args: process.argv.slice(2) }));
+save(value => value.launches.push({ pid: process.pid, script: process.argv[1], args: process.argv.slice(2) }));
 if (process.argv.includes("--version") || process.argv.includes("--help")) {
   process.stdout.write("Antigravity fixture ACP v1\n"); process.exit(0);
 }
@@ -52,6 +52,7 @@ const thoughtId = behavior === "dynamic-selectors" ? "reasoning-choice" : "thoug
 let sessionId = null, model = ["non-gemini-default", "no-gemini"].includes(behavior) ? otherModels[0].value : geminiModels[0].value;
 let thought = "high", promptRequest = null, thinkingOverride = null;
 let scriptedReplies = 0;
+let pendingLoad = null;
 const configs = () => [
   { id: modelId, category: "model", name: "Model", type: "select", currentValue: model,
     options: behavior === "dynamic-selectors" ? [{ group: "models", name: "Models", options: available }] : available },
@@ -106,13 +107,14 @@ function finish(stopReason = "end_turn") {
   const usage = stopReason === "cancelled"
     ? { inputTokens: 2068, outputTokens: 149, cachedReadTokens: 7508, cachedWriteTokens: 0, thoughtTokens: 149, totalTokens: 9725 }
     : { inputTokens: 9565, outputTokens: 87, cachedReadTokens: 0, cachedWriteTokens: 0, thoughtTokens: 46, totalTokens: 9652 };
-  send({ id: request.id, result: { stopReason, ...(behavior === "no-usage" ? {} : { usage }) } });
+  send({ id: request.id, result: { stopReason, ...(behavior === "no-usage" ? {} : { usage: promptUsage ?? usage }) } });
 }
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on("line", line => {
   const message = JSON.parse(line);
   if (!message.method) {
     save(value => value.serverResponses.push(message));
+    if (message.id === "load-permission") { sessionReply(pendingLoad, true); return; }
     if (serverRequests.length) {
       if (++scriptedReplies === serverRequests.length) finish();
     } else if (message.id === "1" && behavior !== "permission-cancel") finish();
@@ -138,7 +140,10 @@ input.on("line", line => {
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OLD REPLAY MUST BE EXCLUDED" } });
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "OLD REASONING" } });
       update({ sessionUpdate: "tool_call", toolCallId: "old-command", name: "run_command", kind: "execute", title: "false", status: "completed", rawInput: { CommandLine: "false" }, args: { CommandLine: "false" } });
-      sessionReply(message.id, true);
+      if (loadPermission) {
+        pendingLoad = message.id;
+        send({ id: "load-permission", method: loadPermission.method, params: { sessionId, ...loadPermission.params } });
+      } else sessionReply(message.id, true);
       break;
     case "session/set_config_option": {
       const current = configs().find(value => value.id === message.params.configId);
@@ -158,7 +163,11 @@ input.on("line", line => {
     case "session/prompt":
       promptRequest = message;
       if (serverRequests.length) {
-        serverRequests.forEach(({ method, params }, index) => send({ id: String(index + 1), method, params: { sessionId, ...params } }));
+        serverRequests.forEach(({ method, params, beforeUpdates = [], afterUpdates = [] }, index) => {
+          for (const frame of beforeUpdates) update(frame);
+          send({ id: String(index + 1), method, params: { sessionId, ...params } });
+          for (const frame of afterUpdates) update(frame);
+        });
         break;
       }
       if (behavior === "exit") { process.exit(7); break; }
@@ -195,5 +204,5 @@ process.stdout.on("error", () => process.exit(0));
     fs.writeFileSync(binary, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
   }
   const state = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
-  return { binary, statePath, state, requests: () => state().requests };
+  return { binary, script, statePath, state, requests: () => state().requests };
 }
