@@ -45,7 +45,9 @@ test("job details and both status views expose dispatch choices while compact re
   const report = direct(call(f, ["task", "--role", "review", "--high-stakes"], "Review the fixture."));
   assert.equal(report.status, "completed");
   const details = json(f.call("result", report.jobId, "--details"));
-  const single = json(f.call("status", report.jobId, "--json")).job;
+  const singleSnapshot = json(f.call("status", report.jobId, "--json"));
+  assert.ok(!("roles" in singleSnapshot));
+  const single = singleSnapshot.job;
   const latest = json(f.call("status", "--json")).latestFinished;
   for (const record of [details, single.request, single, latest]) {
     assert.deepEqual([record.role, record.highStakes, record.model, record.effort], ["review", true, "gpt-6.2-astra", "xhigh"]);
@@ -54,6 +56,7 @@ test("job details and both status views expose dispatch choices while compact re
     const status = f.call(...args);
     assert.equal(status.status, 0, status.stderr);
     assert.match(status.stdout, /role: review \| high-stakes/);
+    assert.equal(status.stdout.includes("Worker roles"), args.length === 1);
   }
   for (const compact of [report, json(f.call("result", report.jobId))]) {
     assert.equal(isC2Report(compact), true);
@@ -68,7 +71,7 @@ test("every follow-up selector, fork and roundtable seat refuses fresh role flag
     for (const flag of [["--role", "implement"], ["--high-stakes"], ["--high-stakes=false"]]) {
       const result = call(f, ["task", ...selector, ...flag], "Continue.");
       assert.equal(result.status, 1);
-      assert.equal(result.stderr.trim(), freshError);
+      assert.equal(result.stderr.trim(), flag[0] === "--high-stakes=false" ? "Pass --high-stakes as a bare flag." : freshError);
     }
   }
   assert.equal(fs.existsSync(path.join(f.dir, "fake-codex-state.json")), false);
@@ -91,6 +94,24 @@ for (const [command, flags] of [["review", ["--role", "review"]], ["adversarial-
     }
   });
 }
+
+test("role and high-stakes task flags reject duplicates and high-stakes takes only the bare form", () => {
+  const f = fixture();
+  for (const [flags, message] of [
+    [["--high-stakes", "--high-stakes=false", "--effort", "low"], "Pass --high-stakes only once."],
+    [["--high-stakes", "--high-stakes"], "Pass --high-stakes only once."],
+    [["--role", "nonexistent", "--role=implement"], "Pass --role only once."],
+    [["--high-stakes=false", "--effort", "low"], "Pass --high-stakes as a bare flag."],
+    [["--high-stakes=true"], "Pass --high-stakes as a bare flag."],
+    [["--high-stakes="], "Pass --high-stakes as a bare flag."]
+  ]) {
+    const result = call(f, ["task", ...flags], "Check the fixture.");
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.trim(), message);
+  }
+  assert.equal(fs.existsSync(path.join(f.dir, "fake-codex-state.json")), false);
+  assert.equal(json(f.call("status", "--json")).latestFinished, null);
+});
 
 test("unknown roles, high-stakes conflicts and cross-backend model overrides fail before launch", () => {
   const f = fixture();
@@ -166,7 +187,10 @@ test("permission hook accepts fresh role flags and declines invalid combinations
   const approved = flags => approveDuet({ hook_event_name: "PreToolUse", tool_name: "Bash", permission_mode: "default",
     session_id: f.env.CODEX_COMPANION_SESSION_ID, tool_use_id: "tool-a", cwd: f.repo, tool_input: { command: "fugato task " + flags } }, env)
     .hookSpecificOutput?.permissionDecision === "allow";
-  for (const flags of ["--role implement --effort medium", "--role=debug --high-stakes", "--high-stakes"]) assert.ok(approved(flags), flags);
-  for (const flags of ["--role unknown", "--role debug --to Ada", "--high-stakes --effort high",
+  for (const flags of ["--role implement --effort medium", "--role=debug --high-stakes", "--high-stakes",
+    "--role implement --model spark", "--backend antigravity --role read --model gemini-4-neon"]) assert.ok(approved(flags), flags);
+  for (const flags of ["--role unknown", "--role debug --to Ada", "--high-stakes --effort high", "--high-stakes --model spark",
+    "--backend antigravity --high-stakes", "--role implement --model gemini-4-neon", "--backend antigravity --role read --model gpt-6.2-sol",
+    "--high-stakes=false", "--high-stakes=true", "--high-stakes --high-stakes", "--role debug --role implement",
     "--role review --roundtable rt-test-room --persona critic"]) assert.equal(approved(flags), false, flags);
 });

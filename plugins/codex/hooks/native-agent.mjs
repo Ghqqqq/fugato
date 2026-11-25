@@ -827,15 +827,14 @@ function blocked(message, state = {}, code = 'native_adapter_error') {
 
 // A small argv tokenizer, never a shell. Quotes/backslashes allow cwd with spaces;
 // command substitution, expansions and shell operators have no special meaning.
-function parsePrompt(text) {
-  const invalid = () => { throw new Error(`Invalid DUET header. Allowed flags: ${ALLOWED}.`); };
+const invalidHeader = () => { throw new Error(`Invalid DUET header. Allowed flags: ${ALLOWED}.`); };
+function promptHeader(text) {
   const newline = text.indexOf('\n');
   const firstLine = text.slice(0, newline < 0 ? undefined : newline).replace(/\r$/, '');
   const prefix = /^[ \t]*DUET:[ \t]+/.exec(firstLine);
   if (!prefix) {
     // Header-like first lines must fail closed rather than discard settings.
-    if (/^[ \t]*duet[ \t]*:/i.test(firstLine)) invalid();
-    return { brief: text, flags: [] };
+    return /^[ \t]*duet[ \t]*:/i.test(firstLine) ? { tokens: [], newline, invalid: true } : null;
   }
   const header = firstLine.slice(prefix[0].length);
   const tokens = []; let token = '', quote = '', escaped = false, present = false;
@@ -847,28 +846,40 @@ function parsePrompt(text) {
     else if (/\s/.test(char)) { if (present) tokens.push(token); token = ''; present = false; }
     else { token += char; present = true; }
   }
-  if (quote || escaped) invalid();
   if (present) tokens.push(token);
+  return { tokens, newline, invalid: Boolean(quote || escaped) };
+}
+
+const hasRoleFlag = flags => flags.some(flag => /^(?:--role|--high-stakes)(?:=|$)/.test(flag));
+function hasSteeringRoleHeader(text) {
+  return hasRoleFlag(promptHeader(text)?.tokens ?? []);
+}
+
+function parsePrompt(text) {
+  const header = promptHeader(text);
+  if (!header) return { brief: text, flags: [] };
+  if (header.invalid) invalidHeader();
+  const { tokens, newline } = header;
   const flags = [], seen = new Set(); let cwd;
   for (let i = 0; i < tokens.length; i++) {
     const match = /^(--[a-z]+(?:-[a-z]+)*)(?:=(.*))?$/.exec(tokens[i]);
-    if (!match) invalid();
+    if (!match) invalidHeader();
     const [, flag, inline] = match;
-    if (seen.has(flag)) invalid();
+    if (seen.has(flag)) invalidHeader();
     seen.add(flag);
     if (['--fast', '--normal', '--fork', '--high-stakes'].includes(flag)) {
-      if (inline !== undefined || (seen.has('--fast') && seen.has('--normal'))) invalid();
+      if (inline !== undefined || (seen.has('--fast') && seen.has('--normal'))) invalidHeader();
       flags.push(flag); continue;
     }
-    if (!['--backend', '--role', '--model', '--effort', '--sandbox', '--cwd', '--max-minutes', '--max-tokens', '--roundtable', '--persona'].includes(flag)) invalid();
+    if (!['--backend', '--role', '--model', '--effort', '--sandbox', '--cwd', '--max-minutes', '--max-tokens', '--roundtable', '--persona'].includes(flag)) invalidHeader();
     const value = inline ?? tokens[++i];
-    if (!value || value.startsWith('--') || value.includes('\0')) invalid();
-    if (flag === '--backend' && !['codex', 'antigravity'].includes(value)) invalid();
-    if (flag === '--persona' && !PERSONA_IDS.includes(value)) invalid();
+    if (!value || value.startsWith('--') || value.includes('\0')) invalidHeader();
+    if (flag === '--backend' && !['codex', 'antigravity'].includes(value)) invalidHeader();
+    if (flag === '--persona' && !PERSONA_IDS.includes(value)) invalidHeader();
     if (flag === '--cwd') cwd = value;
     else flags.push(flag, value);
   }
-  if (seen.has('--roundtable') !== seen.has('--persona')) invalid();
+  if (seen.has('--roundtable') !== seen.has('--persona')) invalidHeader();
   return { brief: newline < 0 ? '' : text.slice(newline + 1), flags, cwd };
 }
 
@@ -1424,8 +1435,10 @@ async function drive($, e, state, progress) {
       if (!input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
-      const hasRole = parsed.flags.includes('--role') || parsed.flags.includes('--high-stakes');
-      if (hasRole && (state.threadId || state.jobId || parsed.flags.includes('--roundtable') || parsed.flags.includes('--fork'))) return blocked(FRESH_ROLE_ERROR, state);
+      const hasRole = hasRoleFlag(parsed.flags);
+      if (hasRole && (state.answeredTurn || state.threadId || state.jobId || parsed.flags.includes('--roundtable') || parsed.flags.includes('--fork'))) {
+        return blocked(FRESH_ROLE_ERROR, state);
+      }
       if (parsed.flags.includes('--roundtable')) {
         const binding = { roomId: parsed.flags[parsed.flags.indexOf('--roundtable') + 1], persona: parsed.flags[parsed.flags.indexOf('--persona') + 1] };
         if (state.threadId && (state.roundtable?.roomId !== binding.roomId || state.roundtable?.persona !== binding.persona)) {
@@ -1822,7 +1835,7 @@ function progressFor($, e, state, publish, currentFlight) {
 }
 
 export function register(on) {
-  registerSteering(on);
+  registerSteering(on, hasSteeringRoleHeader);
   registerRoundtableNotifier(on);
   guidanceCache = null;
   teammateReceive(on);

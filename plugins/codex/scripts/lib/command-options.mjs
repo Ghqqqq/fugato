@@ -13,6 +13,8 @@ export const COMMAND_OPTIONS = {
     internalValueOptions: ["session-cwd", "dispatch-nonce", "tool-use-id", "agent-name"],
     repeatableOptions: ["approve-browser-origin", "approve-computer-app"],
     booleanOptions: ["high-stakes", "json", "report", "write", "resume-last", "resume", "fresh", "fork", "background", "detached", "follow", "direct", "quiet", "fast", "normal", "no-claude-md"],
+    uniqueOptions: ["role", "high-stakes"],
+    bareOptions: ["high-stakes"],
     aliasMap: { m: "model" }
   },
   roundtable: {
