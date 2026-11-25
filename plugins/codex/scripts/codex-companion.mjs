@@ -16,7 +16,7 @@ import { normalizeBrowserOrigins, normalizeBundleIds } from "./lib/server-reques
 import { browserOriginSetup, computerUseSetup, transportSetup, defaultSandboxSetup, defaultModeSetup, permissionMappingSetup, readTomlField, dispatchSetup, dispatchPreference, contextSetup, budgetDefaultsSetup, personaModelsSetup, workerDefaultsSetup, readWorkerDefaults, normalizeRequestedModel, isSupportedReasoningEffort, ensureBrowserApproval, ensureComputerUseApproval, ensureProjectDocs, projectDocsSetup, SANDBOX_MODES } from "./lib/setup-config.mjs";
 import { budgetLimit, newJobBudget } from "./lib/job-budget.mjs";
 import { listModels, renderModels } from "./lib/models.mjs";
-import { ensureAntigravityAvailable, listAntigravityModels, runAntigravityTurn } from "./lib/antigravity.mjs";
+import { ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "./lib/antigravity.mjs";
 import { acpExecutable, acpProcessGone, isAntigravityJob, stopOrphanedAcpGroup } from "./lib/acp-process.mjs";
 import { acpSetting, jobBackend, normalizeBackend, validateAntigravityTask } from "./lib/backends.mjs";
 import { activityReader, formatActivity, redactActivity, snippet } from "./lib/activity.mjs";
@@ -1139,8 +1139,11 @@ async function executeTaskRun(request) {
   // keeps "never" and such a request fails closed at once.
   const approvalPolicy = backend === "antigravity" ? request.detached ? "antigravity+ask-parent" : "antigravity+deny-requests"
     : request.permissionPolicy ? (request.detached ? request.permissionPolicy.approvalPolicy : "never") : request.detached ? FORWARDED_APPROVALS_LABEL : "never";
+  // Record the executable checked for this request; the runner launches exactly
+  // this path and recovery compares against it.
+  const executable = backend === "antigravity" ? resolveAntigravityExecutable(request.cwd) : null;
   updateJob(workspaceRoot, request.jobId, () => ({ preExistingChanges: before.preExistingChanges, sandbox, approvalPolicy,
-    ...(backend === "antigravity" ? { acpExecutable: acpExecutable(request.cwd) } : {}) }));
+    ...(backend === "antigravity" ? { acpExecutable: executable ?? acpExecutable(request.cwd) } : {}) }));
   request.onProgress?.(backend === "antigravity"
     ? `Antigravity ACP uses its own tool permissions without a Fugato filesystem sandbox; approval policy: ${approvalPolicy}. Captured workspace baseline (${before.status}).`
     : `Sandbox: ${sandbox}; approval policy: ${approvalPolicy}${request.detached ? " (Computer Use app requests are forwarded to the parent)" : ""}. Captured workspace baseline (${before.status}).`);
@@ -1150,6 +1153,7 @@ async function executeTaskRun(request) {
   try {
     if (!request.detached) runtime.abort.signal.throwIfAborted();
     result = await (backend === "antigravity" ? runAntigravityTurn : runAppServerTurn)(workspaceRoot, {
+    ...(executable ? { executable, requestCwd: request.cwd } : {}),
     executionCwd: fs.realpathSync(request.cwd),
     jobId: request.jobId,
     onThreadBusy: (threadId, turnIds) => {
