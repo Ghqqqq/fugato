@@ -2,21 +2,24 @@ import { spawnOwned, stopOwnedProcessGroup } from "./process.mjs";
 
 const MAX_FRAME_CHARS = 32 * 1024 * 1024;
 const MAX_STDERR_CHARS = 64 * 1024;
+const EXIT_DRAIN_MS = 250;
 const rpcError = (message, code = "ACP_TRANSPORT_CLOSED", extra = {}) => Object.assign(new Error(message), { code, ...extra });
 
 // ACP v1 uses UTF-8 newline-delimited JSON-RPC in both directions. In
 // particular, handling a server request must not block reading its next frame.
 // https://agentclientprotocol.com/protocol/v1/transports
 export class AcpClient {
-  constructor(command, cwd, { env = process.env, onNotification = null, onRequest = null, timeoutMs = 30000 } = {}) {
+  constructor(command, cwd, { env = process.env, onNotification = null, onRequest = null, timeoutMs = 30000, exitGraceMs = 2000 } = {}) {
     this.timeoutMs = timeoutMs;
+    this.exitGraceMs = exitGraceMs;
     this.onNotification = onNotification;
     this.onRequest = onRequest;
     this.pending = new Map();
     this.serverRequests = new Map();
     this.nextId = 1;
     this.stderr = "";
-    this.buffer = "";
+    this.frameParts = [];
+    this.frameLength = 0;
     this.failure = null;
     this.hasExited = false;
     this.closed = false;
@@ -24,22 +27,33 @@ export class AcpClient {
     // spawnOwned keeps argv literal and handles Windows .cmd/.bat shims.
     this.child = spawnOwned(command, ["acp"], { cwd, env, detached: true, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     this.exit = new Promise(resolve => {
-      this.child.once("error", error => {
-        this.hasExited = true;
-        this.fail(rpcError(`Cannot start Antigravity ACP: ${error.message}`, "ACP_SPAWN_FAILED"));
+      let drainTimer;
+      const observeExit = () => {
+        this.hasExited = this.pid !== null;
         resolve();
+      };
+      const failExited = (code, signal) => this.fail(rpcError(`Antigravity ACP exited before completing the request (${signal || `exit ${code}`}).`));
+      this.child.once("error", error => this.fail(rpcError(`Cannot start Antigravity ACP: ${error.message}`, "ACP_SPAWN_FAILED")));
+      this.child.once("exit", (code, signal) => {
+        observeExit();
+        // A descendant may hold the pipes open after the leader's final frame.
+        drainTimer = setTimeout(() => {
+          failExited(code, signal);
+          this.child.stdout.destroy();
+          this.child.stderr.destroy();
+        }, EXIT_DRAIN_MS);
       });
       this.child.once("close", (code, signal) => {
-        this.hasExited = true;
-        this.fail(rpcError(`Antigravity ACP exited before completing the request (${signal || `exit ${code}`}).`));
-        resolve();
+        observeExit();
+        clearTimeout(drainTimer);
+        failExited(code, signal);
       });
     });
     this.child.stdin.on("error", error => this.fail(rpcError(`Antigravity ACP input closed: ${error.message}`)));
     this.child.stdout.setEncoding("utf8");
     this.child.stdout.on("data", chunk => this.read(chunk));
     this.child.stdout.on("end", () => {
-      this.fail(this.buffer.trim() ? rpcError("Antigravity ACP ended with an incomplete JSON-RPC frame.", "ACP_INVALID_FRAME")
+      this.fail(this.frameParts.some(part => part.trim()) ? rpcError("Antigravity ACP ended with an incomplete JSON-RPC frame.", "ACP_INVALID_FRAME")
         : rpcError("Antigravity ACP closed stdout before completing its pending requests."));
     });
     this.child.stdout.on("error", error => this.fail(rpcError(`Antigravity ACP output failed: ${error.message}`)));
@@ -61,12 +75,18 @@ export class AcpClient {
 
   read(chunk) {
     if (this.failure || this.closed) return;
-    this.buffer += chunk;
-    let newline;
-    while ((newline = this.buffer.indexOf("\n")) >= 0) {
-      const line = this.buffer.slice(0, newline);
-      this.buffer = this.buffer.slice(newline + 1);
-      if (line.length > MAX_FRAME_CHARS) { this.fail(rpcError("Antigravity ACP frame exceeds the size limit.", "ACP_INVALID_FRAME")); return; }
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf("\n", offset);
+      const end = newline < 0 ? chunk.length : newline;
+      this.frameLength += end - offset;
+      if (this.frameLength > MAX_FRAME_CHARS) { this.fail(rpcError("Antigravity ACP frame exceeds the size limit.", "ACP_INVALID_FRAME")); return; }
+      this.frameParts.push(chunk.slice(offset, end));
+      if (newline < 0) return;
+      const line = this.frameParts.join("");
+      this.frameParts = [];
+      this.frameLength = 0;
+      offset = newline + 1;
       if (!line.trim()) continue;
       let message;
       try { message = JSON.parse(line); }
@@ -74,11 +94,13 @@ export class AcpClient {
       if (!message || Array.isArray(message) || typeof message !== "object" || message.jsonrpc !== "2.0") {
         this.fail(rpcError("Antigravity ACP sent an invalid JSON-RPC message.", "ACP_INVALID_FRAME")); return;
       }
+      if (message.id === null && !Object.hasOwn(message, "method")) continue;
       if (message.id !== undefined && !(typeof message.id === "string" || (typeof message.id === "number" && Number.isFinite(message.id)))) {
         this.fail(rpcError("Antigravity ACP sent an invalid JSON-RPC request identifier.", "ACP_INVALID_FRAME")); return;
       }
       if (typeof message.method === "string") {
         if (message.id !== undefined) void this.handleRequest(message);
+        else if (message.method === "$/cancel_request") this.serverRequests.get(message.params?.requestId)?.controller.abort();
         else {
           try { this.onNotification?.(message); }
           catch (error) { this.fail(error); return; }
@@ -98,7 +120,6 @@ export class AcpClient {
         this.fail(rpcError("Antigravity ACP sent an unrecognized JSON-RPC message.", "ACP_INVALID_FRAME")); return;
       }
     }
-    if (this.buffer.length > MAX_FRAME_CHARS) this.fail(rpcError("Antigravity ACP frame exceeds the size limit.", "ACP_INVALID_FRAME"));
   }
 
   send(message) {
@@ -166,19 +187,35 @@ export class AcpClient {
     } finally { if (this.serverRequests.get(message.id) === request) this.serverRequests.delete(message.id); }
   }
 
+  async waitForExit(timeoutMs) {
+    let timer;
+    try { await Promise.race([this.exit, new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); })]); }
+    finally { clearTimeout(timer); }
+  }
+
   close() {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
-    this.fail(rpcError("Antigravity ACP connection closed."));
-    this.closePromise = (async () => {
-      // Only this connection's detached process group is ever signalled.
-      this.child.stdin.end();
-      await stopOwnedProcessGroup(this.child, 100);
-      let timer;
-      try { await Promise.race([this.exit, new Promise(resolve => { timer = setTimeout(resolve, 1000); })]); }
-      finally { clearTimeout(timer); }
-      if (!this.hasExited) throw rpcError("Antigravity ACP process did not exit after cleanup.", "ACP_CLEANUP_FAILED");
-    })();
+    this.closePromise = Promise.resolve().then(async () => {
+      let error = null;
+      try {
+        this.fail(rpcError("Antigravity ACP connection closed."));
+        this.child.stdin.end();
+        await this.waitForExit(this.exitGraceMs);
+      } catch (cause) { error = cause; }
+      try {
+        // The owned group can still contain descendants after a graceful exit.
+        await stopOwnedProcessGroup(this.child, 100);
+      } catch (cause) { error ??= cause; }
+      if (!this.hasExited) await this.waitForExit(1000);
+      if (!this.hasExited) {
+        // Even a failed cleanup must release the worker's event loop.
+        this.child.unref();
+        for (const stream of this.child.stdio) stream?.destroy();
+        error ??= rpcError("Antigravity ACP process did not exit after cleanup.", "ACP_CLEANUP_FAILED");
+      }
+      return { exited: this.hasExited, error };
+    }).catch(error => ({ exited: this.hasExited, error }));
     return this.closePromise;
   }
 }
