@@ -2,7 +2,7 @@
 // No Node globals/imports in this sandbox; all host work goes through $.
 import { cleanDisplayText } from '../scripts/lib/display-text.mjs';
 import { lifecycleStoreSize, forgetLifecycle, pendingLifecycle, captureStartContext, lifecycleBrief, observeStop, prepareLifecycleStep, abandonLifecycleStop } from './lifecycle-hooks.mjs';
-import { registerSteering } from './steering.mjs';
+import { geminiMessage, registerSteering, returnedQuestion } from './steering.mjs';
 import { registerRoundtableNotifier, startRoundtableNotifier, stopRoundtableMember, roundtableNotice, settleRoundtableNotice, isRoundtableNoticeTurn } from './roundtable-notifier.mjs';
 import { PERSONA_IDS } from '../scripts/lib/roundtable-personas.mjs';
 import { AGENT_TYPE, GEMINI_AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
@@ -136,6 +136,11 @@ const COORDINATOR_SUFFIX = '\n\nAddress this before completing your current task
 // exact framing so run-log binding can still match them.
 const coordinatorBody = text => text.startsWith(COORDINATOR_PREFIX) && text.endsWith(COORDINATOR_SUFFIX)
   ? text.slice(COORDINATOR_PREFIX.length, -COORDINATOR_SUFFIX.length) : text;
+function incomingMessage(state, text) {
+  if (!(state?.jobId || state?.intent || state?.answeredTurn)) return { text };
+  const body = coordinatorBody(text);
+  return state.type === GEMINI_AGENT_TYPE ? geminiMessage(body) : { text: body };
+}
 const logKey = (agentId, turnId) => JSON.stringify([agentId, turnId]);
 const invalidateProgress = $ => {
   try { $.ui.invalidate('ui.render'); } catch { /* Display must never affect a turn. */ }
@@ -1305,12 +1310,13 @@ async function drive($, e, state, progress) {
   } else {
     // Only later SendMessage turns carry host framing. An initial Agent brief
     // may contain that exact text as a literal example.
-    const previousTurn = state.jobId || state.intent || state.answeredTurn;
-    let input = previousTurn ? coordinatorBody(state.incoming.text) : state.incoming.text, args, questionChanged = false, resumedWait = false;
+    const message = incomingMessage(state, state.incoming.text);
+    let input = message.text, args, questionChanged = false, resumedWait = false;
     const notice = state.incoming.notice, previousAnswer = state.answer;
     if (notice?.duplicate) return previousAnswer || blocked('Roundtable notice already received; no work was repeated.', state);
     const answeringDisplayedQuestion = !notice && state.answer?.status === 'needs_answer';
     const gemini = state.type === GEMINI_AGENT_TYPE;
+    const decision = input === 'Allow once' || input === 'Deny';
     if (!input.trim() && !(gemini && (answeringDisplayedQuestion || state.status === 'needs_answer'))) {
       return blocked('Empty native-agent message; nothing was dispatched.', state);
     }
@@ -1326,7 +1332,7 @@ async function drive($, e, state, progress) {
       questionChanged = pending?.id !== state.questionId;
       if (gemini && pending && !notice) {
         answerRefused = !answeringDisplayedQuestion || questionChanged || previousAnswer.question?.id !== pending.id
-          || (input !== 'Allow once' && input !== 'Deny');
+          || message.questionId !== pending.id || (pending.kind === 'action-approval' && !decision) || !input.trim();
       }
       // A pending question keeps the job running; its report says needs_answer.
       if (pending) state.status = 'needs_answer';
@@ -1339,7 +1345,9 @@ async function drive($, e, state, progress) {
         if (ACTIVE.includes(job.status) || !ended(job, state)) return blocked('Roundtable notice is waiting for the current job to end.', state);
         await settleRoundtableNotice($, notice, 'accepted');
       }
-      if (answeringDisplayedQuestion && !pending) {
+      const expiredAnswer = answeringDisplayedQuestion && !pending
+        && !(gemini && message.questionId && !decision && ended(job, state));
+      if (expiredAnswer) {
         // The persisted displayed result fixes this message's intent, even if
         // another answer path completed the job while the adapter was unloaded.
         state.intent = { session: state.session, agentId: e.agentId, turnId: e.turnId, kind: 'answer', nonce: nonceFor(state.session, e.agentId, e.turnId) };
@@ -1350,7 +1358,7 @@ async function drive($, e, state, progress) {
       }
       if (resumedWait) {
         // Fall through to the shared wait below.
-      } else if (answeringDisplayedQuestion && !pending) {
+      } else if (expiredAnswer) {
         await save($, state);
         const current = await companion($, state, ['result', state.jobId, '--report']);
         if (current.jobId !== state.jobId) throw new Error('Fugato report does not match the recorded job handle.');
@@ -1381,6 +1389,7 @@ async function drive($, e, state, progress) {
         : ['answer', state.jobId, '--question', state.questionId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
       if (questionChanged || answerRefused) input = '';
     } else {
+      if (message.questionId && decision) return blocked('That permission question has ended. The reply was not delivered.', state);
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
       if (parsed.flags.includes('--roundtable')) {
@@ -1437,7 +1446,8 @@ async function drive($, e, state, progress) {
       if (state.intent.kind === 'task') input = await lifecycleBrief($, state, input);
       report = await companion($, state, args, input, progress);
       if (answerRefused) report = { ...report,
-        notice: 'Your message was not delivered as an assignment. Answer the displayed permission question with exactly Allow once or Deny.' };
+        notice: 'Your message was not delivered as an assignment. ' + (report.question?.kind === 'action-approval'
+          ? 'Answer the displayed permission question with exactly Allow once or Deny.' : 'Reply to the current question.') };
       if (resumedWait && report && typeof report === 'object') report = { ...report,
         notice: `The earlier question had already expired or been answered; this message was not delivered to ${runtimeLabel(state)}. Waited for the running job instead.` };
     }
@@ -1756,7 +1766,8 @@ function progressFor($, e, state, publish, currentFlight) {
 }
 
 export function register(on) {
-  registerSteering(on, dispatching);
+  const resolvingSends = new Set();
+  registerSteering(on, dispatching, resolvingSends);
   registerRoundtableNotifier(on);
   guidanceCache = null;
   teammateReceive(on);
@@ -1959,7 +1970,8 @@ export function register(on) {
         // One small durable guard (not the admission scan) until turn.start
         // persists the binding, so a reload in between still fails closed.
         await $.store.set(bindingFailedKey(session, result.agentId), { bindingPending: true, at: await $.clock.now(),
-          type: e.subagentType, ...(isTeammate ? { isTeammate: true } : {}) }).catch(() => {});
+          type: e.subagentType, ...(e.subagentType === GEMINI_AGENT_TYPE ? { session, agentId: result.agentId, name } : {}),
+          ...(isTeammate ? { isTeammate: true } : {}) }).catch(() => {});
       }
       return result;
     } finally { bindings.delete(spawnBinding); if (!bindings.size) spawning.delete(session); release(); }
@@ -2017,8 +2029,13 @@ export function register(on) {
           await Promise.all(own.map(binding => binding.pending));
           state = await $.store.get(key);
         }
+        // A sender can still be resolving the recipient of an earlier send.
+        // Preserve its address before this admission replaces the old report.
+        if (agent.type === GEMINI_AGENT_TYPE) {
+          for (const routes of resolvingSends) if (!routes.has(key)) routes.set(key, returnedQuestion(state));
+        }
         let incomingText = e.text;
-        if (incomingText.length > 65536) {
+        if (incomingText.length > 65536 && incomingMessage(state, incomingText).text.length > 65536) {
           // Neither permission choice can be oversized. Re-show the question
           // through the ordinary invalid-answer path without retaining the text.
           if (agent.type !== GEMINI_AGENT_TYPE || state?.answer?.status !== 'needs_answer') return await refuse('native_message_too_large');
@@ -2069,6 +2086,7 @@ export function register(on) {
             ...(candidate.bindingPending ? { bindingPending: true } : {}) };
           delete value.finishedAt;
           restoreBinding(key, value);
+          if (value.type === GEMINI_AGENT_TYPE) value.returnedTurn = null;
           if (budget.count + Number(!budget.keepSize) > MAX_RECORDS
             || budget.size - budget.keepSize + stateSize(value) > MAX_STORE_SIZE) return 'native_capacity';
           if (!latest && (resumedSpawns.has(key) || (!observedBindings.has(key) && !bindingFailed))) return 'native_binding_gone';
@@ -2098,6 +2116,10 @@ export function register(on) {
     const flight = `${key}:${e.turnId}`;
     const listener = observer();
     let running = flights.get(flight);
+    const releaseFlight = () => {
+      if (flights.get(flight) === running) flights.delete(flight);
+      if (dispatching.get(key) === running) dispatching.delete(key);
+    };
     if (!running) {
       // Do not wait on another turn's stream (which spends this hook's budget).
       // One agent owns the dispatch lock; a concurrent turn is refused.
@@ -2184,21 +2206,12 @@ export function register(on) {
           // previous intent's closure as it was.
           if (!uncertain && (!state.intent || state.intent.turnId === e.turnId)) state.answeredTurn = e.turnId;
           if (!uncertain && report.status !== 'needs_answer' && !UNSETTLED.includes(state.status)) state.finishedAt = await $.clock.now();
-          // questionId means shown to Claude, not observed in the job. Earlier
-          // saves can fail and turn the response into blocked; only this path
-          // commits the question whose needs_answer report we actually return.
-          if (report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
-          try { await save($, state); }
-          catch (error) {
-            // The companion may already have marked a terminal report as
-            // delivered. A failed adapter cache write must not replace it.
-            if (UNSETTLED.includes(report.status)) throw error;
-            if (report.status === 'needs_answer') {
-              // A store may commit and then throw. Still return the question;
-              // retry pre-commit failures so it remains answerable. Persistent
-              // failure is repaired by re-showing the current question.
-              await save($, state).catch(() => {});
-            }
+          if (state.type === GEMINI_AGENT_TYPE) {
+            // A finished producer can still have unread progress. Commit the
+            // returned report when the consumer reaches its text chunk.
+            running.returnState = state;
+          } else {
+            await saveFinalReport($, state, report);
           }
         }
         running.display.status = report.status;
@@ -2218,8 +2231,7 @@ export function register(on) {
           if (Number.isFinite(running.display.startedAt)) running.display.elapsedMs = Math.max(0, await $.clock.now() - running.display.startedAt);
         } catch { /* Keep the last tick. */ }
         for (const item of running.listeners) item.close();
-        flights.delete(flight);
-        if (dispatching.get(key) === running) dispatching.delete(key);
+        if (!running.returnState || !running.listeners.size) releaseFlight();
         if (liveProgress.get(e.agentId) === running.feed) {
           liveProgress.delete(e.agentId);
           rememberDisplay(agentDisplays, e.agentId, running.display);
@@ -2231,8 +2243,18 @@ export function register(on) {
     } else running.listeners.add(listener);
     try {
       yield* listener.read(running);
-      return yield* finish(e, await running.result);
-    } finally { running.listeners.delete(listener); listener.close(); }
+      const report = await running.result;
+      if (!running.returnState) return yield* finish(e, report);
+      running.returnState.returnedTurn = e.turnId;
+      running.returning ??= saveFinalReport($, running.returnState, report);
+      return yield* finish(e, await running.returning, () => {
+        for (const routes of resolvingSends) if (!routes.has(key)) routes.set(key, undefined);
+        releaseFlight();
+      });
+    } finally {
+      running.listeners.delete(listener); listener.close();
+      if (running.done && !running.listeners.size) releaseFlight();
+    }
   }).catch(async function* ($, e, next) {
     if (!e.agentId || (!await isRoundtableNoticeTurn($, e) && knownTypes.has(e.agentId) && !isNativeType(knownTypes.get(e.agentId)))) return yield* next(e);
     return yield* finish(e, blocked('Native adapter hook failed; inspect fugato status before retrying.', { agentId: e.agentId }));
@@ -2302,10 +2324,28 @@ export function register(on) {
   registered = true;
 }
 
-async function* finish(e, report) {
+async function saveFinalReport($, state, report) {
+  if (report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
+  try { await save($, state); }
+  catch (error) {
+    if (UNSETTLED.includes(report.status)) throw error;
+    if (report.status === 'needs_answer') {
+      try { await save($, state); }
+      catch {
+        if (state.type !== GEMINI_AGENT_TYPE) return report;
+        const target = report.worker || report.jobId;
+        return { ...report, next: null, notice: `SendMessage answers may be refused because the returned question could not be saved. Continue with fugato answer ${target} --question '${state.questionId}' and the answer on stdin.` };
+      }
+    }
+  }
+  return report;
+}
+
+async function* finish(e, report, onYield) {
   // 2.1.302 d.ts 14211-14214 calls usage "What the request cost as the API
   // reported it". Codex tokens belong in the report/notice, never this ledger.
   const text = JSON.stringify(report);
+  onYield?.();
   yield { kind: 'text', index: 1, text };
   yield { kind: 'stop', stopReason: 'end_turn', usage: null };
   return { turnId: e.turnId, index: e.index, answer: text, toolUses: [], stopReason: 'end_turn', usage: null };

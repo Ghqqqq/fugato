@@ -236,7 +236,7 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
     });
   }
   reload(false);
-  async function invoke(event, input, bottom) {
+  async function invoke(event, input, bottom, onChunk) {
     const e = clone(input), record = { event, input: e };
     capture.events.push(record);
     let called = false, cached;
@@ -264,7 +264,13 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
         catch (error) { if (!hook?.catch) throw error; return yield* hook.catch($, e, next); }
       })();
       const chunks = []; let step;
-      do { step = await value.next(); if (!step.done) { chunks.push(step.value); record.chunks = chunks; } } while (!step.done);
+      do {
+        step = await value.next();
+        if (!step.done) {
+          chunks.push(step.value); record.chunks = chunks;
+          if (onChunk) await onChunk(step.value);
+        }
+      } while (!step.done);
       record.chunks = chunks; record.result = step.value; record.processCount = capture.processes.length;
       assert.equal(step.value.usage, null);
       assert.deepEqual(chunks.at(-1), { kind: 'stop', stopReason: 'end_turn', usage: null });
@@ -303,7 +309,7 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
     await invoke('turn.start', { agentId, turnId: `turn-${number}`, text: rewritten }, async e => ({ turnId: e.turnId }));
     const result = await invoke('turn.step', { agentId, turnId: `turn-${number}`, index: 0, model: 'haiku', effort: 'low', messageCount: 1 }, async function* () {
       modelCalls++; throw new Error('Claude model bottom was reached');
-    });
+    }, options.onChunk);
     if (aborted) controller = new AbortController();
     await options.beforeComplete?.();
     const completion = await invoke('turn.complete', { agentId, turnId: `turn-${number}`,
@@ -1341,18 +1347,8 @@ const renderCard = async (f, report) => {
   return card.children.map(row => renderLeaves(row).join('')).join('\n');
 };
 
-test('a Gemini compact report renders as a card and attaches to a bound background delivery', async () => {
-  const f = fixture('review-ok', 'gemini-report');
-  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`).binary;
-  const report = await f.turn('Produce the report.', 1, false, { agentType: geminiType });
-  assert.equal(report.backend, 'antigravity');
-  assert.equal(report.provider, 'Google Antigravity');
-  assert.match(await renderCard(f, report), /Antigravity fixture answer/);
-
+async function attachBackground(f, report, job) {
   const marker = JSON.parse(fs.readFileSync(`${f.root}/isolated/duet/sessions/native-session/${report.jobId}.json`));
-  const job = f.jobs()[0];
-  const { inputTokens, outputTokens, totalTokens } = report.usage;
-  job.report.usage = { inputTokens, outputTokens, totalTokens };
   job.deliveryBindings = [{ sessionId: 'native-session', toolUseId: 'background-tool' }];
   fs.writeFileSync(marker.jobFile, JSON.stringify(job));
   f.env.CLAUDE_CODE_TMPDIR = f.root;
@@ -1363,7 +1359,21 @@ test('a Gemini compact report renders as a card and attaches to a bound backgrou
   const notification = `<task-notification><task-id>background-task</task-id><tool-use-id>background-tool</tool-use-id><output-file>${file}</output-file><status>completed</status><summary>Done</summary></task-notification>`;
   f.reload(false, reportHooks);
   const { context } = await f.invoke('prompt.submit', { origin: { kind: 'task-notification' }, text: notification }, async e => e);
-  const attached = JSON.parse(context[0].split('\n')[1]);
+  return JSON.parse(context[0].split('\n')[1]);
+}
+
+test('a Gemini compact report renders as a card and attaches to a bound background delivery', async () => {
+  const f = fixture('review-ok', 'gemini-report');
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`).binary;
+  const report = await f.turn('Produce the report.', 1, false, { agentType: geminiType });
+  assert.equal(report.backend, 'antigravity');
+  assert.equal(report.provider, 'Google Antigravity');
+  assert.match(await renderCard(f, report), /Antigravity fixture answer/);
+
+  const job = f.jobs()[0];
+  const { inputTokens, outputTokens, totalTokens } = report.usage;
+  job.report.usage = { inputTokens, outputTokens, totalTokens };
+  const attached = await attachBackground(f, report, job);
   assert.ok(isC2Report(attached));
   assert.deepEqual(attached.usage, { inputTokens, outputTokens, totalTokens });
   assert.deepEqual([attached.jobId, attached.backend, attached.provider, attached.summary],
@@ -1433,7 +1443,7 @@ test('native Gemini usage identifies Google Antigravity and the reported model o
 const busyGemini = { isDelivered: false, reason: 'This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again; answer a displayed permission question with exactly Allow once or Deny.' };
 function geminiInbox(f) {
   const messages = [];
-  const send = text => f.invoke('session.send', { to: 'native-agent', text, origin: { kind: 'model' } }, async e => {
+  const send = (text, to = 'native-agent') => f.invoke('session.send', { to, text, origin: { kind: 'model' } }, async e => {
     messages.push(e.text);
     return { isDelivered: true };
   });
@@ -1443,6 +1453,182 @@ function geminiInbox(f) {
   };
   return { send, receive, messages };
 }
+
+const tagged = (id, text) => `[Fugato Gemini answer ${id}]\n${text}`;
+const permissionRequest = (toolCallId, content = 'replacement') => ({ method: 'session/request_permission', params: {
+  toolCall: { toolCallId, name: 'edit_file', kind: 'edit', rawInput: { Path: 'report  file.txt', Replacement: content } },
+  options: [{ optionId: 'allow', kind: 'allow_once', name: 'Allow' }, { optionId: 'deny', kind: 'reject_once', name: 'Deny' }]
+} });
+
+test('two Gemini decisions sent for Q1 cannot answer Q2 or start another job', async () => {
+  const f = fixture('review-ok', 'gemini-two-questions');
+  const acp = installFakeAntigravity(`${f.root}/acp`, { serverRequests: [permissionRequest('one'), permissionRequest('two')] });
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  const inbox = geminiInbox(f);
+  const q1 = await f.turn('Review both changes.', 1, false, { agentType: geminiType });
+  assert.equal(q1.status, 'needs_answer');
+  await inbox.send('Allow once');
+  await inbox.send('Deny');
+  assert.deepEqual(inbox.messages, [tagged(q1.question.id, 'Allow once'), tagged(q1.question.id, 'Deny')]);
+  // A third send began at Q1, but its roster lookup completes after Q2.
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const list = f.$.agent.list;
+  f.$.agent.list = async () => { f.$.agent.list = list; await gate; return list(); };
+  const delayed = inbox.send('Allow once');
+  const q2 = await inbox.receive(2).finally(release);
+  assert.deepEqual(await delayed, { isDelivered: true });
+  assert.deepEqual(inbox.messages.pop(), tagged(q1.question.id, 'Allow once'));
+  assert.equal(q2.status, 'needs_answer');
+  assert.notEqual(q2.question.id, q1.question.id);
+  f.reload();
+  const stale = await inbox.receive(3);
+  assert.equal(stale.question.id, q2.question.id);
+  assert.match(stale.notice, /not delivered/);
+  const literal = tagged(q2.question.id, 'Allow once');
+  await inbox.send(literal);
+  assert.deepEqual(inbox.messages, ['[Fugato Gemini assignment]\n' + literal]);
+  assert.equal((await inbox.receive(4)).question.id, q2.question.id);
+  const untagged = await f.turn('Allow once', 5, false, { wake: true });
+  assert.equal(untagged.question.id, q2.question.id);
+  assert.match(untagged.notice, /not delivered/);
+  assert.deepEqual(acp.state().serverResponses.map(r => r.result.outcome.optionId), ['allow']);
+  await inbox.send('Deny');
+  await inbox.send('Allow once');
+  assert.equal((await inbox.receive(6)).blockers[0].code, 'approval_denied');
+  assert.equal((await inbox.receive(7)).status, 'blocked');
+  assert.deepEqual(acp.state().serverResponses.map(r => r.result.outcome.optionId), ['allow', 'deny']);
+  assert.equal(f.jobs().length, 1);
+});
+
+test('Gemini busy refusal and question addressing survive missing roster entries by id or name', async () => {
+  const f = fixture('review-ok', 'gemini-lookup', { hostOnly: true });
+  const state = { v: 2, session: 'native-session', agentId: 'g1', type: geminiType, name: 'Curie', status: 'running' };
+  const key = 'native:v2:native-session:g1';
+  f.setStore({ [key]: state, 'native:v2:elsewhere:g2': { ...state, session: 'elsewhere', agentId: 'g2', name: 'other' } });
+  const inbox = geminiInbox(f);
+  for (const list of [async () => [], async () => { throw new Error('Roster unavailable'); }]) {
+    f.$.agent.list = list;
+    assert.deepEqual(await inbox.send('another brief', 'g1'), busyGemini);
+    assert.deepEqual(await inbox.send('another brief', 'CURIE'), busyGemini);
+  }
+  assert.deepEqual(inbox.messages, []);
+  assert.deepEqual(await inbox.send('ordinary host delivery', 'other'), { isDelivered: true });
+  state.status = 'needs_answer';
+  state.answer = { status: 'needs_answer', question: { id: 'q1' } };
+  state.questionId = 'q1';
+  f.setStore({ [key]: state });
+  assert.deepEqual(await inbox.send('Deny', 'curie'), { isDelivered: true });
+  assert.deepEqual(inbox.messages, ['ordinary host delivery', tagged('q1', 'Deny')]);
+  assert.equal(f.capture.processes.length, 0);
+});
+
+test('a Gemini question opens at the report chunk and gives CLI recovery when its returned marker cannot be saved', async () => {
+  for (const failSave of [false, true]) {
+    const f = fixture('review-ok', 'gemini-yield');
+    f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`, { behavior: 'permission' }).binary;
+    const inbox = geminiInbox(f), store = f.$.store.set;
+    let before, after, rejected = 0;
+    f.$.store.set = async (key, value) => {
+      if (failSave && value.answer?.status === 'needs_answer') { rejected++; throw new Error('Store full'); }
+      return store(key, value);
+    };
+    const question = await f.turn('Wait for review.', 1, false, { agentType: geminiType, onChunk: async chunk => {
+      if (!before && chunk.kind === 'thinking') {
+        // Leave the consumer paused while the producer finishes the job lookup,
+        // stops its display timer and accumulates the rest of the progress.
+        await until(() => f.jobs()[0]?.pendingQuestion && f.timers.size === 0);
+        before = await inbox.send('Allow once');
+      }
+      if (chunk.kind === 'text') after = await inbox.send('Deny');
+    } });
+    assert.equal(question.status, 'needs_answer');
+    assert.deepEqual(before, busyGemini);
+    if (failSave) {
+      assert.equal(rejected, 2);
+      assert.deepEqual(after, busyGemini);
+      assert.equal(question.next, null);
+      assert.match(question.notice, /answers may be refused.*fugato answer gemini-yield/);
+      assert.match(await renderCard(f, question), /fugato\s+answer gemini-yield/);
+      const fallback = spawnSync(process.execPath, [plugin + '/bin/fugato', 'answer', question.worker, '--question', question.question.id,
+        '--cwd', `${f.root}/repo`, '--session', 'native-session'], { env: f.env, input: 'Allow once', encoding: 'utf8' });
+      assert.equal(fallback.status, 0, fallback.stderr || fallback.stdout);
+      assert.equal(f.jobs()[0].status, 'completed');
+    } else {
+      assert.deepEqual(after, { isDelivered: true });
+      assert.deepEqual(inbox.messages, [tagged(question.question.id, 'Deny')]);
+      assert.equal((await inbox.receive(2)).blockers[0].code, 'approval_denied');
+    }
+  }
+});
+
+test('background delivery exempts only action-approval text through 16 KiB', async () => {
+  const f = fixture('review-ok', 'gemini-long-approval');
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`, { serverRequests: [permissionRequest('long', 'x'.repeat(2521))] }).binary;
+  const q = await f.turn('Review a long replacement.', 1, false, { agentType: geminiType });
+  assert.equal(q.status, 'needs_answer');
+  const attached = await attachBackground(f, q, f.jobs()[0]);
+  assert.equal(attached.question.text, q.question.text);
+  assert.ok(attached.question.text.includes('x'.repeat(2521)));
+  const accepts = (text, kind = 'action-approval', extra = {}) => isC2Report({ ...attached, ...extra, question: { ...attached.question, text, kind } });
+  assert.equal(accepts('é'.repeat(8192)), true);
+  assert.equal(accepts('é'.repeat(8192) + 'x'), false);
+  assert.equal(accepts(q.question.text, 'question'), false);
+  assert.equal(accepts(q.question.text, 'action-approval', { next: 'x'.repeat(2001) }), false);
+  f.reload();
+  const inbox = geminiInbox(f);
+  await inbox.send('Deny');
+  assert.equal((await inbox.receive(2)).blockers[0].code, 'approval_denied');
+});
+
+test('the native follow-up size limit counts the extracted body on Gemini and Codex', async () => {
+  for (const type of [geminiType, AGENT_TYPE]) {
+    const f = fixture('review-ok', 'message-limit');
+    f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`).binary;
+    const initial = await f.turn('First assignment.', 1, false, { agentType: type });
+    assert.equal(initial.status, 'completed');
+    const inbox = geminiInbox(f), brief = '[Fugato Gemini assignment]\n'.padEnd(65536, 'z');
+    (await f.$.agent.list())[0].status = 'completed';
+    await inbox.send(brief);
+    const next = await inbox.receive(2);
+    assert.equal(next.status, 'completed', JSON.stringify(next));
+    assert.equal(f.jobs().find(job => job.id === next.jobId).request.prompt, brief);
+    await inbox.send(brief + 'z');
+    assert.equal((await inbox.receive(3)).blockers[0].code, 'native_message_too_large');
+    assert.equal(f.jobs().length, 2);
+  }
+});
+
+test('a Gemini ask_parent question accepts a tagged free-text answer', async () => {
+  const f = fixture('review-ok', 'gemini-parent-question');
+  const acp = installFakeAntigravity(`${f.root}/acp`, { behavior: 'hold' });
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  const first = f.turn('Ask the parent for a directory.', 1, false, { agentType: geminiType });
+  const job = await until(() => f.jobs().find(job => job.turnId));
+  const [config] = acp.requests().find(request => request.method === 'session/new').params.mcpServers;
+  const env = { ...f.env, ...Object.fromEntries(config.env.map(item => [item.name, item.value])) };
+  const bridge = spawn(config.command, config.args, { cwd: job.workspaceRoot, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  let output = '', answer;
+  bridge.stdout.on('data', chunk => { output += chunk; });
+  try {
+    bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'ask_parent', arguments: { question: 'Which directory?' } } }) + '\n');
+    const question = await first;
+    assert.equal(question.question.kind, 'question');
+    const inbox = geminiInbox(f);
+    await inbox.send('docs');
+    assert.deepEqual(inbox.messages, [tagged(question.question.id, 'docs')]);
+    answer = inbox.receive(2);
+    await until(() => output.includes('\n'));
+    assert.equal(JSON.parse(output).result.content[0].text, 'docs');
+  } finally {
+    bridge.stdin.end();
+    const cancelled = spawnSync(process.execPath, [plugin + '/bin/fugato', 'cancel', job.id, '--json', '--cwd', job.workspaceRoot],
+      { env: f.env, encoding: 'utf8' });
+    assert.equal(cancelled.status, 0, cancelled.stderr);
+    if (answer) assert.equal((await answer).jobId, job.id);
+  }
+});
 
 test('a running Gemini turn refuses SendMessage without queuing work, even across a slow lookup', async () => {
   const f = fixture('review-ok', 'gemini-busy');
@@ -1498,7 +1684,7 @@ test('a Gemini answer followed by a brief before the host drains either runs the
   const brief = 'Inspect the second file.';
   await inbox.send('Allow once');
   await inbox.send(brief);
-  assert.deepEqual(inbox.messages, ['Allow once', brief]);
+  assert.deepEqual(inbox.messages, [tagged(question.question.id, 'Allow once'), tagged(question.question.id, brief)]);
   const spawn = f.$.process.spawn;
   let duringAnswer;
   f.$.process.spawn = request => {
@@ -1507,7 +1693,7 @@ test('a Gemini answer followed by a brief before the host drains either runs the
   };
   const answered = await inbox.receive(2);
   assert.deepEqual(await duringAnswer, busyGemini);
-  assert.deepEqual(inbox.messages, [brief]);
+  assert.deepEqual(inbox.messages, [tagged(question.question.id, brief)]);
   assert.equal(answered.jobId, question.jobId);
   assert.equal(answered.status, 'completed');
   assert.equal(acp.state().serverResponses[0].result.outcome.optionId, 'allow');
@@ -1534,7 +1720,7 @@ test('invalid Gemini permission replies re-show the question, including after an
   let turn = 1;
   for (const input of ['Allow once ', '   ', 'x'.repeat(65537)]) {
     assert.deepEqual(await inbox.send(input), { isDelivered: true });
-    assert.deepEqual(inbox.messages, [input]);
+    assert.deepEqual(inbox.messages, [tagged(question.question.id, input)]);
     f.$.agent.list = list;
     const again = await inbox.receive(++turn);
     assert.equal(again.status, 'needs_answer');
@@ -1573,9 +1759,12 @@ test('after a finished Gemini turn a plain SendMessage starts one assignment on 
   assert.equal(continued.threadId, initial.threadId);
 });
 
-test('background report validation accepts any nonempty subset of recognized usage counters', () => {
+test('Antigravity accepts partial usage while Codex requires every counter', () => {
   const report = { jobId: 'task-usage', status: 'completed', worker: 'Gemini', backend: 'antigravity',
     provider: 'Google Antigravity', summary: 'Completed.', next: null, details: null };
+  const { backend, provider, ...codex } = report;
+  assert.equal(isC2Report({ ...codex, usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 } }), false);
+  assert.equal(isC2Report({ ...codex, usage: { inputTokens: 5, cachedInputTokens: 0, outputTokens: 7, reasoningOutputTokens: 0, totalTokens: 12 } }), true);
   for (const usage of [{ inputTokens: 5, outputTokens: 7, totalTokens: 12 }, { cachedInputTokens: 0 }, { reasoningOutputTokens: 4 }]) {
     assert.equal(isC2Report({ ...report, usage }), true);
   }

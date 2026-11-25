@@ -211,6 +211,7 @@ export function isC2Report(value) {
   if ("blockers" in value && (!Array.isArray(value.blockers) || !value.blockers.every(b => object(b) && typeof b.code === "string" && typeof b.message === "string"))) return false;
   if ("checks" in value && (!object(value.checks) || !strings(value.checks.ran) || !strings(value.checks.claimed) || !count(value.checks.omitted))) return false;
   if ("usage" in value && (!object(value.usage) || Object.keys(value.usage).length === 0
+      || (value.backend !== "antigravity" && Object.keys(value.usage).length !== usageFields.length)
       || !Object.entries(value.usage).every(([key, number]) => usageFields.includes(key) && count(number)))) return false;
   if ("question" in value) {
     const q = value.question;
@@ -218,6 +219,10 @@ export function isC2Report(value) {
         || !(q.expiresInSec === null || count(q.expiresInSec))) return false;
   }
   const { summary, ...envelope } = value;
+  if (envelope.question?.kind === "action-approval") {
+    if (Buffer.byteLength(envelope.question.text) > 16 * 1024) return false;
+    envelope.question = { ...envelope.question, text: "" };
+  }
   return Buffer.byteLength(JSON.stringify(envelope)) <= 2000;
 }
 
