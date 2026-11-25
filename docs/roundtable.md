@@ -1,6 +1,6 @@
 # Roundtable
 
-Roundtable brings persistent Codex members together around one complete goal.
+Roundtable brings persistent Codex or Gemini members together around one complete goal.
 Claude chairs: it states the criteria, protects independent inquiry and accepts
 the final candidate on evidence. Members can investigate, implement, reproduce,
 review and build on one another's work. Their personas shape what they notice
@@ -92,14 +92,24 @@ These are the standard-intensity settings with the built-in role table.
 | calibrator | `judge` | `gpt-6.2-astra` | `medium` |
 
 The per-room persona model takes precedence over the saved persona model,
-then the effective role's Codex model. Gemini rows supply their Codex
-fallback. Persona model overrides must be Codex models. The worker role
-supplies only the model.
+then the effective role's Codex model. Role-derived seats stay Codex (Gemini
+role rows supply their Codex fallback). To pick a Gemini seat, choose a
+`gemini-*` model explicitly with per-room
+`fugato roundtable start --persona-model id=gemini-*[:effort]` or saved
+`fugato setup --persona-model id=gemini-*[:effort]`. Gemini seats require `agy`
+to be installed and Claude permission mapping set to `off`; otherwise
+`roundtable start` fails before creating the room and names the seats. Saved
+Gemini models for unseated personas are ignored. The worker role supplies only
+the model.
 
 With built-in efforts, light lowers each by one step, deep raises by one,
 and full raises by one with critic and integrator at `max`. The shift ladder
 is `low → medium → high → xhigh → max`, clamped at its ends. Saved and per-room
-explicit efforts take precedence over intensity adjustments.
+explicit efforts take precedence over intensity adjustments. Gemini seats accept
+`low`, `medium`, `high` and `xhigh`. Explicit efforts next to a Gemini model are
+validated strictly; inherited or intensity-adjusted efforts clamp to
+`low`..`xhigh`, and a per-room model change ignores a saved effort from a
+different model or backend.
 
 Use `fugato roundtable start --high-stakes` for [high-stakes work](ultra-codex.md#worker-roles).
 It sets every seat's model to `gpt-6.2-astra` except seats with an explicit
@@ -169,7 +179,7 @@ Read objects by id with `forum_read(resource="post/<seq>")`,
 `thread/<seq>`, `member/<name>` or `candidate/<seq>`; the chair uses
 `fugato forum read <roomId> --resource <resource>`. Post reads return one full
 post; thread reads return at most 25 posts and 128 KiB of serialized events per
-page. Member resources show persona, status, the 10 most recent jobs and commits
+page. Member resources show persona, backend, model, status, the 10 most recent jobs and commits
 by default, omitted counts, report summaries of at most 600 characters with
 commands for job details, workspace path, base, HEAD and dirty-file count.
 They contain no full transcripts. Candidate resources include
@@ -194,7 +204,11 @@ After two rounds of disagreement with no new evidence, propose a small
 discriminating experiment; untestable trade-offs go to the chair. Candidates
 are references to inspect, not pasted full diffs or self-accepting votes.
 
-Members use bound `forum_read`/`forum_post` tools. The chair uses:
+Members use bound `forum_read`/`forum_post` tools. On Gemini seats, Fugato
+auto-allows parent-bridge `ask_parent`, `forum_read` and `forum_post` calls one
+call at a time and appends an audit entry (`parent bridge tool auto-allowed: <tool>`,
+without arguments) to job activity; edits and commands still park for approval.
+The chair uses:
 
 ```bash
 fugato forum read <roomId> --json
@@ -217,10 +231,12 @@ session chairs are visible, and the pane cannot post or change a room.
 
 Mentions and chair decisions can wake an idle member. Replies to a thread it
 joined notify it without waking it; ordinary new posts stay in the index.
-Running members receive notices directly through steering. For idle members,
+Running Codex members receive notices directly through steering. Gemini members
+receive forum notices only between turns, never mid-turn; notices wait while a
+Gemini turn is active and deliver once it ends. For idle members,
 the timer records a ready wake and the plugin sends it after a tool call in the
 chair's main loop finishes. Delivery targets the member's bound agent id and
-continues its existing Codex thread. The host excludes all of a plugin's hooks
+continues its existing thread or ACP session. The host excludes all of a plugin's hooks
 from work started in its timer callback, but excludes only the calling hook
 frame from work started in a tool hook. Sending from the tool hook therefore
 keeps the native adapter active without a relay agent or an extra model call.
@@ -241,7 +257,8 @@ pending delivery. If room status still lists the member's wake updates a minute
 after such a run, delivery has stalled (for example, a notice whose retry never
 launched). The chair then sends that member one SendMessage, `Read your forum
 updates and continue.`; the new job settles the stalled notice. The chair does
-not forward notice text or answer for the member. Paused/closed rooms and stopped members do not wake. Posts never grant
+not forward notice text or answer for the member. Parked approvals and pending
+questions hold that member's notices until answered. Paused/closed rooms and stopped members do not wake. Posts never grant
 permission or change trusted controls, and there are no private messages.
 
 ## The chair and lifecycle
@@ -252,10 +269,14 @@ unique evidence and tests popular candidates as carefully as minority ones.
 The runtime returns the stable chair card with the roster.
 
 The workflow is `fugato roundtable start` with the goal on stdin, one background
-native Codex agent per returned member, then work and forum exchanges.
-Agent `name` equals the persona id; copy its printed
-`DUET: --model <m> --effort <e> --normal --roundtable <roomId> --persona <id> --cwd "<workspace path>"`
-header. Dispatch members without Agent `isolation: "worktree"`: Fugato creates
+native agent per returned member using its printed `agentType`
+(`fugato:codex-native` or `fugato:gemini-native`) and printed `header`, then
+work and forum exchanges. Agent `name` equals the persona id. Codex seats print
+`DUET: --model <m> --effort <e> --normal --roundtable <roomId> --persona <id> --cwd "<workspace path>"`;
+Gemini seats print
+`DUET: --backend antigravity --model <gemini> --effort <e> --roundtable <roomId> --persona <id> --cwd "<workspace path>"`
+(no `--sandbox` or speed flag). Gemini seats cannot be read-only; requesting a
+read-only room with Gemini seats is refused naming the seats. Dispatch members without Agent `isolation: "worktree"`: Fugato creates
 and owns each member's detached Git worktree from the current HEAD at
 `<isolated-home>/duet/roundtables/<roomId>/worktrees/<persona>`. These workspaces
 survive completed turns and later wakes. Creation rolls back the entire room
@@ -318,7 +339,8 @@ Closing alone never cancels jobs. Required failing criteria cannot be outvoted.
 
 ## Current limits
 
-Members are Codex-only; Claude subagents cannot take member seats. There is no
+Members may be Codex or Gemini (see [Antigravity roundtable seats](antigravity.md#roundtable));
+Claude subagents cannot take member seats, and Gemini seats cannot be read-only. There is no
 roundtable token or cost cap. Individual jobs may use existing `--max-minutes`
 or `--max-tokens` limits. The chair ends on acceptance or diagnoses stagnation:
 two consecutive work boundaries without a new fact, discriminating experiment

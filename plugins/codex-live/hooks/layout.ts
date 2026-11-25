@@ -1,6 +1,6 @@
 import type { ThemeKey } from 'claude-code';
 import type { CodexLiveEvent, CodexLiveFeedView, CodexLiveJob, CodexLiveSession, CodexLiveState, ForumRoom } from '../types';
-import { attention, attentionOrder, clean, cleanBody, detailedTurns, elapsed, EXPANDED_ID_LIMIT, glyph, isAbsolutePath, jobLifecycle, questionExcerpt, reusedAgentName, sessionForId, taskText, turnKey, unwrapCommand, visibleForums, visibleSessions } from './model';
+import { attention, attentionOrder, clean, cleanBody, detailedTurns, elapsed, EXPANDED_ID_LIMIT, glyph, isAbsolutePath, jobLifecycle, providerLabel, questionExcerpt, reusedAgentName, sessionForId, taskText, turnKey, unwrapCommand, visibleForums, visibleSessions } from './model';
 
 import { commandDisplay, fitCommand, tokenize } from './command';
 import { forumOrder, selectedForum } from './forum';
@@ -187,14 +187,15 @@ export function toolUseCount(events: readonly CodexLiveEvent[]): number {
 
 export const shortModel = (model: string) => model.replace(/^gpt-[\d.]+-(.+)$/, '$1');
 export function workerRole(job: CodexLiveJob): string {
-  const role = job.role?.replace(/^.*(?:codex|fugato)[-:]/, '') ?? '';
+  const role = job.role?.replace(/^.*(?:codex|fugato|gemini)[-:]/, '') ?? '';
   if (['reviewer', 'investigator', 'implementer', 'conjecturer', 'critic', 'improver', 'integrator', 'steward', 'calibrator'].includes(role)) return role;
   return ['conjecturer', 'critic', 'improver', 'integrator', 'steward', 'calibrator'].includes(job.agentName ?? '') ? job.agentName! : 'worker';
 }
 export function workerHeader(job: CodexLiveJob): { name: string; detail: string } {
   const cwd = (job.cwd ?? job.workspaceRoot)?.replace(/[\\/]$/, '').split(/[\\/]/).at(-1);
+  const provider = job.backend === 'antigravity' ? ` · ${providerLabel(job.backend)}` : '';
   return { name: job.agentName || taskText(job.label),
-    detail: ` · ${workerRole(job)} · ${[shortModel(job.model), job.effort].filter(Boolean).join(' ') || 'model unknown'}${cwd ? ` · ${cwd}` : ''}` };
+    detail: ` · ${workerRole(job)} · ${[shortModel(job.model), job.effort].filter(Boolean).join(' ') || 'model unknown'}${provider}${cwd ? ` · ${cwd}` : ''}` };
 }
 export function headerItem(job: CodexLiveJob, _now: number): FeedItem {
   const header = workerHeader(job);
@@ -883,8 +884,12 @@ export function tableRow(entry: TableEntry, selected: boolean, columns: number, 
     ...(columns >= 64 ? [...timelineSpans(entry, timelineAxis(entries, state.nowMs)), { text: '  ' }] : []),
     { text: ' '.repeat(Math.max(0, metaWidth - width(meta))) + meta, color: isNew && !selected ? 'suggestion' : 'subtle' },
   ];
+  const model = worker ? [shortModel(worker.model), worker.effort].filter(Boolean).join(' ') : '';
   const detail = room ? `${room.status === 'open' ? '' : `${room.status} · `}${room.goal.split('\n')[0] ?? ''}` : worker!.question && jobLifecycle(worker!).active
-    ? `asks: ${questionExcerpt(worker!.question.text)}` : `${workerRole(worker!)} · ${[shortModel(worker!.model), worker!.effort].filter(Boolean).join(' ')}`;
+    ? `asks: ${questionExcerpt(worker!.question.text)}`
+    : worker!.backend === 'antigravity'
+      ? [workerRole(worker!), model || 'model unknown', providerLabel(worker!.backend)].join(' · ')
+      : `${workerRole(worker!)} · ${model}`;
   const prefix: Span[] = [{ text: selected ? '❯' : ' ', color: 'suggestion' }, { text: `${bullet} `, color },
     { text: fit(entryName(entry), labelWidth) + ' '.repeat(labelWidth + 2 - width(fit(entryName(entry), labelWidth))), bold: true }];
   if (columns >= 48) prefix.push({ text: detail, color: worker?.question && jobLifecycle(worker).active ? 'warning' : 'subtle' });

@@ -272,17 +272,45 @@ line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/s
   [`processIdentity`](../plugins/codex/scripts/lib/acp-process.mjs) ·
   [Concurrency slots](../plugins/codex/scripts/lib/concurrency.mjs)
 
+## Roundtable
+
+Gemini workers can take explicit [roundtable](roundtable.md) seats alongside
+Codex members. Pick a Gemini seat with per-room
+`fugato roundtable start --persona-model id=gemini-*[:effort]` or saved
+`fugato setup --persona-model id=gemini-*[:effort]`. Role-derived seats stay
+Codex. `agy` must be installed and Claude permission mapping must be `off`, or
+`roundtable start` fails before creating the room.
+
+For each Gemini seat, `roundtable start` prints `backend: "antigravity"`,
+`agentType: "fugato:gemini-native"`, and a `DUET: --backend antigravity ...`
+header. The chair dispatches the printed `agentType` and `header`. Gemini seats
+require full access; read-only Gemini seats are refused.
+
+Gemini members receive forum notices only between turns, never mid-turn. Parked
+approvals hold that member's notices until answered. Edits and commands still
+park for approval in agy's default mode, while parent-bridge calls
+(`ask_parent`, `forum_read`, `forum_post`) are auto-allowed one call at a time
+and audited in job activity without arguments.
+
+Terms note: roundtable seats run `agy acp` as a backend worker. Google's FAQ
+names Claude Code as third-party software, and an `antigravity-cli` collaborator
+stated ([issue 1493](https://github.com/google-antigravity/antigravity-cli/issues/1493#issuecomment-6814901159),
+2026-11-12) that consumer sign-in (`oauth-personal`) is not permitted as a
+backend worker inside a third-party agent harness. Users decide their own
+account risk; see [Terms and sign-in](#terms-and-sign-in).
+
 ## Support boundaries
 
 | Supported on Gemini | Outside Gemini worker support |
 | --- | --- |
-| Native and CLI tasks, including independent parallel workers | Codex review and roundtable personas |
+| Native and CLI tasks, independent parallel workers, and explicit roundtable seats | Codex review and read-only roundtable seats |
 | Gemini model and thinking selection | Setting agy's session mode (`default`, `accept-edits`, `auto`, `plan`) from Fugato |
 | Single-use approvals and reports | Claude permission mapping and plan mode, Codex browser and Computer Use grants |
 | Session continuation with agy 1.5.15+ and `session/load` | Claude transcript `--fork` and `transfer` |
 | Cancellation, leases and running-time budgets | Codex priority `--fast` and a per-turn `--max-tokens` limit |
 
-Pair, Ultra, Duel and Roundtable retain their existing dispatch defaults.
+Pair, Ultra, Duel and role-derived Roundtable seats retain their existing Codex
+dispatch defaults; Gemini roundtable seats require an explicit persona model.
 
 ## Development and live verification
 

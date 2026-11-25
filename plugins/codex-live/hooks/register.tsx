@@ -25,7 +25,7 @@ export const register: Register = on => {
   });
 
   on('command.run', { command: 'fugato-live' }, async ($, e) => {
-    if (!['composer', 'bridge', 'sdk'].includes(e.origin.kind)) return { text: 'Open Codex activity by running /fugato-live yourself.' };
+    if (!['composer', 'bridge', 'sdk'].includes(e.origin.kind)) return { text: 'Open Fugato activity by running /fugato-live yourself.' };
     const target = e.args.trim();
     if (/^forum(?:\s|$)/.test(target)) {
       await poll?.(true);
@@ -45,11 +45,11 @@ export const register: Register = on => {
       }
     } else if (target) {
       const activity = await nativeActivity($, target).catch(() => undefined);
-      if (!activity) return { text: `No unique Codex activity found for ${limitChars(target, 100)}.` };
+      if (!activity) return { text: `No unique Fugato activity found for ${limitChars(target, 100)}.` };
       const selectedId = activity.threadId ? `thread:${activity.threadId}` : activity.jobId;
       if (!await writeView($, latest => ({ ...latest, selectedId, openedJobId: activity.jobId,
         feeds: { ...latest.feeds, [selectedId]: { feedOffset: 0, following: true, seenLines: 0 } } }))) {
-        return { text: 'Codex activity could not be selected.' };
+        return { text: 'Fugato activity could not be selected.' };
       }
     }
     await $.ui.open({ id: 'fugato-live', title: 'Fugato', focus: true });

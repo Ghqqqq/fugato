@@ -1046,3 +1046,37 @@ test('the list shares one fourteen-cell time axis and hides timeline/detail at t
     unknown: ['running · 1 tool · 12s', ''], known: '1.23k tokens', zero: '0 tokens', stopped: '↓ 3 new',
   });
 });
+
+test('Gemini roundtable member rows, headers, status lines and cache validation follow backend', () => {
+  const geminiMember = jobView({
+    id: 'rt-critic', status: 'running', agentName: 'critic', startedAt: createdAt,
+    request: { backend: 'antigravity', model: 'gemini-4-neon', effort: 'high',
+      cwd: '/work/repo/critic', roundtable: { persona: 'critic' } },
+  }, { ...marker('rt-critic'), title: '', summary: '' });
+  const codexMember = jobView({
+    id: 'rt-improver', status: 'running', agentName: 'improver', startedAt: createdAt,
+    request: { model: 'gpt-6.2-sol', effort: 'high', cwd: '/work/repo/improver', roundtable: { persona: 'improver' } },
+  }, { ...marker('rt-improver'), title: '', summary: '' });
+  expect(geminiMember).toMatchObject({ backend: 'antigravity', role: 'critic', model: 'gemini-4-neon', effort: 'high', label: 'Gemini Task' });
+  expect(codexMember).toMatchObject({ backend: 'codex', role: 'improver', model: 'gpt-6.2-sol', effort: 'high', label: 'Codex Task' });
+  const state: CodexLiveState = { jobs: [geminiMember, codexMember], selectedId: geminiMember.id, nowMs: epoch + 15000 };
+  const geminiRow = tableRow(geminiMember, true, 100, state, state.jobs).map(span => span.text).join('');
+  const codexRow = tableRow(codexMember, false, 100, state, state.jobs).map(span => span.text).join('');
+  expect(geminiRow).toContain('critic');
+  expect(geminiRow).toContain('critic · gemini-4-neon high · Google Antigravity');
+  expect(codexRow).toContain('improver · sol high');
+  expect(codexRow).not.toContain('Google Antigravity');
+  expect(feedItems(geminiMember, epoch)[0]?.title).toBe('critic · critic · gemini-4-neon high · Google Antigravity · critic');
+  expect(feedItems(codexMember, epoch)[0]?.title).toBe('improver · improver · sol high · improver');
+  expect(statusLine([geminiMember])).toBe('critic · 1 running');
+  expect(statusLine([{ ...geminiMember, agentName: undefined }])).toBe('Google Antigravity · 1 running');
+  expect(statusLine([geminiMember, { ...geminiMember, id: 'rt-critic-2', agentName: 'steward' }])).toBe('Google Antigravity · 2 running');
+  expect(statusLine([geminiMember, codexMember])).toBe('Fugato · 2 running');
+  expect(statusLine([codexMember, { ...codexMember, id: 'rt-improver-2', agentName: 'steward' }])).toBe('Codex · 2 running');
+  const { backend: _omitted, ...legacyJob } = codexMember;
+  expect(validView({ jobs: [legacyJob, geminiMember], selectedId: geminiMember.id, nowMs: epoch,
+    usageByJob: { old: { model: 'gpt-6-astra', usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2 } } } })).toBe(true);
+  expect(validView({ ...state, jobs: [{ ...geminiMember, backend: 'other' as never }] })).toBe(false);
+  expect(validView({ ...state, usageByJob: { bad: { backend: 'other' as never, model: 'gemini-4-neon',
+    usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2 } } } })).toBe(false);
+});
