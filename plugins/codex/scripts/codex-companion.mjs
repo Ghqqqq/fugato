@@ -17,6 +17,7 @@ import { browserOriginSetup, computerUseSetup, transportSetup, defaultSandboxSet
 import { budgetLimit, newJobBudget } from "./lib/job-budget.mjs";
 import { listModels, renderModels } from "./lib/models.mjs";
 import { ensureAntigravityAvailable, listAntigravityModels, runAntigravityTurn } from "./lib/antigravity.mjs";
+import { acpExecutable, acpProcessGone, isAntigravityJob, stopOrphanedAcpGroup } from "./lib/acp-process.mjs";
 import { acpSetting, jobBackend, normalizeBackend, validateAntigravityTask } from "./lib/backends.mjs";
 import { activityReader, formatActivity, redactActivity, snippet } from "./lib/activity.mjs";
 import { JobRuntime, ACTIVE, OWNER_GRACE_MS, seconds, ownerId, renewLease, requestCancel, answerQuestion, progressSnapshot, leaseExpiryReport, continuationReport, fullReport, directReport, envelopeBytes, adoptJob, ownershipNotice } from "./lib/job-runtime.mjs";
@@ -1089,7 +1090,8 @@ async function executeTaskRun(request) {
 
   if (resumeThreadId) {
     for (const candidate of listJobs(workspaceRoot).filter(job => job.threadId === resumeThreadId && job.id !== request.jobId)) {
-      restoreMissingTaskRecord(workspaceRoot, candidate);
+      const stored = restoreMissingTaskRecord(workspaceRoot, candidate);
+      if (needsAcpRecovery(stored)) await reconcileLostTurn(workspaceRoot, stored);
     }
     const predecessor = threadBlocker(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, request.jobId);
     // A lost turn/start response leaves no turn ID. Read that predecessor's
@@ -1116,7 +1118,8 @@ async function executeTaskRun(request) {
   // keeps "never" and such a request fails closed at once.
   const approvalPolicy = backend === "antigravity" ? request.detached ? "antigravity+ask-parent" : "antigravity+deny-requests"
     : request.permissionPolicy ? (request.detached ? request.permissionPolicy.approvalPolicy : "never") : request.detached ? FORWARDED_APPROVALS_LABEL : "never";
-  updateJob(workspaceRoot, request.jobId, () => ({ preExistingChanges: before.preExistingChanges, sandbox, approvalPolicy }));
+  updateJob(workspaceRoot, request.jobId, () => ({ preExistingChanges: before.preExistingChanges, sandbox, approvalPolicy,
+    ...(backend === "antigravity" ? { acpExecutable: acpExecutable(request.cwd) } : {}) }));
   request.onProgress?.(backend === "antigravity"
     ? `Antigravity ACP uses its own tool permissions without a Fugato filesystem sandbox; approval policy: ${approvalPolicy}. Captured workspace baseline (${before.status}).`
     : `Sandbox: ${sandbox}; approval policy: ${approvalPolicy}${request.detached ? " (Computer Use app requests are forwarded to the parent)" : ""}. Captured workspace baseline (${before.status}).`);
@@ -1236,6 +1239,15 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
     interruptionReason: result.interruptionReason ?? null, interruptionConfirmed: result.interruptionConfirmed ?? null
   };
   const trackedJob = readStoredJob(resolveWorkspaceRoot(request.cwd), request.jobId);
+  // The ACP peer can exit without replying to session/cancel or session/prompt.
+  // Publish process exit separately from an acknowledgement of the assignment.
+  let acpEnd;
+  if (request.backend === "antigravity" && result.turnEnded === false &&
+      (trackedJob.turnSubmission === null || acpProcessGone(trackedJob))) {
+    acpEnd = acpTurnEnd(trackedJob);
+    updateJob(resolveWorkspaceRoot(request.cwd), request.jobId, () => acpEnd);
+    Object.assign(payload, acpEnd);
+  }
   const sharedChanges = payload.touchedFiles?.length
     ? workspaceChangeAttribution({ ...trackedJob, completedAt: result.completedAt ?? nowIso() }, listJobs(resolveWorkspaceRoot(request.cwd)))
     : {};
@@ -1245,6 +1257,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
   Object.assign(payload, { ...(trackedJob?.agentName ? { agentName: trackedJob.agentName } : {}), ownerId: trackedJob?.ownerId ?? null, sessionId: trackedJob?.sessionId ?? null });
   const artifacts = persistTaskArtifacts(resolveWorkspaceRoot(request.cwd), request.jobId, payload);
   const report = buildWorkerReport(payload, { jobId: request.jobId, ...artifacts });
+  if (acpEnd) Object.assign(report, acpEnd, { summary: acpEnd.recovery.detail });
   if (sharedChanges.changedFilesShared) Object.assign(report, { changedFilesShared: true, changedFilesNote: sharedChanges.changedFilesNote });
   Object.assign(report, { ...(trackedJob?.agentName ? { agentName: trackedJob.agentName } : {}), ownerId: payload.ownerId, sessionId: payload.sessionId }, leaseExpiryReport({ ...trackedJob, threadId: payload.threadId, result: payload }));
   if (payload.interruptionReason) {
@@ -1807,10 +1820,14 @@ async function handleTask(argv) {
   // --continue <job-id>: one more turn on a stopped/finished job's own thread,
   // inheriting that job's recorded authorization and runtime choices so a
   // replacement worker does not have to reconstruct them.
-  const continued = options.continue === undefined ? null : readStoredJob(resolveWorkspaceRoot(cwd), String(options.continue).trim());
+  let continued = options.continue === undefined ? null : readStoredJob(resolveWorkspaceRoot(cwd), String(options.continue).trim());
   if (options.continue !== undefined) {
     if (!continued) throw new Error(`No stored job found for --continue ${options.continue}.`);
     if (continued.jobClass !== "task" || !continued.threadId) throw new Error(`Job ${continued.id} has no resumable Codex thread; nothing to continue.`);
+    if (needsAcpRecovery(continued)) {
+      await reconcileLostTurn(resolveWorkspaceRoot(cwd), continued);
+      continued = readStoredJob(resolveWorkspaceRoot(cwd), continued.id);
+    }
     if (ACTIVE.has(continued.status)) throw new Error(`Job ${continued.id} is still ${continued.status}; wait for it to end (or cancel it) before continuing its thread.`);
     for (const flag of ["backend", "thread", "fresh", "resume", "resume-last", "write", "model", "effort", "fast", "normal"]) {
       if (options[flag] !== undefined) throw new Error(`--continue inherits the original job's ${flag} setting; do not pass --${flag}.`);
@@ -1821,7 +1838,7 @@ async function handleTask(argv) {
   }
   let threadId = continued ? continued.threadId : options.thread?.trim() ?? null;
   const inheritance = threadId ? resolveThreadInheritance(cwd, threadId, {
-    selectedJob, backend: threadBackend, allowCrossSessionFallback: explicitThread || Boolean(selectedJob)
+    selectedJob, backend: threadBackend, continued: Boolean(continued), allowCrossSessionFallback: explicitThread || Boolean(selectedJob)
   }) : null;
   const sourceJob = inheritance?.job;
   const previousRequest = sourceJob?.request;
@@ -1842,7 +1859,7 @@ async function handleTask(argv) {
   }
   if (backend === "antigravity" && options["max-tokens"] === undefined && budget.maxTokens !== null) {
     budget.maxTokens = null;
-    process.stderr.write("Ignoring the saved default max-tokens for Antigravity because ACP does not report per-turn token usage.\n");
+    process.stderr.write("Ignoring the saved default max-tokens for Antigravity: ACP reports token usage only when a turn ends, so Fugato cannot stop a turn at a token budget.\n");
   }
   const recordedSandbox = recordedSettings.sandbox;
   if ((continued || options.thread?.trim()) && !SANDBOX_MODES.includes(recordedSandbox) && options.sandbox === undefined) {
@@ -2235,25 +2252,62 @@ async function handleInferredTurnRecheck(argv) {
   } catch { /* Optional recovery must never surface a helper failure to the user. */ }
 }
 
+function acpTurnEnd(job) {
+  const turnResolution = job.turnSubmission === null ? "notStarted" : "unknown";
+  const detail = turnResolution === "notStarted"
+    ? "The worker stopped before submitting the Antigravity prompt."
+    : "The owned Antigravity process exited without a confirmed prompt result. The turn outcome is unknown. The assignment has not been replayed.";
+  return { turnEnded: true, turnResolution, interruptionConfirmed: false,
+    recovery: { status: "recovered", source: "antigravity-acp", threadId: job.threadId ?? null,
+      turnId: job.turnId ?? null, turnStatus: turnResolution, detail } };
+}
+
+// A record can still need its final status published after its turn has
+// already ceased to block the session. Leave unclaimed queued launches alone.
+function needsAcpRecovery(job) {
+  return isAntigravityJob(job) && job.jobClass === "task" && !job.recovered && !job.result?.turnEnded
+    && (ACTIVE.has(job.status) ? Boolean(job.pid) : ["failed", "interrupted", "cancelled"].includes(job.status))
+    && !processAlive(job.pid);
+}
+
+function reconcileAcpTurn(workspaceRoot, stored, isCurrent) {
+  const current = updateJob(workspaceRoot, stored.id, latest => {
+    if (!isCurrent(latest) || !needsAcpRecovery(latest)) return null;
+    const stopped = ACTIVE.has(latest.status)
+      ? { status: "failed", phase: "failed", completedAt: nowIso(), pid: null } : {};
+    const gone = acpProcessGone(latest);
+    if (!gone && latest.turnSubmission !== null) {
+      const detail = "The Antigravity worker exited without a prompt result. Exit of its owned ACP process is unconfirmed.";
+      return { ...stopped, turnResolution: "unknown", recovery: { status: "unknown", source: "antigravity-acp", detail } };
+    }
+    const end = acpTurnEnd(latest), status = stopped.status ?? latest.status;
+    const result = { status: 1, backend: "antigravity", threadId: latest.threadId ?? null, turnId: latest.turnId ?? null,
+      error: latest.errorMessage ?? end.recovery.detail, ...latest.result, ...end, workerStatus: status };
+    const artifacts = taskArtifactPaths(workspaceRoot, latest.id);
+    // A crash between the artifact write and terminal publication can leave
+    // captured output on disk. Keep it available for inspection.
+    if (!fs.existsSync(artifacts.rawOutputFile)) fs.writeFileSync(artifacts.rawOutputFile, result.rawOutput ?? "", { mode: 0o600 });
+    fs.writeFileSync(artifacts.resultFile, JSON.stringify(result, null, 2) + "\n", { mode: 0o600 });
+    const report = { ...(latest.report ?? buildWorkerReport(result, { jobId: latest.id, ...artifacts })),
+      status, ...end, summary: end.recovery.detail };
+    return { ...stopped, ...artifacts, ...end, ...(gone ? { acpProcessExited: true } : {}),
+      recovered: true, recoveredAt: nowIso(), result, report, summary: end.recovery.detail };
+  });
+  if (current.recovered) recordFinishedJob(current);
+  return { outcome: current.turnResolution ?? "unknown", result: current.result, recovery: current.recovery };
+}
+
 export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null, interruptRequested = false, admittingJobId = null, isCurrent = () => true, privateWhenBusy = false } = {}) {
   let stored = restoreMissingTaskRecord(workspaceRoot, job);
   if (!isCurrent(stored)) return { outcome: "unknown" };
+  // Each ACP connection owns one process. A second connection cannot read
+  // the lost turn's result, including through a session/load history replay.
+  if (needsAcpRecovery(stored)) return reconcileAcpTurn(workspaceRoot, stored, isCurrent);
   if (!unresolvedTask(stored)) {
     return { outcome: stored?.recovered ? stored.recovery?.turnStatus ?? stored.status : "unknown", result: stored?.result };
   }
   if (jobBackend(stored) === "antigravity") {
-    // ACP v1 has no exact-turn read/interrupt endpoint on a second connection.
-    // The live worker owns cancellation. Never send its session to Codex or
-    // infer success from a later session/load replay after a lost receipt.
-    const alive = processAlive(stored.pid);
-    const recovery = { status: alive ? "running" : "unknown", source: "antigravity-acp",
-      detail: alive ? "The Antigravity worker still owns the ACP connection; cancellation is handled by that worker."
-        : "The Antigravity worker exited without a confirmed turn result. ACP cannot recover this exact turn; inspect its log and Antigravity before retrying. The task has not been replayed." };
-    if (!alive && ACTIVE.has(stored.status) && stored.pid) {
-      stored = updateJob(workspaceRoot, stored.id, latest => isCurrent(latest) && unresolvedTask(latest) && !processAlive(latest.pid)
-        ? { status: "failed", phase: "failed", pid: null, completedAt: nowIso(), errorMessage: recovery.detail } : null);
-    }
-    return recordTurnResolution(workspaceRoot, stored, alive ? "in_progress" : "unknown", recovery, isCurrent);
+    return { outcome: "unknown", recovery: stored.recovery };
   }
   // A queued launch without a PID is not evidence of a dead worker. Legacy
   // terminal records without turn handles must also retain their outcome.
@@ -2399,7 +2453,7 @@ async function refreshJobSnapshot(cwd, reference) {
   const { workspaceRoot, job } = snapshot;
   const stored = restoreMissingTaskRecord(workspaceRoot, job);
   if (stored) recordFinishedJob(stored);
-  if (!unresolvedTask(stored)) return buildSingleJobSnapshot(cwd, job.id);
+  if (!needsAcpRecovery(stored) && !unresolvedTask(stored)) return buildSingleJobSnapshot(cwd, job.id);
   const { recovery } = await reconcileLostTurn(workspaceRoot, job);
   // A concurrent reader may have recovered while this read was unavailable.
   // Prefer its committed terminal result over our transient recovery notice.
@@ -2658,6 +2712,7 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
       confirmation: confirmed || alreadyEnded ? "confirmed" : "unconfirmed",
       turnInterruptAttempted: attempted,
       turnInterrupted: attempted && (current.turnInterrupted ?? confirmed), reason: "cancelled_by_user",
+      ...(isAntigravityJob(current) && current.recovery?.detail ? { detail: current.recovery.detail } : {}),
       backgroundTerminals: current.backgroundTerminals ?? { cleaned: false, detail: "Background terminal cleanup has not been confirmed." } };
     report(payload);
     if (!confirmed && !alreadyEnded) process.exitCode = 2;
@@ -2693,21 +2748,33 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
       reportUnchanged(snapshot.workspaceRoot, stored);
       return;
     }
-    if (stored && !ACTIVE.has(stored.status) && !unresolvedTask(stored)) {
-      reportOutcome(stored);
-      return;
-    }
-    if (stored && jobBackend(stored) === "antigravity") {
-      let current = requestCancel(snapshot.workspaceRoot, stored.id, "cancelled_by_user", { expect });
-      if (!current) { reportUnchanged(snapshot.workspaceRoot, stored); return; }
-      // The original stdio connection owns session/cancel. Loading a session
-      // into another process cannot safely interrupt that pending prompt.
-      for (const deadline = Date.now() + 6000; Date.now() < deadline && ACTIVE.has(current.status);) {
+    if (isAntigravityJob(stored)) {
+      let current = stored;
+      if (ACTIVE.has(current.status) || unresolvedTask(current)) {
+        current = requestCancel(snapshot.workspaceRoot, stored.id, "cancelled_by_user", { expect });
+        if (!current) { reportUnchanged(snapshot.workspaceRoot, stored); return; }
+      }
+      // Give the live worker its chance to send session/cancel on the original
+      // connection. A dead worker can no longer signal its orphaned group.
+      for (const deadline = Date.now() + 6000; Date.now() < deadline && ACTIVE.has(current.status)
+          && (!current.pid || processAlive(current.pid));) {
         await sleep(100);
         current = readStoredJob(snapshot.workspaceRoot, stored.id);
       }
-      if (unresolvedTask(current)) await reconcileLostTurn(snapshot.workspaceRoot, current);
+      if (expect && !expect(current)) { reportUnchanged(snapshot.workspaceRoot, current); return; }
+      if (!processAlive(current.pid) && current.acpProcessPid && !current.acpProcessExited) {
+        await stopOrphanedAcpGroup(current);
+        if (acpProcessGone(current)) {
+          current = updateJob(snapshot.workspaceRoot, stored.id, latest => latest.acpProcessPid === current.acpProcessPid
+            && !processAlive(latest.pid) ? { acpProcessExited: true } : null);
+        }
+      }
+      if (needsAcpRecovery(current)) await reconcileLostTurn(snapshot.workspaceRoot, current);
       reportOutcome(readStoredJob(snapshot.workspaceRoot, stored.id));
+      return;
+    }
+    if (stored && !ACTIVE.has(stored.status) && !unresolvedTask(stored)) {
+      reportOutcome(stored);
       return;
     }
     // Save intent before handle discovery or an interrupt can race recovery.
@@ -3038,7 +3105,7 @@ async function waitForJob(workspaceRoot, job, { owner, timeoutSec, minIntervalSe
       if (moved) { detachReason = "moved"; stopRenewal(); await finish({ ...moved, ...reported(), cursor }, 2); return; }
       if (attached && current.ownerWaitToken !== waitToken) { stopRenewal(); throw new Error("This owner wait was replaced; the replacement is responsible for waiting."); }
       let recovery = null;
-      if (unresolvedTask(current)) {
+      if (needsAcpRecovery(current) || unresolvedTask(current)) {
         let resolution;
         if (Date.now() >= recoveryRetryAt) {
           resolution = await reconcileLostTurn(workspaceRoot, current);

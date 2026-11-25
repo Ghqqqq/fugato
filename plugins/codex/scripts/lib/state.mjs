@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { acpProcessGone, isAntigravityJob } from "./acp-process.mjs";
 
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { nearestGitBoundary, resolveWorkspaceRoot } from "./workspace.mjs";
@@ -355,6 +356,10 @@ function taskProcessAlive(pid) {
 
 export function unresolvedTask(current) {
   if (!current || current.jobClass !== "task" || current.recovered || taskProcessAlive(current.pid)) return false;
+  if (isAntigravityJob(current)) {
+    if (current.turnSubmission === null || current.result?.turnEnded || acpProcessGone(current)) return false;
+    return Boolean(current.turnId || current.turnSubmission);
+  }
   if (!current.result) return current.status !== "cancelled" || Boolean(current.turnSubmission);
   // A stopped job whose interrupt was never confirmed may still own its turn.
   if (["interrupted", "cancelled"].includes(current.status)) {
