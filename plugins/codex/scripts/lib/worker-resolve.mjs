@@ -197,24 +197,24 @@ export function recordedThreadSettings(job) {
     ...Object.fromEntries(["backend", "model", "effort", "serviceTier"].map(key => [key, sources.find(source => source[key] !== undefined)?.[key]])) };
 }
 
-function jobInheritance(job, session) {
+function jobInheritance(job, session, continued = false) {
   const grants = requestGrantsInSession(job, session);
   return { job, backend: jobBackend(job), details: {
     jobId: job.id, scope: session && reportSession(job) === session ? "session" : "workspace",
     settingsInherited: true, requestGrantsInherited: grants,
     note: grants
       ? "Inherited settings and recorded request grants from this session's job; runtime-only grants were excluded."
-      : "Inherited settings from this job; no request grants recorded in this session were inherited."
+      : `Inherited settings from ${continued ? "the continued" : "this"} job; no request grants recorded in this session were inherited.`
   } };
 }
 
-export function resolveThreadInheritance(cwd, threadId, { allowCrossSessionFallback = false, selectedJob = null, backend = null } = {}) {
+export function resolveThreadInheritance(cwd, threadId, { allowCrossSessionFallback = false, selectedJob = null, backend = null, continued = false } = {}) {
   const session = process.env.CODEX_COMPANION_SESSION_ID?.trim() || null;
   if (selectedJob) {
     backend = jobBackend(selectedJob);
     // A refused Codex attempt never established its requested settings. Its
     // predecessor must still belong to Codex, even if another backend reused the handle.
-    if (backend === "antigravity" || startedThreadSettings(selectedJob)) return jobInheritance(selectedJob, session);
+    if (backend === "antigravity" || startedThreadSettings(selectedJob)) return jobInheritance(selectedJob, session, continued);
   }
   const records = jobs => jobs.filter(candidate => candidate.threadId === threadId).map(candidate => stored(candidate, cwd));
   const scoped = records(scopedJobs(cwd));
