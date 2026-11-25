@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.8.0
 
 - Add full-access Gemini workers through Google's official `agy acp` runtime
   with `fugato task --backend antigravity` and native `fugato:gemini-native`.
