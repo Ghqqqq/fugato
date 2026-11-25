@@ -197,11 +197,12 @@ export function recordedThreadSettings(job) {
     ...Object.fromEntries(["backend", "model", "effort", "serviceTier"].map(key => [key, sources.find(source => source[key] !== undefined)?.[key]])) };
 }
 
-function jobInheritance(job, session, continued = false) {
+function jobInheritance(job, backend, session, continued = false) {
   const grants = requestGrantsInSession(job, session);
-  return { job, backend: jobBackend(job), details: {
-    jobId: job.id, scope: session && reportSession(job) === session ? "session" : "workspace",
-    settingsInherited: true, requestGrantsInherited: grants,
+  const sessionScope = continued ? (job ? reportSession(job) : null) === session : Boolean(session);
+  return { job, backend, details: {
+    jobId: job?.id ?? null, scope: sessionScope ? "session" : "workspace",
+    settingsInherited: Boolean(job), requestGrantsInherited: grants,
     note: grants
       ? "Inherited settings and recorded request grants from this session's job; runtime-only grants were excluded."
       : `Inherited settings from ${continued ? "the continued" : "this"} job; no request grants recorded in this session were inherited.`
@@ -212,21 +213,31 @@ export function resolveThreadInheritance(cwd, threadId, { allowCrossSessionFallb
   const session = process.env.CODEX_COMPANION_SESSION_ID?.trim() || null;
   if (selectedJob) {
     backend = jobBackend(selectedJob);
-    // A refused Codex attempt never established its requested settings. Its
-    // predecessor must still belong to Codex, even if another backend reused the handle.
-    if (backend === "antigravity" || startedThreadSettings(selectedJob)) return jobInheritance(selectedJob, session, continued);
+    // --to selects a thread on this backend. Only --continue takes settings
+    // directly from its job. A refused Codex attempt still needs a started predecessor.
+    if (continued && (backend === "antigravity" || startedThreadSettings(selectedJob))) {
+      return jobInheritance(selectedJob, backend, session, true);
+    }
   }
-  const records = jobs => jobs.filter(candidate => candidate.threadId === threadId).map(candidate => stored(candidate, cwd));
-  const scoped = records(scopedJobs(cwd));
-  const workspace = records(newest(listJobs(resolveWorkspaceRoot(cwd))));
+  const onThread = candidate => candidate.threadId === threadId;
+  const scoped = scopedJobs(cwd).filter(onThread);
+  const workspace = newest(listJobs(resolveWorkspaceRoot(cwd)).filter(onThread));
   const visible = allowCrossSessionFallback ? [...scoped, ...workspace] : scoped;
-  backend ??= visible.length ? jobBackend(visible[0]) : undefined;
-  if (!selectedJob && visible.length && !visible.some(candidate => jobBackend(candidate) === backend)) {
+  backend ??= jobBackend(visible.length ? stored(visible[0], cwd) : null);
+  if (!selectedJob && visible.length && !visible.some(candidate => jobBackend(stored(candidate, cwd)) === backend)) {
     throw new Error("A worker session keeps its original backend. Start a fresh task to change --backend.");
   }
-  const started = candidate => jobBackend(candidate) === backend && startedThreadSettings(candidate);
-  const job = scoped.find(started) ?? null;
-  const latest = newest([...(job ? [job] : []), ...workspace]).find(started);
+  // Order the index entries by dispatch before inspecting their private records.
+  const firstStarted = candidates => {
+    for (const candidate of candidates) {
+      const record = stored(candidate, cwd);
+      if (jobBackend(record) === backend && startedThreadSettings(record)) return record;
+    }
+    return null;
+  };
+  const job = firstStarted(scoped);
+  const latest = firstStarted(newest([...(job ? [job] : []), ...workspace]));
+  if (continued) return jobInheritance(job ?? latest ?? null, backend, session, true);
   if (!job && allowCrossSessionFallback && latest) {
     return { job: latest, backend, details: {
       jobId: latest.id, scope: "workspace",
@@ -235,7 +246,7 @@ export function resolveThreadInheritance(cwd, threadId, { allowCrossSessionFallb
     } };
   }
   const skipped = session && latest && (latest.sessionId === undefined ? latest.ownerId : latest.sessionId) !== session;
-  if (!skipped) return job ? jobInheritance(job, session) : { job, backend };
+  if (!skipped) return job ? jobInheritance(job, backend, session) : { job, backend };
   const grants = requestGrantsInSession(job, session);
   return { job, backend, details: {
     jobId: job?.id ?? null, skippedJobId: latest.id, scope: "session",

@@ -1378,6 +1378,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   // Reserve the name under the same workspace lock that publishes job state.
   // Concurrent dispatches see this queued reservation before either launches.
   const stored = listJobs(workspaceRoot);
+  const inheritedPrevious = !identity.continued && identity.threadId
+    ? latestThreadJob(workspaceRoot, identity.threadId, { backend: identity.backend, startedOnly: true }) : null;
   let duplicateDispatch, releaseReservation;
   updateState(workspaceRoot, state => {
     const currentIds = new Set(state.jobs.map(candidate => candidate.id));
@@ -1386,12 +1388,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
       duplicateDispatch = candidates.find(candidate => candidate.dispatchNonce === identity.dispatchNonce && candidate.sessionId === record.sessionId);
       if (duplicateDispatch) return;
     }
-    const threadCandidates = identity.threadId ? [...candidates, identity.sourceJob]
+    const threadCandidates = identity.threadId ? [...candidates, inheritedPrevious]
       .filter(candidate => candidate?.threadId === identity.threadId && jobBackend(candidate) === identity.backend)
       .sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")) || b.id.localeCompare(a.id)) : [];
     // Another session may use a different name on this thread. Preserve this
     // session's identity while retaining explicit --continue job semantics.
-    const previous = identity.selectedJob ?? (record.sessionId ? threadCandidates.find(candidate => candidate.agentName &&
+    const previous = identity.continued ?? (record.sessionId ? threadCandidates.find(candidate => candidate.agentName &&
       (candidate.sessionId === undefined ? candidate.ownerId : candidate.sessionId) === record.sessionId) : null) ?? threadCandidates[0];
     const recent = Date.now() - 24 * 60 * 60 * 1000;
     const previousSession = (previous?.sessionId === undefined ? previous?.ownerId : previous.sessionId) || null;
@@ -1876,9 +1878,8 @@ async function handleTask(argv) {
   const approvedComputerApps = normalizeBundleIds(options["approve-computer-app"] ?? grantRequest?.approvedComputerApps ?? []);
   const lifecycle = { budget, owner: options.owner, leaseSec: seconds(options["lease-sec"] ?? process.env.CODEX_COMPANION_LEASE_SEC, options.direct ? 1800 : 180, "--lease-sec"), questionTimeoutSec: seconds(options["question-timeout-sec"], 900, "--question-timeout-sec") };
   if ((options.roundtable !== undefined) !== (options.persona !== undefined)) throw new Error("--roundtable and --persona must be supplied together.");
-  const latestRequest = threadId && !selectedJob && !previousRequest?.roundtable
-    ? latestThreadJob(cwd, threadId, { backend })?.request : null;
-  const previousRoundtable = continued?.request?.roundtable ?? previousRequest?.roundtable ?? latestRequest?.roundtable;
+  const previousRoundtable = continued?.request?.roundtable ?? previousRequest?.roundtable
+    ?? (options.thread ? latestThreadJob(cwd, options.thread, { backend })?.request?.roundtable : null);
   const roundtable = options.roundtable !== undefined ? { roomId: options.roundtable, persona: options.persona } : previousRoundtable;
   if ((continued || options.thread) && options.roundtable !== undefined &&
       (!previousRoundtable || previousRoundtable.roomId !== roundtable.roomId || previousRoundtable.persona !== roundtable.persona)) {
@@ -1915,7 +1916,7 @@ async function handleTask(argv) {
   if (threadId && fresh) {
     throw new Error("Choose --thread, --fresh, or --resume/--resume-last; these options cannot be combined.");
   }
-  const contextRequest = previousRequest ?? latestRequest;
+  const contextRequest = previousRequest ?? (threadId ? latestThreadJob(cwd, threadId, { backend })?.request : null);
   const claudeInstructions = prepareClaudeInstructions({
     sessionId: process.env[SESSION_ID_ENV], cwd, sessionCwd: options["session-cwd"],
     previousRequest: contextRequest?.claudeInstructionsBase !== undefined ? { ...contextRequest, developerInstructions: contextRequest.claudeInstructionsBase } : contextRequest,
@@ -2002,7 +2003,7 @@ async function handleTask(argv) {
     else ensureCodexAvailable(cwd);
 
     if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, selectedJob, sourceJob, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
     if (job.dispatchReused) {
       await waitForJob(workspaceRoot, job, { owner: job.ownerId, timeoutSec: options["timeout-sec"], direct: true, quiet: options.quiet, toolUseId: dispatchToolUseId });
       return;
@@ -2055,7 +2056,7 @@ async function handleTask(argv) {
   }
 
   if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, selectedJob, sourceJob, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
   job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
   if (options.run !== undefined) job.request.run = options.run;
   if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
