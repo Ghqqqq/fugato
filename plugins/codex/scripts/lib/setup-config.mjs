@@ -10,6 +10,8 @@ import { cachedReasoningEfforts, readModelCache } from "./models.mjs";
 import { BUILTIN_WORKER_DEFAULTS, MODE_NAMES } from "./ultra-codex-mode.mjs";
 import { BUDGET_NOTE, budgetLimit } from "./job-budget.mjs";
 import { PERSONAS, PERSONA_IDS } from "./roundtable-personas.mjs";
+import { backendForModel, BUILTIN_ROLES, HIGH_STAKES, ROLE_IDS, ROUTINE_ROLES, STRONG_ROLES } from "./roles.mjs";
+import { resolveAntigravityExecutable } from "./antigravity.mjs";
 
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function scan(text) {
@@ -25,7 +27,10 @@ function scan(text) {
   });
 }
 export function readTomlField(text, keys) {
-  const entries = scan(text), found = entries.filter(e => same(e.keys, keys));
+  return fieldIn(scan(text), keys);
+}
+function fieldIn(entries, keys) {
+  const found = entries.filter(e => same(e.keys, keys));
   if (found.length > 1) throw new Error("Duplicate selected TOML setting; no configuration changed.");
   if (entries.some(e => e.keys && e.keys.length < keys.length && e.keys.every((k, i) => keys[i] === k))) throw new Error("Selected setting uses a closed inline table; convert it to ordinary TOML tables first.");
   return found.length ? valueOf(found[0].value) : undefined;
@@ -431,37 +436,61 @@ export function readPersonaModels(env = process.env) {
   return mapping;
 }
 
-function personaModelsSummary(text) {
+function personaModelsSummary(text, env) {
+  const overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
   return Object.fromEntries(PERSONA_IDS.map(id => [id, Object.fromEntries(["model", "effort"].map(key => {
     const saved = readTomlField(text, ["roundtable", "personas", id, key]);
-    return [key, { value: typeof saved === "string" ? saved : PERSONAS[id][key], source: typeof saved === "string" ? "saved" : "built-in" }];
+    if (typeof saved === "string") return [key, { value: saved, source: "saved" }];
+    if (key === "effort") return [key, { value: PERSONAS[id].effort, source: "built-in" }];
+    const role = PERSONAS[id].role, row = configuredRoleModel(role, overrides[role]?.model, legacy);
+    return [key, row.fallback ? { value: row.fallback.model, source: "fallback" } : { value: row.model, source: row.source }];
   }))]));
 }
-/** @param {{ models?: string[], env?: NodeJS.ProcessEnv, dryRun?: boolean }} [options] */
-export function personaModelsSetup({ models = [], env = process.env, dryRun = false } = {}) {
-  if (!Array.isArray(models)) throw new Error("--persona-model must be repeatable id=model[:effort], or id=default.");
-  const warnings = [], seen = new Set();
-  // Validate the entire batch through the shared worker-default checks before editing.
-  const changes = models.map(value => {
+
+function modelMappingChanges(models, kind, env, warnings) {
+  const flag = `--${kind}-model`, ids = kind === "role" ? ROLE_IDS : PERSONA_IDS;
+  if (!Array.isArray(models)) throw new Error(`${flag} must be repeatable id=model[:effort], or id=default.`);
+  const seen = new Set(), catalog = models.length ? readModelCache(env) : null;
+  return models.map(value => {
     const match = typeof value === "string" && /^([^=]+)=([^=]+)$/.exec(value);
-    if (!match || !PERSONA_IDS.includes(match[1])) throw new Error(`--persona-model needs id=model[:effort] or id=default; ids: ${PERSONA_IDS.join(", ")}.`);
+    if (kind === "role" && match?.[1] === "high-stakes") throw new Error("the high-stakes tuple is fixed at gpt-6.2-astra/xhigh");
+    if (!match || !ids.includes(match[1])) throw new Error(`${flag} needs id=model[:effort] or id=default; ids: ${ids.join(", ")}.`);
     const [, id, setting] = match;
-    if (seen.has(id)) throw new Error(`--persona-model repeats ${id}; specify each persona once.`);
+    if (seen.has(id)) throw new Error(`${flag} repeats ${id}; specify each ${kind} once.`);
     seen.add(id);
     if (setting === "default") return { id, model: undefined, effort: undefined };
     const colon = setting.lastIndexOf(":"), model = colon < 0 ? setting : setting.slice(0, colon), effort = colon < 0 ? undefined : setting.slice(colon + 1);
-    if (!model || model === "default" || effort === "" || effort === "default") throw new Error("--persona-model needs id=model[:effort], or id=default to reset both values.");
+    if (!model || model.trim() === "default" || effort === "" || effort === "default") throw new Error(`${flag} needs id=model[:effort], or id=default to reset both values.`);
     let checkedModel;
     try {
-      checkedModel = checkedWorkerPreference("defaultModel", model, env, warnings);
-      if (effort !== undefined) checkedWorkerPreference("defaultEffort", effort, env, warnings);
+      if (kind === "role" && backendForModel(model) === "antigravity") {
+        checkedModel = workerPreference("defaultModel", model, env);
+        if (!checkedModel) throw new Error(`${flag} requires a valid Gemini model name.`);
+        warnings.push(`Warning: model ${checkedModel} could not be checked against a cached Antigravity catalog.`);
+      } else {
+        checkedModel = checkedWorkerPreference("defaultModel", model, env, warnings, catalog);
+      }
+      if (effort !== undefined) checkedWorkerPreference("defaultEffort", effort, env, warnings, catalog);
     }
-    catch (error) { throw new Error(error.message.replaceAll("--default-model", "--persona-model").replaceAll("--default-effort", "--persona-model effort")); }
+    catch (error) { throw new Error(error.message.replaceAll("--default-model", flag).replaceAll("--default-effort", `${flag} effort`)); }
     return { id, model: checkedModel, effort };
   });
+}
+
+function applyModelMappings(text, section, changes) {
+  for (const { id, model, effort } of changes) {
+    text = setTomlField(text, [...section, id, "model"], model);
+    text = setTomlField(text, [...section, id, "effort"], effort);
+  }
+  return text;
+}
+
+/** @param {{ models?: string[], env?: NodeJS.ProcessEnv, dryRun?: boolean }} [options] */
+export function personaModelsSetup({ models = [], env = process.env, dryRun = false } = {}) {
+  const warnings = [], changes = modelMappingChanges(models, "persona", env, warnings);
   const { root, file } = duetConfig(env), before = read(root, file);
-  const after = changes.reduce((text, { id, model, effort }) => setTomlField(setTomlField(text, ["roundtable", "personas", id, "model"], model), ["roundtable", "personas", id, "effort"], effort), before);
-  return { file, personaModels: personaModelsSummary(after), warnings, ...apply(root, [{ file, before, after }], dryRun) };
+  const after = applyModelMappings(before, ["roundtable", "personas"], changes);
+  return { file, personaModels: personaModelsSummary(after, env), warnings, ...apply(root, [{ file, before, after }], dryRun) };
 }
 
 /** @param {{ mode?: string, env?: NodeJS.ProcessEnv, dryRun?: boolean }} [options] */
@@ -562,6 +591,65 @@ export function readWorkerDefaults(env = process.env) {
   const values = workerDefaultsSummary(env);
   return { model: values.defaultModel.value, effort: values.defaultEffort.value, routineModel: values.ultraRoutineModel.value };
 }
+
+function advisoryRoleConfig(env) {
+  try {
+    const { root, file } = duetConfig(env);
+    return read(root, file);
+  } catch { return ""; }
+}
+
+function savedRoleOverrides(text, env) {
+  let entries;
+  try { entries = scan(text); } catch { return {}; }
+  const overrides = {};
+  for (const id of ROLE_IDS) {
+    for (const [field, preference] of [["model", "defaultModel"], ["effort", "defaultEffort"]]) {
+      try {
+        const value = workerPreference(preference, fieldIn(entries, ["roles", id, field]), env);
+        if (value && value !== "default") (overrides[id] ??= {})[field] = value;
+      } catch { /* A malformed preference leaves this field at its inherited value. */ }
+    }
+  }
+  return overrides;
+}
+
+export function readRoleOverrides(env = process.env) {
+  return savedRoleOverrides(advisoryRoleConfig(env), env);
+}
+
+function configuredRoleModel(id, savedModel, legacy) {
+  const builtin = BUILTIN_ROLES[id];
+  const tier = ROUTINE_ROLES.includes(id) ? legacy.ultraRoutineModel : STRONG_ROLES.includes(id) ? legacy.defaultModel : null;
+  const inherited = tier?.source === "saved" && tier.value !== "default" && backendForModel(tier.value) === "codex" ? tier.value : null;
+  const model = savedModel ?? inherited ?? builtin.model, backend = backendForModel(model);
+  const source = savedModel ? "saved" : inherited ? "legacy" : "built-in";
+  return { model, backend, source, ...(backend === "antigravity" ? { fallback: builtin.fallback ?? builtin } : {}) };
+}
+
+function roleTableFromConfig(text, env, cwd) {
+  const overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
+  const executable = resolveAntigravityExecutable(cwd);
+  const roles = ROLE_IDS.map(id => {
+    const saved = overrides[id], row = configuredRoleModel(id, saved?.model, legacy);
+    if (row.fallback && !executable) return { id, ...row.fallback, source: "fallback" };
+    return { id, ...row, effort: saved?.effort ?? BUILTIN_ROLES[id].effort, source: saved?.effort ? "saved" : row.source };
+  });
+  return { roles, highStakes: { ...HIGH_STAKES, source: "fixed" }, gemini: { installed: Boolean(executable), executable } };
+}
+
+export function effectiveRoleTable({ env = process.env, cwd = process.cwd() } = {}) {
+  return roleTableFromConfig(advisoryRoleConfig(env), env, cwd);
+}
+
+/** @param {{ models?: string[], env?: NodeJS.ProcessEnv, dryRun?: boolean }} [options] */
+export function roleModelsSetup({ models = [], env = process.env, dryRun = false } = {}) {
+  const warnings = [], changes = modelMappingChanges(models, "role", env, warnings);
+  const { root, file } = duetConfig(env), before = read(root, file);
+  const after = applyModelMappings(before, ["roles"], changes);
+  return { file, table: roleTableFromConfig(after, env, process.cwd()), warnings, ...apply(root, [{ file, before, after }], dryRun) };
+}
+
 function checkedWorkerPreference(key, value, env, warnings, catalog = readModelCache(env)) {
   const cacheAgeMs = catalog?.fetchedAt ? Date.now() - Date.parse(catalog.fetchedAt) : null;
   const normalized = value === "default" ? undefined : workerPreference(key, value, env);

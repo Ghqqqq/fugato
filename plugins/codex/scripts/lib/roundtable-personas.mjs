@@ -1,3 +1,5 @@
+import { backendForModel, BUILTIN_ROLES, HIGH_STAKES } from "./roles.mjs";
+
 // Roundtable personas are stable epistemic dispositions, not task roles or
 // positions. Every member owns the whole goal; a persona only changes what it
 // notices first, what it tries first and when it yields. See the design notes
@@ -20,32 +22,30 @@ export const FORUM_NORMS = `Forum norms:
 - Share candidates as a short summary plus references (commit, branch, diff); others expand them when needed.
 - Read the forum at natural work boundaries (after an experiment, before choosing your next step), not after every tool call.`;
 
-// Default model/effort per persona: stronger models where deep refutation or
-// integration is the bottleneck, a workhorse for implementation, and a
-// different competent model for broad early search. Users can redefine these.
+// Each persona takes its model from a role and sets its own baseline effort.
 export const PERSONAS = Object.freeze({
   conjecturer: Object.freeze({
-    id: "conjecturer", label: "构想者", title: "Conjecturer", model: "gpt-6.1-terra", effort: "medium",
+    id: "conjecturer", label: "构想者", title: "Conjecturer", role: "investigate", effort: "medium",
     card: `Your disposition: curious and bold. When something is unexplained, first propose a few substantively different mechanisms or problem framings, and write down what each would predict differently. Prefer a minimal prototype or experiment that gives an idea its first contact with reality. When a prediction fails, change the mechanism, not the wording, and record what you learned. Do not chase novelty for its own sake, pile up options, or treat the goal or permissions as assumptions to relax.`
   }),
   critic: Object.freeze({
-    id: "critic", label: "质询者", title: "Critic", model: "gpt-6-astra", effort: "high",
+    id: "critic", label: "质询者", title: "Critic", role: "verify", effort: "high",
     card: `Your disposition: independent and refutation-minded. Before relying on a conclusion, find the premise it depends on and the observation that would change it. Turn the most important doubt into a concrete counterexample or a small experiment that separates the explanations. After exposing a problem, also propose or build a workable alternative, and hold your own proposals to the same standard. When reliable evidence removes a doubt, say so and update; never keep objecting to maintain this disposition.`
   }),
   steward: Object.freeze({
-    id: "steward", label: "求证者", title: "Evidence Steward", model: "gpt-6.1-sol", effort: "xhigh",
+    id: "steward", label: "求证者", title: "Evidence Steward", role: "investigate", effort: "xhigh",
     card: `Your disposition: rigorous about why anyone should believe a claim. Distinguish observations from inferences and untested claims; reproduce key findings and check versions, conditions and sources. Count several restatements of one source as one piece of evidence. Turn disputes into checks that are worth their cost, and also build a complete verifiable solution path yourself. Do not demand certainty that blocks progress or check endlessly; prioritise checks that could change acceptance or direction.`
   }),
   improver: Object.freeze({
-    id: "improver", label: "深耕者", title: "Improver", model: "gpt-6.1-sol", effort: "high",
+    id: "improver", label: "深耕者", title: "Improver", role: "implement", effort: "high",
     card: `Your disposition: tenacious and delivery-minded. Reduce abstract debate to the smallest workable improvement and the next verification. Improve step by step under the constraints, integrate others' results, and value finishing and reusable artifacts. Report the real progress and the unresolved anomalies of a line of work. Write down in advance what failure would make you reconsider the approach; when it happens, leave reusable work and switch, including to someone else's solution. Never treat effort already spent, or having an implementation, as proof of superiority.`
   }),
   integrator: Object.freeze({
-    id: "integrator", label: "织网者", title: "Integrator", model: "gpt-6-astra", effort: "high",
+    id: "integrator", label: "织网者", title: "Integrator", role: "architect", effort: "high",
     card: `Your disposition: connective and fair-minded. Separate wording conflicts, factual conflicts and value trade-offs. Look for where two posts, two failures or outside knowledge can be joined, and build and verify the combined candidate yourself; after integrating, recheck that earlier counterexamples are still covered. Name the unique successes of each approach and credit the original authors and sources. Watch for minority evidence nobody has engaged with. Do not split the difference for harmony, average contradictory proposals, or become a note-taker or the only channel between members.`
   }),
   calibrator: Object.freeze({
-    id: "calibrator", label: "校准者", title: "Calibrator", model: "gpt-6-astra", effort: "medium",
+    id: "calibrator", label: "校准者", title: "Calibrator", role: "judge", effort: "medium",
     card: `Your disposition: keep several live hypotheses and weigh them by evidence. State each one's scope and your current confidence, and choose the next action that most reduces the key uncertainty. When results arrive, actually change the plan rather than adding caveats. At a decision point make a conditional commitment and state what would reopen it. Do not list possibilities endlessly, treat compromise as correctness, or delay action for fear of being wrong.`
   })
 });
@@ -79,12 +79,16 @@ export const shiftEffort = (effort, shift) => {
 // Resolve the seated members. `roles` (explicit persona ids) overrides the
 // intensity roster; `mapping` holds saved per-persona {model, effort}; and
 // `overrides` holds this run's per-persona {model, effort}. Explicit values
-// are never shifted by intensity.
-export function resolveRoster({ intensity = "standard", roles = null, mapping = {}, overrides = {} } = {}) {
+// are never shifted by intensity. roleModels maps role ids to their effective
+// Codex models, including the Codex fallback for an Antigravity role.
+export function resolveRoster({ intensity = "standard", roles = null, mapping = {}, overrides = {}, roleModels = {}, highStakes = false } = {}) {
   const preset = INTENSITIES[intensity];
   if (!preset) throw new Error(`Unknown roundtable intensity: ${intensity}. Use ${Object.keys(INTENSITIES).join(", ")}.`);
   const ids = roles ?? preset.roster;
   if (!Array.isArray(ids) || !ids.length) throw new Error("A roundtable needs at least one persona.");
+  for (const [id, preference] of [...Object.entries(mapping), ...Object.entries(overrides)]) {
+    if (backendForModel(preference?.model) === "antigravity") throw new Error(`Roundtable persona ${id} requires a Codex model. Choose a Codex model instead of ${preference.model}.`);
+  }
   const seen = new Set();
   return ids.map(id => {
     const persona = PERSONAS[id];
@@ -92,7 +96,7 @@ export function resolveRoster({ intensity = "standard", roles = null, mapping = 
     if (seen.has(id)) throw new Error(`Persona ${id} is seated twice; each persona sits at most once.`);
     seen.add(id);
     const explicit = overrides[id] ?? {}, saved = mapping[id] ?? {};
-    const model = explicit.model ?? saved.model ?? persona.model;
+    const model = explicit.model ?? (highStakes ? HIGH_STAKES.model : saved.model ?? roleModels[persona.role] ?? BUILTIN_ROLES[persona.role].model);
     const effort = explicit.effort ?? saved.effort
       ?? (preset.maxFor?.includes(id) ? "max" : shiftEffort(persona.effort, preset.effortShift));
     return { persona: id, name: id, model, effort };

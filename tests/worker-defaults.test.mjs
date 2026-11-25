@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { lifecycleHarness } from "./fake-codex-fixture.mjs";
 import { readWorkerDefaults, readPersonaModels, personaModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 import { PERSONAS } from "../plugins/codex/scripts/lib/roundtable-personas.mjs";
+import { BUILTIN_ROLES } from "../plugins/codex/scripts/lib/roles.mjs";
 
 const { fs, path, fixture, json, direct, run, hook } = await lifecycleHarness();
 const BUILTIN = { model: "gpt-6-astra", effort: "xhigh", routineModel: "gpt-6.1-sol" };
@@ -40,7 +41,7 @@ test("persona mappings preview, save, report field sources and reset independent
   assert.deepEqual(readPersonaModels(f.env), {});
   for (const [id, persona] of Object.entries(PERSONAS)) {
     assert.deepEqual(personaModelsSetup({ env: f.env }).personaModels[id], {
-      model: { value: persona.model, source: "built-in" }, effort: { value: persona.effort, source: "built-in" }
+      model: { value: BUILTIN_ROLES[persona.role].model, source: "built-in" }, effort: { value: persona.effort, source: "built-in" }
     });
   }
   assert.ok(fs.readFileSync(file, "utf8").startsWith(before));
@@ -74,6 +75,20 @@ test("persona mapping batches reject invalid ids, models, efforts and mixed setu
   fs.writeFileSync(cache, JSON.stringify({ fetched_at: new Date(Date.now() - 48 * 3600000).toISOString(), models }));
   const stale = json(f.call("setup", "--persona-model", "critic=new-persona", "--json"));
   assert.ok(stale.warnings.some(warning => /48 hours/.test(warning)));
+});
+
+test("persona summaries report the source of the seat's model independently of role effort", () => {
+  const f = fixture(), file = preferenceFile(f);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `ultraRoutineModel = "legacy-routine"
+[roles.implement]
+effort = "max"
+[roles.verify]
+model = "gemini-custom"
+`);
+  const { personaModels } = personaModelsSetup({ env: f.env });
+  assert.deepEqual(personaModels.improver, { model: { value: "legacy-routine", source: "legacy" }, effort: { value: "high", source: "built-in" } });
+  assert.deepEqual(personaModels.critic, { model: { value: "gpt-6.2-astra", source: "fallback" }, effort: { value: "high", source: "built-in" } });
 });
 
 test("worker defaults preview, save and reset together while preserving unrelated preferences", () => {
