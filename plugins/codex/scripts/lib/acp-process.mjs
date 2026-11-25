@@ -13,13 +13,24 @@ export function acpExecutable(cwd) {
 
 function matchesInvocation(command, executable) {
   const windows = process.platform === "win32";
-  const normalize = value => windows ? value.toLowerCase().replaceAll('"', "").replace(/\^(.)/g, "$1") : value;
-  const expected = new Set([executable, path.basename(executable)]);
+  const normalize = value => windows ? value.toLowerCase() : value;
+  const expected = new Set([executable, (windows ? path.win32 : path).basename(executable)]);
   try { expected.add(fs.realpathSync(executable)); } catch { /* The binary may since have been removed. */ }
   // Account for a shebang interpreter or a Windows .cmd shim. Only accept
   // the executable and its single literal ACP argument, never a substring.
   let invocation = normalize(command);
-  if (windows) invocation = invocation.replace(/^(?:.*\\)?cmd\.exe \/d \/s \/c /, "");
+  if (windows) {
+    const shim = /^"?(?:[^"]*\\)?cmd\.exe"? \/d \/s \/c "(.+) ([^ ]+)"$/.exec(invocation);
+    if (shim) {
+      // The executable is cmd-escaped once. Local npm shims escape their
+      // quoted argument twice because the shim forwards it through %*.
+      const unescape = value => value.replace(/\^(.)/g, "$1");
+      const name = unescape(shim[1]);
+      const arg = /node_modules[\\/]\.bin[\\/][^\\/]+\.cmd$/.test(name) ? unescape(unescape(shim[2])) : unescape(shim[2]);
+      return arg === '"acp"' && [...expected].some(candidate => name === normalize(candidate));
+    }
+    invocation = invocation.replace(/^"([^"]+)" /, "$1 ");
+  }
   invocation = invocation.replace(/^(?:[^\s]*[\\/])?(?:node|sh|bash|dash|zsh|python[\d.]*)(?:\.exe)?\s+/, "");
   return [...expected].some(name => invocation === normalize(name) + " acp");
 }
@@ -63,16 +74,16 @@ function processIdentity(job) {
   if (!command) return pidExists(pid) ? "unknown" : "absent";
   const executable = job.acpExecutable ?? acpExecutable(job.request?.cwd ?? job.workspaceRoot ?? process.cwd());
   if (!matchesInvocation(command, executable)) return "reused";
-  // The worker observes its live ACP child at PID registration and again at prompt submission.
-  const proofTimes = [job.acpProcessRecordedAt, job.turnSubmission?.at]
-    .filter(value => typeof value === "string").map(Date.parse).filter(Number.isFinite);
-  if (!Number.isFinite(startedAt) || !proofTimes.length) return "unknown";
-  const recordedAt = Math.max(...proofTimes);
-  // ps reports only whole seconds. A matching executable born anywhere in
-  // the latest proof's second could be a replacement. CreationDate retains ms.
-  const cutoff = process.platform === "win32" ? recordedAt : Math.floor(recordedAt / 1000) * 1000;
-  if (startedAt === cutoff) return "unknown";
-  return startedAt < cutoff ? "owned" : "reused";
+  const observation = job.acpProcessRecordedAt ?? job.turnSubmission?.at;
+  const recordedAt = typeof observation === "string" ? Date.parse(observation) : NaN;
+  if (!Number.isFinite(startedAt) || !Number.isFinite(recordedAt)) return "unknown";
+  const windows = process.platform === "win32";
+  const cutoff = windows ? recordedAt : Math.floor(recordedAt / 1000) * 1000;
+  if (startedAt !== cutoff) return startedAt < cutoff ? "owned" : "reused";
+  // ps rounds to seconds. If the registered child survived into a later
+  // submission second, a replacement could not have been born in this one.
+  const submittedAt = job.turnSubmission?.at;
+  return !windows && typeof submittedAt === "string" && Date.parse(submittedAt) >= cutoff + 1000 ? "owned" : "unknown";
 }
 
 const gone = identity => identity === "absent" || identity === "reused";

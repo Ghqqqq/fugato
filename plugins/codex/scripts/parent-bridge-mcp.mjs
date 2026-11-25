@@ -8,25 +8,31 @@ import path from "node:path";
 import process from "node:process";
 import { randomUUID } from "node:crypto";
 import { createJsonLineReader } from "./lib/app-server.mjs";
+import { jobBackend } from "./lib/backends.mjs";
 import { ACTIVE, ASK_PARENT, PARENT_BRIDGE_ENV, recordedThreadJobs, askParentQuestion } from "./lib/job-runtime.mjs";
 import { readRoom, assertChair, readIndex, readThread, readResource, postEvent, renderForum, EVENT_KINDS } from "./lib/forum.mjs";
 import { readJobFile, resolveJobFile } from "./lib/state.mjs";
 
 const cwd = process.env[PARENT_BRIDGE_ENV.cwd], envThread = process.env[PARENT_BRIDGE_ENV.threadId], envJob = process.env[PARENT_BRIDGE_ENV.jobId];
+const backend = process.env.CODEX_COMPANION_BRIDGE_BACKEND ?? "codex";
 const caller = { pid: process.pid, nonce: randomUUID() };
 const validThread = id => typeof id === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(id);
 // Match the job filename alphabet used by retention, with a bounded length.
 const validJob = id => typeof id === "string" && /^[A-Za-z0-9_-]{1,120}$/.test(id);
-if (!cwd || !path.isAbsolute(cwd) || (envThread !== undefined) === (envJob !== undefined) ||
+if (!["codex", "antigravity"].includes(backend) || !cwd || !path.isAbsolute(cwd) || (envThread !== undefined) === (envJob !== undefined) ||
     (envThread !== undefined ? !validThread(envThread) : !validJob(envJob))) {
   process.stderr.write("parent-bridge-mcp: missing or invalid thread/job handle environment.\n");
   process.exit(2);
 }
 let resolvedThread = envThread ?? null;
+function startingJob() {
+  const job = readJobFile(resolveJobFile(cwd, envJob));
+  return job.id === envJob && jobBackend(job) === backend ? job : null;
+}
 const boundThread = () => {
   if (resolvedThread) return resolvedThread;
   try {
-    const threadId = readJobFile(resolveJobFile(cwd, envJob))?.threadId;
+    const threadId = startingJob()?.threadId;
     return validThread(threadId) ? (resolvedThread = threadId) : null;
   } catch { return null; }
 };
@@ -45,11 +51,20 @@ if (!resolvedThread) {
 const TURN_RECORD_WAIT_MS = 3000;
 const TURN_RECORD_POLL_MS = 100;
 const validTurn = id => typeof id === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(id);
+function bridgeJobs(threadId) {
+  // Each ACP process serves a single job, even on a loaded session. Codex
+  // keeps its bridge across runs, so its current owner can change workspace.
+  if (backend === "antigravity" && envJob) {
+    const job = startingJob();
+    return job?.threadId === threadId && job.workspaceRoot === cwd ? [job] : [];
+  }
+  return recordedThreadJobs(threadId, backend).jobs;
+}
 async function jobForTurn(threadId, turnId) {
   const deadline = Date.now() + (turnId ? TURN_RECORD_WAIT_MS : 0);
   while (true) {
-    const inventory = recordedThreadJobs(threadId);
-    const candidates = inventory.jobs.filter(job => ACTIVE.has(job.status) &&
+    const jobs = bridgeJobs(threadId);
+    const candidates = jobs.filter(job => ACTIVE.has(job.status) &&
       typeof job.workspaceRoot === "string" && path.isAbsolute(job.workspaceRoot) &&
       validTurn(job.turnId) && (!turnId || job.turnId === turnId));
     // Turn IDs are unique, and queued reservations have none, so one readable
@@ -59,7 +74,7 @@ async function jobForTurn(threadId, turnId) {
     // Missing metadata cannot justify guessing among owners. With an exact turn,
     // allow its accepted handle (or a concurrent index update) to be published.
     if (!turnId || candidates.length > 1 || Date.now() >= deadline ||
-        inventory.jobs.some(job => job.turnId === turnId)) return null;
+        jobs.some(job => job.turnId === turnId)) return null;
     await new Promise(resolve => setTimeout(resolve, TURN_RECORD_POLL_MS));
   }
 }
@@ -84,8 +99,8 @@ const FORUM_TOOLS = [
     annotations: { title: "Post to roundtable forum", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } }
 ];
 function listingJob() {
-  if (!resolvedThread && envJob) return readJobFile(resolveJobFile(cwd, envJob));
-  const jobs = recordedThreadJobs(boundThread()).jobs.filter(job => ACTIVE.has(job.status));
+  if (!resolvedThread && envJob) return startingJob();
+  const jobs = bridgeJobs(boundThread()).filter(job => ACTIVE.has(job.status));
   return jobs.length === 1 ? jobs[0] : null;
 }
 function forumArgs(name, args) {

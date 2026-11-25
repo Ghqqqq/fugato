@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, waitForCondition, writeExecutable } from "./helpers.mjs";
-import { resolveJobFile, unresolvedTask, updateJob } from "../plugins/codex/scripts/lib/state.mjs";
+import { answerQuestion, PARENT_BRIDGE_ENV } from "../plugins/codex/scripts/lib/job-runtime.mjs";
+import { resolveJobFile, unresolvedTask, updateJob, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const cli = fileURLToPath(new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url));
 const fugato = fileURLToPath(new URL("../plugins/codex/bin/fugato", import.meta.url));
@@ -384,4 +386,77 @@ test("a legacy Codex submission recovers its missing turn ID alongside an unsubm
   assert.equal(recovered.recovery.source, "thread/read");
   assert.equal(recovered.recovery.turnId, original.turnId);
   assert.equal(f.job(acp.jobId).turnSubmission, null);
+});
+
+test("ACP admission ignores a missing private Codex job with the same handle in another workspace", () => {
+  const f = fixture(), first = f.complete("--backend", "antigravity");
+  const { threadId } = f.job(first.jobId);
+  const other = makeTempDir("legacy-codex-index-");
+  initGitRepo(other);
+  upsertJob(other, { id: "missing-codex", workspaceRoot: other, threadId, jobClass: "task", status: "running" });
+  assert.equal(fs.existsSync(resolveJobFile(other, "missing-codex")), false);
+  const next = f.complete("--continue", first.jobId);
+  assert.equal(next.status, "completed");
+  assert.deepEqual(f.requests("session/load").map(request => request.params.sessionId), [threadId]);
+});
+
+test("cancel cleans Codex terminals when a job never submitted and ACP is live on the same handle", t => {
+  const previous = process.env.CODEX_COMPANION_HOME;
+  process.env.CODEX_COMPANION_HOME = makeTempDir("codex-cleanup-");
+  t.after(() => { process.env.CODEX_COMPANION_HOME = previous; });
+  const f = fixture();
+  installFakeCodex(f.dir);
+  f.env.CODEX_COMPANION_BIN = path.join(f.dir, "codex");
+  const { jobId } = f.complete("--backend", "codex"), { threadId, request } = f.job(jobId);
+  const { backend, ...legacyRequest } = request;
+  updateJob(f.repo, jobId, () => ({ backend: undefined, request: legacyRequest, turnId: null,
+    turnSubmission: null, result: null, report: null, status: "failed", pid: null }));
+  const acp = { id: "live-acp", workspaceRoot: f.repo, backend: "antigravity", threadId,
+    turnId: "acp-active", jobClass: "task", status: "running", pid: process.pid };
+  upsertJob(f.repo, acp);
+  writeJobFile(f.repo, acp.id, acp);
+  const cancel = f.command(["cancel", jobId, "--json"]);
+  assert.equal(f.job(jobId).recovery.turnStatus, "notStarted");
+  assert.equal(cancel.turnInterruptAttempted, false);
+  assert.equal(cancel.backgroundTerminals.cleaned, true);
+  const requests = fs.readFileSync(path.join(f.dir, "fake-codex-state.json.requests.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+  assert.deepEqual(requests.filter(r => r.method === "thread/backgroundTerminals/clean").map(r => r.params.threadId), [threadId]);
+  assert.deepEqual(f.job(acp.id), acp);
+});
+
+test("parent questions reach their own backend when ACP and Codex share thread and turn handles", async t => {
+  const f = fixture(), first = f.complete("--backend", "antigravity");
+  const next = f.complete("--continue", first.jobId);
+  const { threadId, turnId } = f.job(next.jobId);
+  updateJob(f.repo, next.jobId, () => ({ status: "running", pid: process.pid }));
+  const codex = { id: "legacy-bridge-job", workspaceRoot: f.repo, threadId, turnId, status: "running", pid: process.pid };
+  upsertJob(f.repo, codex);
+  writeJobFile(f.repo, codex.id, codex);
+  const [server] = f.requests("session/load")[0].params.mcpServers;
+  const env = Object.fromEntries(server.env.map(({ name, value }) => [name, value]));
+  assert.equal(env[PARENT_BRIDGE_ENV.jobId], next.jobId);
+  assert.equal(env[PARENT_BRIDGE_ENV.threadId], undefined);
+  assert.equal(env.CODEX_COMPANION_BRIDGE_BACKEND, "antigravity");
+  const threadEnv = { [PARENT_BRIDGE_ENV.cwd]: f.repo, [PARENT_BRIDGE_ENV.threadId]: threadId };
+  for (const [target, other, binding] of [
+    [next.jobId, codex.id, env],
+    [next.jobId, codex.id, { ...threadEnv, CODEX_COMPANION_BRIDGE_BACKEND: "antigravity" }],
+    [codex.id, next.jobId, threadEnv]
+  ]) {
+    const bridge = spawn(server.command, server.args, { cwd: f.repo, env: { ...f.env, ...binding }, stdio: ["pipe", "pipe", "inherit"] });
+    t.after(() => bridge.kill());
+    let reply;
+    createInterface({ input: bridge.stdout }).on("line", line => { reply = JSON.parse(line); });
+    bridge.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "ask_parent", arguments: { question: "Which sample?" }
+    } }) + "\n");
+    await waitForCondition(() => reply || f.job(target).pendingQuestion || f.job(other).pendingQuestion, "bridge question", 5000);
+    assert.ok(!f.job(other).pendingQuestion);
+    const pending = f.job(target).pendingQuestion;
+    assert.equal(pending?.text, "Which sample?");
+    answerQuestion(f.repo, target, pending.id, "Sample B");
+    await waitForCondition(() => reply, "bridge answer", 5000);
+    assert.equal(reply.result.content[0].text, "Sample B");
+    bridge.stdin.end();
+  }
 });

@@ -1037,8 +1037,8 @@ function admissionInventory(workspaceRoot, jobs, threadId, backend) {
   if (backend !== "antigravity") return { jobs: local, complete: true };
   // ACP session handles span workspaces. A crashed wrapper can leave a
   // submitted prompt alive after its PID-based session lock is reclaimed.
-  const inventory = recordedThreadJobs(threadId);
-  const foreign = inventory.jobs.filter(job => job.workspaceRoot !== workspaceRoot && isAntigravityJob(job));
+  const inventory = recordedThreadJobs(threadId, backend);
+  const foreign = inventory.jobs.filter(job => job.workspaceRoot !== workspaceRoot);
   return { jobs: local.concat(foreign), complete: inventory.complete };
 }
 
@@ -2884,7 +2884,7 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
         stored = readStoredJob(snapshot.workspaceRoot, stored.id) ?? stored;
       }
       if (stored.recovered && stored.recovery?.turnStatus === "notStarted") {
-        const inventory = stored.threadId ? recordedThreadJobs(stored.threadId) : { jobs: [], complete: true };
+        const inventory = stored.threadId ? recordedThreadJobs(stored.threadId, "codex") : { jobs: [], complete: true };
         const otherOwner = inventory.jobs.find(candidate => candidate.id !== stored.id &&
           (processAlive(candidate.pid) || (candidate.turnId && (ACTIVE.has(candidate.status) || unresolvedTask(candidate)))));
         const backgroundTerminals = stored.threadId && inventory.complete && !otherOwner
