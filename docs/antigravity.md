@@ -8,28 +8,43 @@ alongside Codex tasks and do not require the Codex CLI.
 
 ## Terms and sign-in
 
-Fugato launches Google's official `agy` binary with the single argument
-`acp` and identifies itself as `fugato`. Antigravity reads its own cached
-credentials. Fugato never extracts, copies or proxies Google sign-in tokens.
-Google's ACP guide says “Any ACP client can launch Antigravity CLI.”
+Fugato launches Google's official `agy` binary with the single argument `acp`
+and identifies itself as `fugato`. It relies on the credentials `agy` has
+cached and never extracts, copies or proxies Google sign-in tokens. Google's
+ACP guide lists four sign-in methods: `oauth-personal`, `oauth-business`
+(Gemini Enterprise), `gemini-api-key` and `agent-platform`. Fugato does not
+select or call the API-key or Gemini Enterprise sign-in methods.
 [ACP guide](https://antigravity.google/docs/ide/extensions/acp) ·
 [Fugato ACP client](../plugins/codex/scripts/lib/acp-client.mjs)
 
-Google's FAQ says using third-party software to access Antigravity with an
-Antigravity login violates the Terms. It recommends a Gemini Enterprise or
-Google AI Studio API key for third-party coding agents. Its section on
-headless `agy -p` also says that wrapping `agy` inside third-party coding
-agents is unsupported under consumer plans. [Google FAQ](https://antigravity.google/docs/faq/)
+Google's Antigravity FAQ, in a question that names Claude Code as an example of
+third-party software, states: "Using third-party software, tools, or services
+to access Antigravity is a violation of our Terms of Service ... To use a
+third-party coding agent with Gemini, we recommend using a Gemini Enterprise or
+Google AI Studio API key." It also states: "Wrapping `agy` inside third-party
+coding agents or applications, or automating account rotation, is not supported
+under consumer plans." [Antigravity FAQ](https://antigravity.google/docs/faq)
 
-On the Google AI Developers Forum, Google addressed the official, unmodified
-`antigravity-acp` runtime from the ACP Registry. The replies say an ACP client
-such as T3 Code or Zed may run that runtime with native personal sign-in for
-single-user interactive development. General ACP clients are limited to the
-Gemini models in the user's plan. Extracting or proxying OAuth tokens is
-prohibited. These forum replies do not establish formal Google policy.
-If you need certainty, use a Google AI Studio API key or Gemini Enterprise.
+On 2026-11-12, a Collaborator on Google's `antigravity-cli` repository (issue
+1493) wrote that interactive ACP clients may launch the unmodified `agy acp`
+"when a human user is directly driving the session", and added: "What is not
+permitted under consumer sign-in (oauth-personal) is using agy acp as a backend
+worker inside a third-party coding agent, autonomous agent harness, or
+background orchestrator."
+[antigravity-cli issue 1493](https://github.com/google-antigravity/antigravity-cli/issues/1493#issuecomment-6814901159)
+
+Earlier replies on the Google AI Developers Forum addressed single-user
+interactive clients such as T3 Code or Zed, where a human drives the session;
+those replies do not establish formal Google policy.
 [Forum reply on personal sign-in](https://discuss.ai.google.dev/t/tos-clarification-is-t3-code-official-antigravity-acp-agent-permitted-under-the-antigravity-terms-of-service/192027/2) ·
 [Forum clarification on clients and models](https://discuss.ai.google.dev/t/conflicting-guidance-on-using-t3-code-with-personal-google-ai-subscriptions/197131/3)
+
+Fugato's Gemini workers are that backend-worker case: Google's FAQ calls
+third-party access a "violation" of its Terms of Service, and the
+`antigravity-cli` collaborator states that backend-worker use under consumer
+sign-in is "not permitted". If you use a personal Google sign-in with Fugato's
+Gemini workers, you do so at your own account risk; Google recommends a Google
+AI Studio API key or Gemini Enterprise for third-party coding agents.
 
 ## Set up
 
@@ -232,13 +247,14 @@ line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/s
   its own job records to admit a turn, clean up or route a parent question.
   [Companion CLI](../plugins/codex/scripts/codex-companion.mjs) ·
   [Parent question routing](../plugins/codex/scripts/parent-bridge-mcp.mjs)
-- After a worker crash, `fugato cancel <jobId>` signals only a verified agy
-  process group. On systems where `ps` reports start times to the second,
-  the matching process must have started before the PID registration second,
-  or in that same second with the prompt submitted in a later second. Windows
-  uses a start timestamp strictly earlier than registration. If ownership is
-  uncertain, Fugato leaves the process running. Once the owned process is
-  gone, the worker's concurrency slot is released and the session can continue.
+- After a worker crash, `fugato cancel <jobId>` checks the start identity saved
+  with the agy PID (Linux: boot ID and `/proc` start time; Windows: creation
+  time; others: `ps` start time) and signals the agy process group only when the
+  command and start identity match. A mismatch means PID reuse, and a saved
+  identity that cannot be re-read leaves the process running. Records without a
+  saved identity (from older versions, or when it could not be read at
+  registration) keep the previous timing rule. Once gone, the concurrency slot
+  is released and the session can continue.
   [`processIdentity`](../plugins/codex/scripts/lib/acp-process.mjs) ·
   [Concurrency slots](../plugins/codex/scripts/lib/concurrency.mjs)
 
