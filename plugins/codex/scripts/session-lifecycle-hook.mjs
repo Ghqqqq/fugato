@@ -9,19 +9,20 @@ import { listSessionJobs } from "./lib/state.mjs";
 import { ACTIVE, requestCancel } from "./lib/job-runtime.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
-import { clearMode, pruneModes, readMode, reminderText } from "./lib/ultra-codex-mode.mjs";
+import { clearMode, formatRoleSummary, pruneModes, readMode, reminderText } from "./lib/ultra-codex-mode.mjs";
 import { runAutomaticRetention } from "./lib/retention.mjs";
 import { activeRunContext } from "./lib/run-journal.mjs";
 import { deleteClaudeSnapshot, recordClaudeTranscript } from "./lib/claude-memory.mjs";
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 // Name the selected dispatch route up front so the first task needs no readiness notice.
 // An unavailable adapter observation enables the Bash fallback on later sessions.
-async function sessionStartContext() {
-  let dispatch = "auto", unavailable = null;
+async function sessionStartContext(cwd) {
+  let dispatch = "auto", unavailable = null, workerRoles = "";
   try {
-    const { dispatchPreference, readNativeUnavailable } = await import("./lib/setup-config.mjs");
+    const { dispatchPreference, effectiveRoleTable, readNativeUnavailable } = await import("./lib/setup-config.mjs");
     dispatch = dispatchPreference();
     if (dispatch === "auto") unavailable = readNativeUnavailable();
+    workerRoles = `Worker roles: ${formatRoleSummary(effectiveRoleTable({ cwd }))}.`;
   } catch { /* built-in guidance must remain available on any preference error */ }
   const bash = dispatch === "bash" || Boolean(unavailable);
   const routeContext = bash ? [
@@ -34,6 +35,7 @@ async function sessionStartContext() {
   ];
   return [
     ...routeContext,
+    ...(workerRoles ? [workerRoles] : []),
     "When delegating outside an orchestration mode, choose a role for each fresh dispatch.",
     bash
       ? "Use `fugato task --role <id> --normal` for a Codex row or `fugato task --backend antigravity --role <id> --normal` for a Gemini row."
@@ -113,7 +115,7 @@ async function main() {
       child.on("error", () => {}); child.unref();
     } catch { /* Missing prerequisites are reported by setup/task, not a login prompt. */ }
     const runContext = activeRunContext(cwd, input.session_id);
-    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: await sessionStartContext() + (runContext ? `\n${runContext}` : "") + (modeReminder ? `\n${modeReminder}` : "") } })}\n`);
+    process.stdout.write(`${JSON.stringify({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: await sessionStartContext(input.cwd || process.cwd()) + (runContext ? `\n${runContext}` : "") + (modeReminder ? `\n${modeReminder}` : "") } })}\n`);
     return;
   }
   if ((event || input.hook_event_name) !== "SessionEnd") return;

@@ -30,7 +30,7 @@ import { startRun, useRun, addEntry, closeRun, showRun, listRuns, renderRun, val
 import { recordFinishedJob, recordedThreadJobs, uniqueTurnAttribution } from "./lib/job-runtime.mjs";
 import { listSessionJobs, updateJob, unresolvedTask, withoutPrivateActivity } from "./lib/state.mjs";
 import { markReportEmitted } from "./lib/report-delivery.mjs";
-import { clearMode, effectiveMaxWorkers, modeFile, PAIR_MAX_REWORK_ROUNDS, PROTOCOL_PATH, protocolVersion, readMode, setMode, validateRoundtableOptions } from "./lib/ultra-codex-mode.mjs";
+import { clearMode, effectiveMaxWorkers, formatRoleSummary, modeFile, PAIR_MAX_REWORK_ROUNDS, PROTOCOL_PATH, protocolVersion, readMode, setMode, validateRoundtableOptions } from "./lib/ultra-codex-mode.mjs";
 import { snapshotWorkspace, compareWorkspaceSnapshots, workspaceChangeAttribution } from "./lib/workspace-changes.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -3448,7 +3448,7 @@ async function handleOrchestrationMode(argv, modeName) {
       : "";
     const defaultLine = defaultMode === "off" ? "" : `default mode: ${defaultMode} (fugato setup --default-mode)\n`;
     const modelLine = personaModels ? `persona models: ${Object.entries(personaModels).map(([id, entry]) => `${id} ${entry.model.value}/${entry.effort.value}`).join(", ")}`
-      : `models: worker roles from fugato models; roleless default ${models.model}/${models.effort}`;
+      : `models: roles ${formatRoleSummary(effectiveRoleTable({ cwd: resolveCommandCwd(options) }))}; roleless default ${models.model}/${models.effort}`;
     const roomLine = latestRoom ? `latest room: ${latestRoom.roomId} (${latestRoom.status}, ${latestRoom.intensity}); needs the chair: ${latestRoom.attention.length}; members ${latestRoom.members.map(member => `${member.name}:${member.status} workspace ${member.workspace.path} (${member.workspace.hasChanges === null ? "changes unknown" : member.workspace.hasChanges ? "changed" : "clean"})`).join(", ")}; open items ${latestRoom.counts.openItems}\n` : "";
     const text = `${latestRoom ? renderAttention(latestRoom) : ""}${renderOrchestrationMode(mode, modeName)}\n${modelLine}\n${defaultLine}${roomLine}${preamble}`;
     outputCommandResult(payload, text, options.json);

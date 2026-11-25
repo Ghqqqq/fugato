@@ -120,6 +120,16 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
 
 test("ultra reminder groups equal role tuples and updates when agy becomes available", () => {
   const f = fixture();
+  const fallbackSummary = "scan sol/low, implement|investigate|read|research sol/high, review sol/medium, " +
+    "debug|architect|verify|judge|alt-design astra/xhigh, visual|media terra/medium; " +
+    "high-stakes astra/xhigh; Gemini off (Codex fallbacks)";
+  const start = f.json(f.lifecycle("SessionStart", { source: "startup" }));
+  assert.ok(start.hookSpecificOutput.additionalContext.split("\n").includes(`Worker roles: ${fallbackSummary}.`));
+  for (const verb of ["ultra-codex", "pair", "duel"]) {
+    const status = f.call(verb, "status");
+    assert.equal(status.status, 0, status.stderr);
+    assert.ok(status.stdout.split("\n").includes(`models: roles ${fallbackSummary}; roleless default gpt-6-astra/xhigh`));
+  }
   setMode(f.repo, SESSION, { scale: "quick", maxWorkers: 2 }, f.env);
   const prefix = "Ultra-codex mode on (quick, max 2 workers; roles: ";
   const suffix = `). Apply protocol v${protocolVersion()} to substantive tasks`;
@@ -128,10 +138,7 @@ test("ultra reminder groups equal role tuples and updates when agy becomes avail
     assert.equal(result.status, 0, result.stderr);
     return result.stdout.split("; re-read")[0];
   };
-  assert.equal(reminder(),
-    prefix + "scan sol/low, implement|investigate|read|research sol/high, review sol/medium, " +
-    "debug|architect|verify|judge|alt-design astra/xhigh, visual|media terra/medium; " +
-    "high-stakes astra/xhigh; Gemini off (Codex fallbacks)" + suffix);
+  assert.equal(reminder(), prefix + fallbackSummary + suffix);
   writeExecutable(f.env.FUGATO_ANTIGRAVITY_BIN, "");
   assert.equal(reminder(),
     prefix + "scan sol/low, implement|investigate sol/high, review sol/medium, " +

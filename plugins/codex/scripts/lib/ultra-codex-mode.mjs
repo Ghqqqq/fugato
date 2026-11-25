@@ -184,6 +184,19 @@ export function formatRoleTuples(rows) {
   });
 }
 
+export function formatRoleSummary(table) {
+  const tuples = formatRoleTuples([...table.roles, table.highStakes]);
+  const groups = new Map();
+  for (const [index, { id }] of table.roles.entries()) {
+    const tuple = tuples[index];
+    if (!groups.has(tuple)) groups.set(tuple, []);
+    groups.get(tuple).push(id);
+  }
+  const roles = Array.from(groups, ([tuple, ids]) => `${ids.join("|")} ${tuple}`).join(", ");
+  const gemini = table.gemini.installed ? "on" : "off (Codex fallbacks)";
+  return `${roles}; high-stakes ${tuples.at(-1)}; Gemini ${gemini}`;
+}
+
 // What the UserPromptSubmit hook adds to the prompt while the mode is on.
 // Short on purpose: it is paid on every prompt. The protocol itself is read
 // only when its current version is absent (including after compaction).
@@ -199,14 +212,5 @@ export function reminderText(mode, protocolPath = PROTOCOL_PATH, table) {
     return `Duel mode on (Codex builder implement ${implement}, breaker verify ${verify}, analysis architect ${architect}, max ${options.rounds} rounds). Apply duel protocol ${suffix}`;
   }
   const cap = options.maxWorkers === "unlimited" ? "no worker cap" : `max ${effectiveMaxWorkers(options.maxWorkers)} workers${options.maxWorkers === "auto" ? " (auto)" : ""}`;
-  const tuples = formatRoleTuples([...table.roles, table.highStakes]);
-  const groups = new Map();
-  for (const [index, { id }] of table.roles.entries()) {
-    const tuple = tuples[index];
-    if (!groups.has(tuple)) groups.set(tuple, []);
-    groups.get(tuple).push(id);
-  }
-  const roles = Array.from(groups, ([tuple, ids]) => `${ids.join("|")} ${tuple}`).join(", ");
-  const gemini = table.gemini.installed ? "on" : "off (Codex fallbacks)";
-  return `Ultra-codex mode on (${options.scale}, ${cap}; roles: ${roles}; high-stakes ${tuples.at(-1)}; Gemini ${gemini}). Apply protocol ${suffix}`;
+  return `Ultra-codex mode on (${options.scale}, ${cap}; roles: ${formatRoleSummary(table)}). Apply protocol ${suffix}`;
 }
