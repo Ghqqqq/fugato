@@ -784,7 +784,7 @@ async function handleSetup(argv) {
     finalReport.actionsTaken.push(`CUA surfaces: ${toolSync.surfaces.join(", ") || "none"}; backends: ${toolSync.backends.join(", ") || "none"}.`);
     if (toolSync.changed) finalReport.nextSteps.push("Restart the Claude session/shared Codex runtime to load synced tools.");
   }
-  outputResult(options.json ? finalReport : `${renderSetupReport(finalReport)}Default mode: ${finalReport.defaultMode}.\nDispatch route: ${finalReport.dispatch}.\nDefault models: worker ${finalReport.defaultModel.value}/${finalReport.defaultEffort.value}, ultra routine ${finalReport.ultraRoutineModel.value}.\nSelected Codex: ${finalReport.codex.executable} (source: ${finalReport.codex.source}).\n`, options.json);
+  outputResult(options.json ? finalReport : `${renderSetupReport(finalReport)}Default mode: ${finalReport.defaultMode}.\nDispatch route: ${finalReport.dispatch}.\nRoleless default model: ${finalReport.defaultModel.value}/${finalReport.defaultEffort.value} (worker roles are listed above).\nSelected Codex: ${finalReport.codex.executable} (source: ${finalReport.codex.source}).\n`, options.json);
 }
 
 function buildAdversarialReviewPrompt(context, focusText) {
@@ -3449,7 +3449,7 @@ async function handleOrchestrationMode(argv, modeName) {
       : "";
     const defaultLine = defaultMode === "off" ? "" : `default mode: ${defaultMode} (fugato setup --default-mode)\n`;
     const modelLine = personaModels ? `persona models: ${Object.entries(personaModels).map(([id, entry]) => `${id} ${entry.model.value}/${entry.effort.value}`).join(", ")}`
-      : `models: worker ${models.model}/${models.effort}, ultra routine ${models.routineModel}`;
+      : `models: worker roles from fugato models; roleless default ${models.model}/${models.effort}`;
     const roomLine = latestRoom ? `latest room: ${latestRoom.roomId} (${latestRoom.status}, ${latestRoom.intensity}); needs the chair: ${latestRoom.attention.length}; members ${latestRoom.members.map(member => `${member.name}:${member.status} workspace ${member.workspace.path} (${member.workspace.hasChanges === null ? "changes unknown" : member.workspace.hasChanges ? "changed" : "clean"})`).join(", ")}; open items ${latestRoom.counts.openItems}\n` : "";
     const text = `${latestRoom ? renderAttention(latestRoom) : ""}${renderOrchestrationMode(mode, modeName)}\n${modelLine}\n${defaultLine}${roomLine}${preamble}`;
     outputCommandResult(payload, text, options.json);
