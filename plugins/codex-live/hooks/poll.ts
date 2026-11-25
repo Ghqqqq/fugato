@@ -3,7 +3,7 @@ import type { EngineInterface } from 'claude-code';
 import type { CodexLiveJob, CodexLiveMarker, CodexLiveState } from '../types';
 import { ATTENTION_SESSION_LIMIT, attention, boundState, clean, detailedTurns, expireQuestion, fitState, groupedSessions, jobSummary, jobView, markerView, normalizeSessions, oldestJob,
   retainedTurns, sessionForId, sessionId, statusLine, unavailableJob, usageSnapshots, visibleSessions } from './model';
-import { feedLines, paneLayout, normalizeFeed, recentEndedJobIds, selectedJob } from './layout';
+import { feedLines, hasIndexSummary, paneLayout, normalizeFeed, recentEndedJobIds, selectedJob } from './layout';
 import { createForumPoller, forumId, selectedForum } from './forum';
 import { checkedView, publishView, reportFailure, updateFailure, viewports } from './runtime';
 
@@ -13,6 +13,25 @@ const view = atom({ plugin: 'fugato-live', key: 'view' } as const,
 // Charge serialized UTF-16 bytes, including escaping, separately from the
 // published view's character budget. A single oversized read is never cached.
 const PAYLOAD_CACHE_BYTES = 8 * 1024 * 1024;
+const INDEX_READ_BYTES = 4 * 1024 * 1024; // The host's $.fs.read byte ceiling.
+
+async function readIndexJobs($: EngineInterface, path: string, markers: ReadonlyMap<string, Cached>) {
+  const jobs = new Map<string, Record<string, unknown>>();
+  try {
+    const stat = await $.fs.stat(path);
+    if (stat.kind !== 'file' || stat.size > INDEX_READ_BYTES) return jobs;
+    const index = JSON.parse(await $.fs.read(path));
+    if (Array.isArray(index?.jobs)) for (const job of index.jobs) {
+      if (markers.has(job?.id) && typeof job.status === 'string' && job.status.trim()) jobs.set(job.id, job);
+    }
+  } catch { /* Keep the last good view when the index is also unreadable. */ }
+  return jobs;
+}
+
+function staleView(job: CodexLiveJob): CodexLiveJob {
+  return { ...job, detailsUnavailable: true,
+    ...('fromWorkspaceIndex' in job ? { fromWorkspaceIndex: false } : {}) };
+}
 
 type Cached = {
   marker: CodexLiveMarker;
@@ -195,6 +214,7 @@ export function createPoller($: EngineInterface, diagnostics?: {
         lastDiscovery = discovery;
       }
       const newlyActive: string[] = [];
+      const indexes = new Map<string, Awaited<ReturnType<typeof readIndexJobs>>>();
       const recovered = (entry: Cached) => {
         if (jobErrors.delete(entry.job.id)) $.ui.log(`fugato-live: Job ${clean(entry.job.id)} read recovered`, { to: 'debug' });
       };
@@ -204,7 +224,27 @@ export function createPoller($: EngineInterface, diagnostics?: {
           $.ui.log(`fugato-live: Job ${clean(entry.job.id)} unreadable · ${reason}`, { to: 'debug' });
           jobErrors.set(entry.job.id, reason);
         }
-        entry.job = { ...entry.job, detailsUnavailable: true };
+        entry.nextCheck = now + 5000;
+        const indexPath = entry.marker.jobFile.replace(/([/\\])jobs[/\\][^/\\]+$/, '$1state.json');
+        if (indexPath !== entry.marker.jobFile) {
+          if (!indexes.has(indexPath)) indexes.set(indexPath, await readIndexJobs($, indexPath, cache));
+          const indexed = indexes.get(indexPath)!.get(entry.marker.jobId);
+          if (indexed) {
+            if (!belongsHere(indexed, entry)) return;
+            // A task's missing private result normally means its outcome is
+            // unresolved. An index omits that result for every task by design.
+            const job = jobView({ ...indexed, jobClass: undefined },
+              { ...entry.marker, summary: clean(indexed.summary).slice(0, 1000) || entry.marker.summary }, false, now);
+            if (sessionId(entry.job) !== sessionId(job) && previouslyKnown.has(job.id)) joinedThreads.add(job.id);
+            const updated = Date.parse(typeof indexed.updatedAt === 'string' ? indexed.updatedAt : '');
+            const summary = { ...job, fromWorkspaceIndex: true, detailsUnavailable: true,
+              lastUpdateMs: Number.isFinite(updated) ? updated : entry.job.lastUpdateMs };
+            entry.job = summary;
+            entry.missingSince = undefined; entry.removed = false;
+            return;
+          }
+        }
+        entry.job = staleView(entry.job);
         // Two ENOENT observations at least five seconds apart prove removal
         // only while both the session inventory and the jobs parent are readable
         // and that listing no longer names the job file.
@@ -217,7 +257,6 @@ export function createPoller($: EngineInterface, diagnostics?: {
           entry.missingSince ??= now;
         } else entry.missingSince = undefined;
         if (entry.removed) removedJobs.add(entry.job.id);
-        entry.nextCheck = now + 5000;
       };
       const belongsHere = (raw: { sessionId?: unknown } | null, entry: Cached): boolean => {
         const id = entry.marker.jobId;
@@ -263,7 +302,7 @@ export function createPoller($: EngineInterface, diagnostics?: {
       for (const entry of cache.values()) {
         if (foreignJobs.has(entry.job.id) || removedJobs.has(entry.job.id)) continue;
         // Also retry bookkeeping after a rejected state write with unchanged mtime.
-        if (entry.processedMtime !== undefined) {
+        if (entry.processedMtime !== undefined || hasIndexSummary(entry.job)) {
           if (!previouslyKnown.has(entry.job.id) && entry.job.active && !opened.has(entry.job.id)) newlyActive.push(entry.job.id);
           seen.add(entry.job.id);
         }
@@ -289,7 +328,7 @@ export function createPoller($: EngineInterface, diagnostics?: {
         return true;
       }).map(job => ({
         marker: { jobId: job.id, jobFile: '', summary: job.label, title: '', createdAt: job.createdAt },
-        markerName: '', job: { ...jobSummary(job), detailsUnavailable: true },
+        markerName: '', job: staleView(jobSummary(job)),
         full: job.detailsLoaded !== false ? job : undefined, nextCheck: Infinity,
       }));
       // Include evicted summaries when grouping: a follow-up can immediately
@@ -436,7 +475,12 @@ export function createPoller($: EngineInterface, diagnostics?: {
           const detail = details.get(entry.job.id);
           // Identity tokens keep the memo from retaining an evicted full payload.
           sources.push(detail?.source);
-          return detail ? { ...detail.full, homeDir: displayHome || undefined, detailsUnavailable: entry.job.detailsUnavailable, lastUpdateMs: entry.job.lastUpdateMs } : entry.job;
+          if (!detail) return entry.job;
+          // Keep any last readable transcript without restoring its stale header.
+          const full = 'fromWorkspaceIndex' in entry.job ? { ...entry.job, events: detail.full.events,
+            detailsLoaded: detail.full.detailsLoaded, prompt: detail.full.prompt, promptReport: detail.full.promptReport,
+            toolUses: detail.full.toolUses } : detail.full;
+          return { ...full, homeDir: displayHome || undefined, detailsUnavailable: entry.job.detailsUnavailable, lastUpdateMs: entry.job.lastUpdateMs };
         });
         const active = retained.some(session => session.active);
         const stale = jobs.some(job => job.detailsUnavailable);
@@ -503,7 +547,7 @@ export function createPoller($: EngineInterface, diagnostics?: {
       detailedIds = new Set(selected ? detailedTurns(selected).map(job => job.id) : []);
       const retainedIds = new Set(candidate.jobs.map(job => job.id));
       knownJobs.clear();
-      for (const entry of [...cache.values(), ...remembered]) if (!entry.removed && entry.processedMtime !== undefined &&
+      for (const entry of [...cache.values(), ...remembered]) if (!entry.removed && (entry.processedMtime !== undefined || hasIndexSummary(entry.job)) &&
         (retainedIds.has(entry.job.id) || !presentMarkers || presentMarkers.has(entry.markerName))) knownJobs.add(entry.job.id);
       for (const entry of remembered) if (retainedIds.has(entry.job.id)) {
         cache.set(entry.job.id, entry);

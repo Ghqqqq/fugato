@@ -1,0 +1,611 @@
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID, createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
+import { AcpClient } from "./acp-client.mjs";
+import { agentMessageActivity, itemActivity, planActivity, snippet } from "./activity.mjs";
+import { executableOnPath } from "./process.mjs";
+import { resolveIsolatedCodexHome } from "./codex-home.mjs";
+import { acquireConcurrency } from "./concurrency.mjs";
+import { PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
+import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
+
+const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
+export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
+export const ANTIGRAVITY_DEFAULT_EFFORT = "xhigh";
+const LOGIN_HELP = "Run `agy acp --login` (or an interactive `agy` session) to sign in, then retry.";
+const cancelledOutcome = () => ({ outcome: { outcome: "cancelled" } });
+const notStarted = error => Object.assign(error, { turnStatus: "notStarted", turnEnded: true });
+const binary = () => process.env.FUGATO_ANTIGRAVITY_BIN || "agy";
+const INSTALL_HELP = "Install Antigravity CLI, check `agy acp --help`, or set FUGATO_ANTIGRAVITY_BIN to its executable path.";
+// ACP's default mode asks about edits and commands. Edit requests repeat the
+// changed text in the arguments and the diff, so they need more than Codex's 800 bytes.
+const MAX_APPROVAL_BYTES = 16 * 1024;
+const MAX_UNSUPPORTED_BLOCKERS = 8;
+const changedOperation = { code: "operation-changed-before-approval", message: "Antigravity's operation changed or its arguments disagree." };
+
+function denyPermission(options) {
+  const deny = Array.isArray(options) && options.find(value => value?.kind === "reject_once" && typeof value.optionId === "string");
+  return deny ? { outcome: { outcome: "selected", optionId: deny.optionId } } : cancelledOutcome();
+}
+
+export function resolveAntigravityExecutable(cwd) {
+  const command = binary();
+  if (process.platform === "win32") {
+    const name = /[\\/]/.test(command) ? path.win32.resolve(cwd, command) : command;
+    return executableOnPath(name);
+  }
+  if (!command.includes("/")) return executableOnPath(command);
+  const executable = path.isAbsolute(command) ? command : path.resolve(cwd, command);
+  try {
+    fs.accessSync(executable, fs.constants.X_OK);
+    return fs.statSync(executable).isFile() ? executable : null;
+  } catch { return null; }
+}
+
+export function ensureAntigravityAvailable(cwd) {
+  const executable = resolveAntigravityExecutable(cwd);
+  if (!executable) throw notStarted(new Error(`Antigravity executable '${binary()}' was not found or is not executable. ${INSTALL_HELP} ${LOGIN_HELP}`));
+  return executable;
+}
+
+function launchExecutable(cwd, options) {
+  if (options.executable == null) return ensureAntigravityAvailable(options.requestCwd ?? cwd);
+  if (!path.isAbsolute(options.executable)) throw notStarted(new Error("The supplied Antigravity executable must be an absolute path."));
+  return options.executable;
+}
+
+function report(options, message, phase = null, extra = {}) {
+  try { options.onProgress?.({ message, phase, ...extra }); }
+  catch { /* Diagnostics cannot disable cancellation or lose a completed turn. */ }
+}
+
+function authenticationError(error) {
+  if (error.rpcCode === -32000 || /authentication required/i.test(error.message)) {
+    error.message = `Antigravity authentication is required. ${LOGIN_HELP}`;
+  }
+  return error;
+}
+
+async function initialize(client, signal = null) {
+  const result = await client.request("initialize", {
+    protocolVersion: 1,
+    // agy owns its tools. An empty capability set does not restrict its file or
+    // terminal access, and must never be represented as a sandbox guarantee.
+    clientCapabilities: {},
+    clientInfo: { name: "fugato", title: "Fugato", version: manifest.version }
+  }, { signal }).catch(error => {
+    if (!signal?.aborted) error.message += ` ${INSTALL_HELP} ${LOGIN_HELP}`;
+    throw error;
+  });
+  if (result?.protocolVersion !== 1) throw new Error(`Antigravity negotiated unsupported ACP version ${result?.protocolVersion ?? "unknown"}. Fugato supports ACP v1. ${INSTALL_HELP} ${LOGIN_HELP}`);
+  return result;
+}
+
+function supportsOrderedReplay(version) {
+  const match = typeof version === "string" && /^(\d+)\.(\d+)\.(\d+)(-[\w.-]+)?(?:\+[\w.-]+)?$/.exec(version);
+  if (!match) return false;
+  const [, major, minor, patch, prerelease] = match;
+  if (Number(major) !== 1) return Number(major) > 1;
+  if (Number(minor) !== 5) return Number(minor) > 5;
+  return Number(patch) > 15 || (Number(patch) === 15 && !prerelease);
+}
+
+const isGemini = model => typeof model === "string" && model.startsWith("gemini-");
+
+function geminiModelOption(option) {
+  const options = (Array.isArray(option?.options) ? option.options : []).flatMap(choice => {
+    if (!Array.isArray(choice?.options)) return isGemini(choice?.value) ? [choice] : [];
+    const models = choice.options.filter(value => isGemini(value?.value));
+    return models.length ? [{ ...choice, options: models }] : [];
+  });
+  return { ...option, currentValue: isGemini(option?.currentValue) ? option.currentValue : null, options };
+}
+
+function configValues(option) {
+  return Array.isArray(option?.options) ? option.options.flatMap(value => Array.isArray(value?.options) ? value.options : [value])
+    .filter(value => value && typeof value.value === "string") : [];
+}
+function configOption(configOptions, kind) {
+  const options = Array.isArray(configOptions) ? configOptions.filter(option => option?.type === "select") : [];
+  return options.find(option => option.category === kind) ?? options.find(option =>
+    kind === "model" ? option.id === "model" : ["thought_level", "thinking_level", "thinkingLevel", "reasoning_effort"].includes(option.id));
+}
+function configSelection(configOptions, kind) { return configOption(configOptions, kind)?.currentValue ?? null; }
+
+function sessionConfiguration(sessionId = null) {
+  const pending = new Map();
+  return {
+    sessionId, options: [],
+    observe(message) {
+      const params = message.params;
+      if (message.method !== "session/update" || params?.update?.sessionUpdate !== "config_option_update" ||
+          typeof params.sessionId !== "string" || !Array.isArray(params.update.configOptions)) return;
+      if (params.sessionId === this.sessionId) this.options = params.update.configOptions;
+      else if (this.sessionId === null) {
+        // A server may announce configuration before session/new returns its
+        // handle. Keep only a bounded set until that handle binds the session.
+        pending.set(params.sessionId, params.update.configOptions);
+        if (pending.size > 16) pending.delete(pending.keys().next().value);
+      }
+    },
+    accept(response, fresh = false) {
+      if (fresh) {
+        if (typeof response?.sessionId !== "string" || !response.sessionId) throw new Error("Antigravity did not return a session handle.");
+        this.sessionId = response.sessionId;
+        this.options = pending.get(this.sessionId) ?? [];
+        pending.clear();
+      }
+      if (Array.isArray(response?.configOptions)) this.options = response.configOptions;
+    }
+  };
+}
+
+async function setSelection(client, sessionId, configuration, kind, requested, isDefault, signal) {
+  const selector = configOption(configuration.options, kind);
+  const model = kind === "model";
+  if (model && requested && !isGemini(requested)) throw new Error(`Antigravity supports only Gemini models (gemini-*). Cannot select '${requested}'.`);
+  const option = model ? geminiModelOption(selector) : selector;
+  if (!model && !requested) return;
+  if (!option) {
+    if (isDefault) return;
+    throw new Error("Antigravity does not advertise a thinking level selector; leave this option unset to use its configured default.");
+  }
+  const values = configValues(option);
+  let selected = values.find(value => value.value === requested);
+  // Thinking labels may be title-cased while their IDs are opaque.
+  if (!selected && !model) selected = values.find(value => String(value.name).toLowerCase() === String(requested).toLowerCase());
+  if (!selected && (isDefault || !requested)) {
+    if (!model || option.currentValue) return option.currentValue;
+    selected = values[0];
+    if (!selected) throw new Error("Antigravity did not advertise a Gemini model for this account.");
+  }
+  if (!selected) throw new Error(`Unsupported Antigravity ${model ? "model" : "thinking level"} '${requested}'. Available values: ${values.map(value => value.value).join(", ") || "none"}.`);
+  if (option.currentValue === selected.value) return selected.value;
+  await client.request("session/set_config_option", { sessionId, configId: option.id, value: selected.value }, { signal, onResponse: result => {
+    if (!Array.isArray(result?.configOptions)) throw new Error("Antigravity did not return its updated session configuration.");
+    if (!result.configOptions.some(value => value.id === option.id && value.currentValue === selected.value)) throw new Error("Antigravity did not acknowledge the requested session configuration.");
+    configuration.accept(result);
+  } });
+  return selected.value;
+}
+
+function parentBridgeServers(cwd, options) {
+  const bridge = options.parentBridge;
+  if (!bridge) return [];
+  const threadId = options.resumeThreadId ?? bridge.threadId;
+  const jobId = options.jobId ?? bridge.jobId;
+  if (!threadId && !jobId) throw new Error("Antigravity parent bridge requires a Fugato job or session handle.");
+  const env = { [PARENT_BRIDGE_ENV.cwd]: bridge.cwd ?? cwd, CODEX_COMPANION_BRIDGE_BACKEND: "antigravity",
+    ...(jobId ? { [PARENT_BRIDGE_ENV.jobId]: jobId } : { [PARENT_BRIDGE_ENV.threadId]: threadId }),
+    CODEX_COMPANION_HOME: resolveIsolatedCodexHome(), ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
+  return [{ name: PARENT_BRIDGE_SERVER, command: process.execPath,
+    args: [fileURLToPath(new URL("../parent-bridge-mcp.mjs", import.meta.url))],
+    env: Object.entries(env).map(([name, value]) => ({ name, value: String(value) })) }];
+}
+
+function promptContent(options) {
+  const prompt = options.prompt?.trim() || options.defaultPrompt?.trim();
+  if (!prompt) throw new Error("A prompt is required for an Antigravity run.");
+  const content = [];
+  // ACP v1 has no portable developer-role or outputSchema field. Forward
+  // Fugato's instructions as explicit task context; its existing report parser
+  // validates the final response instead of claiming server-enforced output.
+  if (options.developerInstructions) content.push({ type: "text", text: `[Fugato task instructions]\n${options.developerInstructions}` });
+  content.push({ type: "text", text: prompt });
+  if (options.outputSchema) content.push({ type: "text", text: `Return the final answer as one JSON object matching this schema. Do not surround the object with prose or Markdown fences.\n${JSON.stringify(options.outputSchema)}` });
+  return content;
+}
+
+function escapeApprovalControls(json) {
+  // JSON quotes C0 controls. Also quote format controls (including bidi),
+  // C1 controls and Unicode line separators so each field stays on one line.
+  return json.replace(/[\p{Cf}\u007f-\u009f\u2028\u2029]/gu, char =>
+    char.split("").map(unit => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""));
+}
+
+function inputCommand(input) {
+  return [input?.CommandLine, input?.command, input].find(value => typeof value === "string" && value.trim());
+}
+
+function permissionReview(tool) {
+  if (typeof tool?.toolCallId !== "string" || !tool.toolCallId.trim()) return null;
+  const input = tool.rawInput;
+  const fields = [["Tool call ID", tool.toolCallId], ["Name", tool.name], ["Kind", tool.kind],
+    ["Agent description", tool.title], ["Locations", tool.locations], ["Arguments", input], ["Operation details", tool.content]]
+    .filter(([, value]) => value != null);
+  const tooLarge = { code: "operation-too-large-to-display-exactly", message: "Antigravity's operation exceeds the approval display limit." };
+  try {
+    if (!isDeepStrictEqual(input, tool.args)) return changedOperation;
+    // Permission requires executable text in the input. A title is descriptive.
+    if ((tool.kind === "execute" || tool.name === "run_command") && !inputCommand(input)) {
+      return { code: "missing-command-line", message: "Antigravity requested execution without a command line." };
+    }
+    const hasInput = typeof input === "string" ? Boolean(input.trim()) : input != null &&
+      (typeof input !== "object" || Object.keys(input).length > 0);
+    const hasDiff = toolDiffs(tool).some(diff => typeof diff.oldText === "string" || typeof diff.newText === "string");
+    if (!hasInput && !hasDiff) return null;
+    const lines = ["Antigravity requests permission."];
+    for (const [label, value] of fields) {
+      const json = JSON.stringify(value);
+      if (json.length > MAX_APPROVAL_BYTES) return tooLarge;
+      lines.push(`${label}: ${escapeApprovalControls(json)}`);
+    }
+    lines.push("Allow this operation once?");
+    const question = lines.join("\n");
+    if (Buffer.byteLength(JSON.stringify(question)) <= MAX_APPROVAL_BYTES) return { question, fields: structuredClone(fields) };
+  } catch (error) {
+    // A deeply nested JSON value can exceed the serializer's stack limit.
+    if (!(error instanceof RangeError)) throw error;
+  }
+  return tooLarge;
+}
+
+async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call) {
+  const choices = Array.isArray(params.options) ? params.options : [];
+  const allow = choices.find(value => value?.kind === "allow_once" && typeof value.optionId === "string");
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  for (const signal of [turnSignal, requestSignal]) signal?.addEventListener("abort", abort, { once: true });
+  let onCancelled;
+  try {
+    if (turnSignal.aborted || requestSignal.aborted) {
+      if (call) call.permission = "denied";
+      return cancelledOutcome();
+    }
+    let answer = "deny";
+    let review = call && binding.turnId && allow ? permissionReview(call.tool) : null;
+    if (review?.question && options.onApprovalRequest) {
+      const request = { kind: "acp-permission", question: review.question, options: ["Allow once", "Deny"],
+        binding: { ...binding }, signal: controller.signal, toolCall: call.tool };
+      answer = await Promise.race([
+        Promise.resolve().then(() => options.onApprovalRequest(request)).catch(() => "deny"),
+        new Promise(resolve => { onCancelled = () => resolve("deny"); controller.signal.addEventListener("abort", onCancelled, { once: true }); })
+      ]);
+      // Bind the answer to the displayed values. Status updates and JSON
+      // object key order do not change the operation.
+      if (!controller.signal.aborted && !isDeepStrictEqual(permissionReview(call.tool)?.fields, review.fields)) {
+        review = changedOperation;
+        answer = "deny";
+      }
+    }
+    if (controller.signal.aborted) {
+      if (call) call.permission = "denied";
+      return cancelledOutcome();
+    }
+    if (answer === "once" && allow) {
+      if (call.permission !== "denied") call.permission = "approved";
+      return { outcome: { outcome: "selected", optionId: allow.optionId } };
+    }
+    if (call) call.permission = "denied";
+    blockers.push({ code: review?.code ?? "approval_denied", message: review?.message ?? "Antigravity tool permission was denied or could not be forwarded.",
+      method: "session/request_permission", kind: "acp-permission" });
+    return denyPermission(choices);
+  } finally {
+    for (const signal of [turnSignal, requestSignal]) signal?.removeEventListener("abort", abort);
+    if (onCancelled) controller.signal.removeEventListener("abort", onCancelled);
+    controller.abort();
+  }
+}
+
+function observeTool(tools, update) {
+  const call = tools.get(update.toolCallId) ?? { tool: {}, diffs: [], permission: null };
+  const tool = { ...call.tool, ...update };
+  // agy sends args as a copy of rawInput. Either field in this frame takes
+  // precedence over both cached copies. Keep conflicting copies for review.
+  if (Object.hasOwn(update, "rawInput") || Object.hasOwn(update, "args")) {
+    tool.rawInput = Object.hasOwn(update, "rawInput") ? update.rawInput : update.args;
+    tool.args = Object.hasOwn(update, "args") ? update.args : update.rawInput;
+  }
+  const diffs = toolDiffs(update);
+  if (diffs.length) call.diffs = diffs;
+  else if (call.diffs.length && ["rawInput", "args", "locations"].some(field => !isDeepStrictEqual(tool[field], call.tool[field]))) {
+    call.diffs = [];
+    // A partial update can also inherit the previous proposal's diff blocks.
+    if (Array.isArray(tool.content)) tool.content = tool.content.filter(block => block?.type !== "diff");
+  }
+  call.tool = tool;
+  tools.set(update.toolCallId, call);
+  return call;
+}
+
+function commandResult(tool) {
+  const raw = tool.rawOutput;
+  const output = typeof raw === "string" ? raw : raw?.stdout ?? raw?.text ?? null;
+  const exitCode = raw?.exitCode ?? raw?.exit_code ?? null;
+  const command = inputCommand(tool.rawInput) ?? (tool.kind === "execute" && typeof tool.title === "string" && tool.title.trim() ? tool.title : null);
+  return { id: tool.toolCallId, type: "commandExecution", command,
+    title: typeof tool.title === "string" ? tool.title : null,
+    status: tool.status === "completed" ? "completed" : tool.status === "failed" ? "failed" : "inProgress",
+    exitCode: Number.isInteger(exitCode) ? exitCode : null, aggregatedOutput: output, durationMs: null };
+}
+
+function failedPermissionCheck(tool) {
+  if (tool.status !== "failed") return false;
+  const content = Array.isArray(tool.content) ? tool.content.map(block => block?.content?.text) : [];
+  return [tool.rawOutput, ...content].some(text => typeof text === "string" &&
+    /^(?:permission check failed\b[\s\S]*?:\s*)?user denied permission to run command\b/i.test(text));
+}
+
+function promptUsage(raw) {
+  const fields = { inputTokens: raw?.inputTokens, cachedInputTokens: raw?.cachedReadTokens,
+    outputTokens: raw?.outputTokens, reasoningOutputTokens: raw?.thoughtTokens, totalTokens: raw?.totalTokens };
+  const validCount = count => Number.isSafeInteger(count) && count >= 0;
+  if (validCount(fields.inputTokens)) {
+    for (const cached of [raw.cachedReadTokens, raw.cachedWriteTokens]) {
+      if (validCount(cached)) fields.inputTokens += cached;
+    }
+  }
+  const counts = Object.entries(fields).filter(([, count]) => validCount(count));
+  return counts.length ? Object.fromEntries(counts) : null;
+}
+
+function acquireSessionAdmission(threadId) {
+  const directory = path.join(resolveIsolatedCodexHome(), "duet", "antigravity-session-admission");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const release = tryAcquirePidLock(path.join(directory, `${createHash("sha256").update(threadId).digest("hex")}.lock`));
+  if (!release) throw notStarted(new Error(`Antigravity session ${threadId} already has a Fugato run in progress.`));
+  return release;
+}
+
+const fileChangeKinds = new Set(["edit", "delete", "move"]);
+function toolDiffs(tool) {
+  return Array.isArray(tool.content) ? tool.content.filter(value => value?.type === "diff" && typeof value.path === "string" && value.path) : [];
+}
+function changedPaths(tool, diffs = toolDiffs(tool)) {
+  // Locations can include read dependencies. A diff identifies the changed
+  // paths directly. Without one, only a file-changing kind attests to edits.
+  const locations = fileChangeKinds.has(tool.kind) && Array.isArray(tool.locations) ? tool.locations : [];
+  return [...new Set((diffs.length ? diffs : locations).map(value => value?.path).filter(value => typeof value === "string" && value))];
+}
+
+function toolActivityItem(tool, diffs) {
+  const status = tool.status === "in_progress" || tool.status === "pending" ? "inProgress" : tool.status;
+  if (tool.kind === "execute") {
+    const command = commandResult(tool);
+    if (command.command !== null) return command;
+  }
+  if (fileChangeKinds.has(tool.kind) || diffs.length) {
+    return { type: "fileChange", id: tool.toolCallId, status, changes: changedPaths(tool, diffs).map(file => {
+      const diff = diffs.find(value => value.path === file);
+      return { path: file, kind: tool.kind === "delete" ? "delete" : diff?.oldText === null ? "add" : tool.kind === "edit" || diff ? "update" : "unknown",
+        ...(diff?.oldText === null && typeof diff.newText === "string" ? { content: diff.newText } : {}) };
+    }) };
+  }
+  return { type: "dynamicToolCall", id: tool.toolCallId, status, tool: tool.name ?? tool.title ?? tool.kind ?? "Antigravity tool" };
+}
+
+export async function listAntigravityModels(cwd, options = {}) {
+  const executable = launchExecutable(cwd, options);
+  const configuration = sessionConfiguration();
+  const client = new AcpClient(executable, path.resolve(cwd), { onNotification: message => configuration.observe(message) });
+  try {
+    await initialize(client);
+    await client.request("session/new", { cwd: path.resolve(cwd), mcpServers: [] }, { onResponse: response => configuration.accept(response, true) });
+    const model = configOption(configuration.options, "model"), thinking = configOption(configuration.options, "thought_level");
+    const supported = geminiModelOption(model);
+    const models = configValues(supported);
+    if (!models.length) throw new Error("Antigravity did not advertise a Gemini model for this account.");
+    return { provider: "antigravity", data: models.map(option => ({ id: option.value, model: option.value,
+      displayName: option.name ?? option.value, description: option.description ?? "", isDefault: option.value === model.currentValue,
+      // Only the selected model's effort options have been observed. Changing
+      // models can change this list, so avoid advertising invented support.
+      supportedReasoningEfforts: option.value === model.currentValue ? configValues(thinking).map(value => ({ reasoningEffort: value.value, description: value.name ?? value.value })) : [],
+      defaultReasoningEffort: option.value === model.currentValue ? thinking?.currentValue ?? null : null })),
+      configOptions: configuration.options.map(option => option === model ? supported : option) };
+  } catch (error) { throw authenticationError(error); }
+  finally { await client.close(); }
+}
+
+export async function runAntigravityTurn(cwd, options = {}) {
+  const executionCwd = path.resolve(options.executionCwd ?? cwd);
+  const content = promptContent(options);
+  if (options.sandbox && options.sandbox !== "danger-full-access") throw notStarted(new Error("Antigravity ACP does not implement Fugato's Codex sandbox modes. Select danger-full-access explicitly; Antigravity's own permission rules still apply."));
+  if (options.signal?.aborted) throw notStarted(new Error("Antigravity task interrupted before startup."));
+  const executable = launchExecutable(cwd, options);
+  const reservation = await acquireConcurrency({ jobFile: options.jobId ? resolveJobFile(cwd, options.jobId) : null, signal: options.signal,
+    onQueued: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "queued", phase: "queued (concurrency limit)" })); report(options, "Queued (concurrency limit).", "queued (concurrency limit)"); },
+    onAdmitted: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "running", phase: "starting" })); } });
+  let client, releaseAdmission, submitted = false, cleanupConfirmed = false;
+  let threadId = options.resumeThreadId ?? null, turnId = null;
+  const configuration = sessionConfiguration(threadId);
+  let capture = false, finalMessage = "", messageId = null, toolSinceChunk = false, thought = "", acpUsage = null;
+  let model, effort, usage;
+  let turnEnded = false, stopReason = null, failure = null, promptPromise = null, cancellationTimer = null;
+  let cancelRequested = false, resolveCancelTimeout;
+  const cancellationTimeout = new Promise(resolve => { resolveCancelTimeout = resolve; });
+  const turnAbort = new AbortController(), tools = new Map(), blockers = [];
+  let unsupportedBlockers = 0;
+  const activityStarts = new Map(), activityLifecycles = new Map(), activityDescriptors = new Map();
+  // Named messages can resume until the turn ends. Keep pending messages
+  // in last-chunk order so a resumed final report follows intervening prose.
+  const messages = new Map();
+  const publishMessage = text => {
+    if (!text) return;
+    const activity = agentMessageActivity(text, "antigravity");
+    report(options, "Antigravity message captured.", "working", { activity });
+  };
+  const publishAnonymous = () => {
+    if (typeof messageId === "symbol" && messages.size === 1) {
+      publishMessage(messages.get(messageId));
+      messages.delete(messageId);
+    }
+  };
+  const persist = patch => { if (options.jobId) updateJob(cwd, options.jobId, () => patch); };
+  const abort = () => {
+    cancelRequested = true;
+    turnAbort.abort();
+    if (!submitted || !threadId || !client) return;
+    try {
+      client.cancelPermissionRequests(threadId);
+      client.notify("session/cancel", { sessionId: threadId });
+    } catch { /* Cleanup still runs if the pipe closed. */ }
+    if (!cancellationTimer) cancellationTimer = setTimeout(() => resolveCancelTimeout({ cancelledWithoutAck: true }), options.cancelTimeoutMs ?? 2000);
+  };
+  try {
+    if (threadId) {
+      releaseAdmission = acquireSessionAdmission(threadId);
+    }
+    client = new AcpClient(executable, executionCwd, {
+      timeoutMs: options.connectTimeoutMs ?? 30000,
+      onRequest: (message, signal) => {
+        if (message.method === "session/request_permission") {
+          const params = message.params ?? {}, partial = params.toolCall;
+          if (!capture) return denyPermission(params.options);
+          // ACP permits ToolCallUpdate here, including only toolCallId. Merge
+          // with this session's observed call so approval shows its real scope.
+          const call = params.sessionId === threadId && typeof partial?.toolCallId === "string" ? observeTool(tools, partial) : null;
+          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call);
+        }
+        if (unsupportedBlockers < MAX_UNSUPPORTED_BLOCKERS) {
+          const method = `unrecognized:${createHash("sha256").update(message.method).digest("hex").slice(0, 16)}`;
+          blockers.push({ code: "approval_unsupported", message: "Antigravity requested an unsupported client method.", method });
+          unsupportedBlockers++;
+        }
+        throw Object.assign(new Error("Method not found"), { rpcCode: -32601 });
+      },
+      onNotification: message => {
+        configuration.observe(message);
+        if (message.method !== "session/update" || message.params?.sessionId !== threadId) return;
+        const update = message.params.update;
+        if (!update || typeof update.sessionUpdate !== "string") return;
+        if (!capture) return; // agy 1.5.15+ finishes history replay before the load reply.
+        switch (update.sessionUpdate) {
+          case "agent_message_chunk": {
+            if (update.content?.type !== "text" || typeof update.content.text !== "string" || !update.content.text) break;
+            const id = update.messageId ?? (toolSinceChunk || messageId == null ? Symbol() : messageId);
+            if (id !== messageId) publishAnonymous();
+            messageId = id;
+            toolSinceChunk = false;
+            finalMessage = (messages.get(id) ?? "") + update.content.text;
+            messages.delete(id);
+            messages.set(id, finalMessage);
+            report(options, "Antigravity response received.", "working", { logTitle: "Antigravity message", logBody: update.content.text });
+            break;
+          }
+          case "agent_thought_chunk":
+            if (update.content?.type === "text" && typeof update.content.text === "string") thought += update.content.text;
+            break;
+          case "tool_call":
+          case "tool_call_update":
+            if (typeof update.toolCallId !== "string") break;
+            {
+            const { tool, diffs } = observeTool(tools, update);
+            const lifecycle = ["completed", "failed", "cancelled"].includes(tool.status) ? "completed" : "started";
+            if (activityLifecycles.get(tool.toolCallId) === lifecycle || activityLifecycles.get(tool.toolCallId) === "completed") break;
+            activityLifecycles.set(tool.toolCallId, lifecycle);
+            toolSinceChunk = true;
+            publishAnonymous();
+            let item = toolActivityItem(tool, diffs);
+            const descriptor = activityDescriptors.get(tool.toolCallId);
+            // Keep a metadata-only start paired with its completion even if
+            // later updates add a command. The full result retains that data.
+            if (descriptor?.type === "dynamicToolCall") item = { ...descriptor, status: item.status };
+            activityDescriptors.set(tool.toolCallId, item);
+            const activity = itemActivity(item, lifecycle, activityStarts, tool.toolCallId);
+            report(options, "Antigravity tool activity recorded.", "working", {
+              item: { type: item.type, summary: "Antigravity tool", lifecycle, callId: tool.toolCallId, title: snippet(tool.title ?? tool.name ?? tool.kind ?? "Tool", 160) }, activity
+            });
+            }
+            break;
+          case "plan": report(options, "Antigravity plan updated.", "planning", { activity: planActivity((Array.isArray(update.entries) ? update.entries : [])
+            .map(entry => ({ step: entry.content, status: entry.status === "in_progress" ? "inProgress" : entry.status }))) }); break;
+          case "usage_update": acpUsage = { used: update.used, size: update.size, ...(update.cost ? { cost: update.cost } : {}) }; break;
+        }
+      }
+    });
+    persist({ acpProcessPid: client.pid, acpProcessGroup: true, acpProcessExited: false });
+    options.signal?.addEventListener("abort", abort, { once: true });
+    const initialized = await initialize(client, options.signal);
+    const params = { cwd: executionCwd, mcpServers: parentBridgeServers(cwd, options) };
+    if (threadId) {
+      if (initialized.agentCapabilities?.loadSession !== true) throw new Error("This Antigravity runtime does not support loading sessions; start a new task instead of continuing this one.");
+      const version = initialized.agentInfo?.version;
+      if (!supportsOrderedReplay(version)) throw new Error(`Antigravity continuation requires agy 1.5.15 or newer to finish history replay before a new turn. The server reported version ${version ?? "unknown"}.`);
+      await client.request("session/load", { ...params, sessionId: threadId }, { signal: options.signal, onResponse: response => configuration.accept(response) });
+    } else {
+      await client.request("session/new", params, { signal: options.signal, onResponse: response => {
+        configuration.accept(response, true);
+        threadId = configuration.sessionId;
+      } });
+      // A fresh run must guard its session too: an explicit continuation can
+      // arrive as soon as its first live handle is published.
+      releaseAdmission = acquireSessionAdmission(threadId);
+    }
+    const selectedModel = await setSelection(client, threadId, configuration, "model", options.model, options.modelDefault, options.signal);
+    await setSelection(client, threadId, configuration, "thought_level", options.effort, options.effortDefault, options.signal);
+    model = configSelection(configuration.options, "model");
+    effort = configSelection(configuration.options, "thought_level");
+    if (!isGemini(model) || selectedModel !== model) throw new Error("Antigravity did not confirm the selected Gemini model before prompt submission.");
+    if (options.signal?.aborted) throw new Error("Antigravity task interrupted before prompt submission.");
+    turnId = `acp-${randomUUID()}`;
+    persist({ threadId, turnId, selectedModel: model, selectedEffort: effort, turnSubmission: { at: new Date().toISOString(), transport: "acp-stdio", threadId } });
+    reservation.submitted();
+    submitted = true; capture = true;
+    promptPromise = client.request("session/prompt", { sessionId: threadId, prompt: content }, { timeoutMs: 0 });
+    // Both outcomes are wrapped immediately so a cancellation timeout cannot
+    // leave a later transport rejection unhandled.
+    const settled = promptPromise.then(result => ({ result }), error => ({ error }));
+    report(options, `Antigravity session ready (${threadId}).`, "starting", { threadId, turnId });
+    const outcome = await Promise.race([settled, cancellationTimeout]);
+    if (outcome.cancelledWithoutAck) {
+      failure = new Error("Antigravity did not acknowledge cancellation; its owned process was stopped.");
+    } else if (outcome.error) {
+      failure = authenticationError(outcome.error);
+      turnEnded = outcome.error.code === "ACP_RPC_ERROR";
+    } else {
+      stopReason = outcome.result?.stopReason;
+      usage = promptUsage(outcome.result?.usage);
+      if (!["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"].includes(stopReason)) failure = new Error(`Antigravity returned an invalid stop reason: ${String(stopReason)}.`);
+      else turnEnded = true;
+      if (stopReason === "refusal") blockers.push({ code: "agent_refusal", message: "Antigravity refused to continue the task." });
+      if (["max_tokens", "max_turn_requests"].includes(stopReason)) blockers.push({ code: "agent_limit", message: `Antigravity stopped because of ${stopReason}.` });
+    }
+  } catch (error) {
+    failure = authenticationError(error);
+    if (!submitted) throw notStarted(failure);
+  } finally {
+    capture = false; turnAbort.abort();
+    for (const text of messages.values()) publishMessage(text);
+    clearTimeout(cancellationTimer);
+    options.signal?.removeEventListener("abort", abort);
+    try {
+      if (client) {
+        const { exited } = await client.close();
+        cleanupConfirmed = exited;
+        if (exited) persist({ acpProcessExited: true });
+      }
+    } finally {
+      releaseAdmission?.();
+      // Unlike the shared Codex broker, each ACP process belongs to this run.
+      // Confirmed process cleanup releases its slot even without a cancel ACK.
+      if (!submitted || cleanupConfirmed) reservation.release();
+    }
+  }
+  const fileChanges = [], commandExecutions = [];
+  // Proposed diffs can accompany pending or denied operations. Only completed
+  // tool events confirm edits; workspace snapshots detect any partial writes
+  // from failed operations independently.
+  for (const { tool, diffs, permission } of tools.values()) {
+    if (tool.status === "completed" && (fileChangeKinds.has(tool.kind) || diffs.length)) {
+      const otherContent = Array.isArray(tool.content) ? tool.content.filter(block => block?.type !== "diff") : [];
+      fileChanges.push(diffs.length ? { ...tool, content: [...diffs, ...otherContent] } : tool);
+    }
+    if (tool.kind !== "execute" || permission === "denied") continue;
+    if (permission !== "approved" && failedPermissionCheck(tool)) {
+      blockers.push({ code: "approval_denied", message: "Antigravity denied permission to run the command.", method: "session/request_permission", kind: "acp-permission" });
+    } else commandExecutions.push(commandResult(tool));
+  }
+  const touchedFiles = [...new Set(fileChanges.flatMap(tool => changedPaths(tool)))];
+  const status = failure || ["cancelled", "max_tokens", "max_turn_requests"].includes(stopReason) ? 1 : 0;
+  const turnStatus = stopReason === "cancelled" || cancelRequested ? "interrupted" : status ? "failed" : "completed";
+  return { provider: "antigravity", status, threadId, turnId, finalMessage, reasoningSummary: thought ? [thought] : [],
+    turn: { id: turnId, status: turnStatus, error: failure ? { message: failure.message } : null },
+    turnStatus, turnEnded, stopReason, turnInterruptAttempted: cancelRequested && submitted,
+    interruptionConfirmed: stopReason === "cancelled", acpProcessExited: cleanupConfirmed,
+    sandbox: "danger-full-access", approvalPolicy: options.onApprovalRequest ? "antigravity-rules+parent-once" : "antigravity-rules+deny",
+    model, effort, ...(usage ? { usage } : {}),
+    fileChanges, touchedFiles, commandExecutions,
+    blockers, error: failure ? { message: failure.message } : null, stderr: client?.stderr ?? "", acpUsage };
+}

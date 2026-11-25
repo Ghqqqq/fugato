@@ -2,6 +2,38 @@
 
 Slash commands and companion subcommands. Back to the [README](../README.md).
 
+## Google workers
+
+Install Antigravity CLI and sign in once with `agy acp --login` or an interactive
+`agy` session. Continuations require agy 1.5.15 or later.
+[Terms and sign-in](antigravity.md#terms-and-sign-in) · [Setup](antigravity.md#set-up)
+
+| Command | Use |
+| --- | --- |
+| `fugato setup --backend antigravity` | Check ACP and the cached login without sending a model prompt. |
+| `fugato models --backend antigravity` | List the account's `gemini-*` models. Only the current model has thinking levels listed. |
+| `fugato task --backend antigravity` | Start a full-access Gemini worker with the brief on stdin. |
+| `fugato task --to <jobId>` or `fugato task --continue <jobId>` | Continue the selected job on its recorded backend. |
+| `fugato task-resume-candidate --backend antigravity` | Find the latest resumable Gemini task. |
+| `fugato task --resume-last --backend antigravity` | Continue the latest eligible Gemini task with the brief on stdin. |
+
+Bare `--resume-last` and `task-resume-candidate` select Codex jobs. For a
+Gemini job, `fugato result <jobId> --details` includes per-turn tokens when
+agy supplies them. Use `--max-minutes` to bound running time. Gemini tasks
+refuse an explicit `--max-tokens` limit and ignore the saved default token
+limit because agy reports usage at the end of the turn.
+[Companion CLI](../plugins/codex/scripts/codex-companion.mjs)
+
+Native dispatch uses `fugato:gemini-native`. A running turn refuses
+`SendMessage`. For a `needs_answer` report, follow its `next` field. Send
+`Answer <questionId>` on the first line, using the displayed ID, then the
+answer body on the following lines. A permission answer must be exactly
+`Allow once` or `Deny`. An ordinary answer accepts up to 8,000 characters
+of free text. Fugato checks the job's pending question and refuses missing,
+stale or mismatched IDs without starting work. After the turn finishes,
+send a plain brief for the next assignment.
+[Native worker messaging](antigravity.md#start-a-native-worker-in-claude-code)
+
 ## Slash commands
 
 The Claude Code plugins are `fugato` and optional `fugato-live`. For an older
@@ -507,8 +539,8 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | `fugato task --cwd <repo>/sub` | Start or resume the Codex thread in that subdirectory; broker/job state remains at the repository root |
 | `fugato task --run <id\|none>` | Override journal linkage for this dispatch only; select an open run across workspaces or skip linking with `none`; follow-ups do not inherit it |
 | `fugato task --to <worker>` | New turn on that worker's thread/cwd, inheriting recorded settings unless overridden |
-| `fugato task --fork` | Import the current Claude transcript into a new thread, then run the stdin brief; fidelity not verified |
-| `fugato task --max-minutes <n> --max-tokens <n>` | Per-turn running-time/token budgets; either flag can be used alone |
+| `fugato task --fork` | Import the current Claude transcript into a new Codex thread, then run the stdin brief. Import fidelity is unverified. |
+| `fugato task --max-minutes <n>` | Set a per-turn running-time budget for either backend. Codex also accepts `--max-tokens <n>` alone or with `--max-minutes`. |
 | `fugato answer <worker> --question '<questionId>'` | Answer the displayed question ID from stdin and keep waiting; prefer the report's `next` verbatim |
 | `fugato wait <worker>` | Attach the sole owner wait and renew its lease |
 | `fugato result <worker>` | Retrieve report v2 if missing from the completion notification |

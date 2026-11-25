@@ -61,6 +61,7 @@ import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 import { classifyRuntimeError } from "./runtime-errors.mjs";
 import { computerUseSetup, computerUseSessionFile, grantComputerAppsForThread, readTomlField, setTomlField } from "./setup-config.mjs";
+import { jobBackend } from "./backends.mjs";
 import { withJournalLock, tryAcquirePidLock, updateJob, unresolvedTask, resolveJobFile } from "./state.mjs";
 import { APPROVAL_CHOICES } from "./server-requests.mjs";
 import { mappedSandboxConfig, mappedSandboxPolicy } from "./permission-policy.mjs";
@@ -1861,7 +1862,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       };
       return { status: 0, threadId, turnId: null, finalMessage: blocker.message, blockers: [blocker], turnEnded: true };
     };
-    const recordedJobs = () => recordedThreadJobs(threadId).jobs.filter(job => job.id !== options.jobId);
+    const recordedJobs = () => recordedThreadJobs(threadId).jobs.filter(job => job.id !== options.jobId && jobBackend(job) === "codex");
     const recordedTurns = jobs => jobs.filter(job =>
       job.turnId && (ACTIVE.has(job.status) || unresolvedTask(job))).map(job => job.turnId);
     try {
@@ -2031,7 +2032,7 @@ export async function readAppServerTurn(cwd, job, { admittingJobId = null, env =
       // A dead wrapper may have stopped before turn/start, or after sending it
       // but before saving its reply. Never infer absence from an unreadable list.
       if (response.thread?.id !== threadId || !Array.isArray(response.thread.turns)) return null;
-      const inventory = recordedThreadJobs(threadId);
+      const inventory = recordedThreadJobs(threadId, "codex");
       if (!inventory.complete) return null;
       // Recovered jobs written before turn handles were published keep theirs in recovery.
       const owned = new Set(inventory.jobs.filter(candidate => candidate.id !== job.id || candidate.workspaceRoot !== job.workspaceRoot)

@@ -89,7 +89,8 @@ export async function handoffSteering(cwd, jobId, { deliveryId, text, sessionId,
     if (inbox.deliveries.length >= MAX_DELIVERIES) return { changed: false,
       value: receipt(jobId, { deliveryId, status: "failed", reason: "inbox_full" }) };
     const row = { deliveryId, text, at: now(), status: "queued", sessionId, ownerId: job.ownerId };
-    if (job.request?.permissionPolicy) finish(row, "deferred", "permission_mapping");
+    if (job.request?.backend === "antigravity") finish(row, "deferred", "backend_unsupported");
+    else if (job.request?.permissionPolicy) finish(row, "deferred", "permission_mapping");
     else if (pendingQuestion(job)) finish(row, "deferred", "pending_question");
     else if (!ACTIVE.has(job.status) || !job.threadId || !job.turnId) finish(row, "deferred", "no_active_turn");
     inbox.deliveries.push(row);

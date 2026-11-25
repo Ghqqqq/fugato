@@ -132,6 +132,7 @@ export function approveDuet(input, env = process.env) {
       const value = inlineValue ?? args[++i];
       if (!value || value.startsWith("-") || !value.trim()) return {};
       if (["to", "thread", "continue"].includes(name) && !target(value)) return {};
+      if (name === "backend" && !["codex", "antigravity"].includes(value)) return {};
       if (name === "model" && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(normalizeRequestedModel(value))) return {};
       if (name === "session" && value !== input.session_id) return {};
       if (name === "effort" && !isSupportedReasoningEffort(value, env)) return {};
@@ -166,7 +167,7 @@ export function approveDuet(input, env = process.env) {
   if ((flags.has("fast") && flags.has("normal")) || ["to", "thread", "fresh"].filter(key => flags.has(key)).length > 1) return {};
   if (flags.get("fork") && ["to", "thread", "continue", "resume", "resume-last"].some(key => flags.has(key))) return {};
   if (flags.has("source") && !flags.get("fork")) return {};
-  if (flags.has("continue") && ["to", "thread", "fresh", "resume", "resume-last", "sandbox", "model", "effort", "fast", "normal"].some(key => flags.has(key))) return {};
+  if (flags.has("continue") && ["backend", "to", "thread", "fresh", "resume", "resume-last", "sandbox", "model", "effort", "fast", "normal"].some(key => flags.has(key))) return {};
   if (flags.has("help") && (heredoc || [...flags.keys()].some(key => !["help", "session", "cwd"].includes(key)))) return {};
   if (executable === launcherName && !trustedLauncher(env, input.cwd, launcherName)) return {};
   // Re-emit validated words literally: unquoted arguments (including our own

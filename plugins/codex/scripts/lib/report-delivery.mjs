@@ -15,7 +15,7 @@ const object = value => value !== null && typeof value === "object" && !Array.is
 const strings = value => Array.isArray(value) && value.every(item => typeof item === "string");
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const nullableString = value => value === null || typeof value === "string";
-const fields = new Set(["status", "worker", "jobId", "summary", "summaryTruncated", "blockers", "question", "changedFiles", "changedFilesOmitted", "changedFilesShared", "changedFilesNote", "checks", "assumptions", "keyFindings", "usage", "next", "details"]);
+const fields = new Set(["status", "worker", "jobId", "backend", "provider", "model", "summary", "summaryTruncated", "blockers", "question", "changedFiles", "changedFilesOmitted", "changedFilesShared", "changedFilesNote", "checks", "assumptions", "keyFindings", "usage", "next", "details"]);
 const usageFields = ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"];
 const terminal = new Set(["completed", "needs_input", "blocked", "failed", "cancelled", "interrupted", "owner_stopped", "error"]);
 const noticeLimit = 5, graceMs = 10000;
@@ -200,6 +200,9 @@ export function isC2Report(value) {
       || !["completed", "needs_input", "blocked", "failed", "cancelled", "queued", "running", "needs_answer", "ownership_moved", "interrupted", "owner_stopped", "error", "unknown", "unreachable"].includes(value.status)
       || !id(value.jobId) || !nullableString(value.worker) || typeof value.summary !== "string" || value.summary.length > 8000
       || !nullableString(value.next) || !nullableString(value.details)) return false;
+  if (("backend" in value && value.backend !== "antigravity")
+      || ("provider" in value && (value.backend !== "antigravity" || value.provider !== "Google Antigravity"))
+      || ("model" in value && (value.backend !== "antigravity" || typeof value.model !== "string" || value.model.length > 200))) return false;
   if ("summaryTruncated" in value && typeof value.summaryTruncated !== "boolean") return false;
   for (const key of ["changedFiles", "assumptions", "keyFindings"]) if (key in value && !strings(value[key])) return false;
   if ("changedFilesOmitted" in value && !count(value.changedFilesOmitted)) return false;
@@ -207,14 +210,19 @@ export function isC2Report(value) {
   if ("changedFilesNote" in value && (typeof value.changedFilesNote !== "string" || value.changedFilesNote.length > 600)) return false;
   if ("blockers" in value && (!Array.isArray(value.blockers) || !value.blockers.every(b => object(b) && typeof b.code === "string" && typeof b.message === "string"))) return false;
   if ("checks" in value && (!object(value.checks) || !strings(value.checks.ran) || !strings(value.checks.claimed) || !count(value.checks.omitted))) return false;
-  if ("usage" in value && (!object(value.usage) || Object.keys(value.usage).length !== usageFields.length
-      || !usageFields.every(key => count(value.usage[key])))) return false;
+  if ("usage" in value && (!object(value.usage) || Object.keys(value.usage).length === 0
+      || (value.backend !== "antigravity" && Object.keys(value.usage).length !== usageFields.length)
+      || !Object.entries(value.usage).every(([key, number]) => usageFields.includes(key) && count(number)))) return false;
   if ("question" in value) {
     const q = value.question;
     if (!object(q) || !nullableString(q.id) || typeof q.kind !== "string" || typeof q.text !== "string" || !strings(q.options)
         || !(q.expiresInSec === null || count(q.expiresInSec))) return false;
   }
   const { summary, ...envelope } = value;
+  if (value.backend === "antigravity" && envelope.question?.kind === "action-approval") {
+    if (Buffer.byteLength(envelope.question.text) > 16 * 1024) return false;
+    envelope.question = { ...envelope.question, text: "" };
+  }
   return Buffer.byteLength(JSON.stringify(envelope)) <= 2000;
 }
 

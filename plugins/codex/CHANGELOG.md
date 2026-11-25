@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.8.0
+
+- Add full-access Gemini workers through Google's official `agy acp` runtime
+  with `fugato task --backend antigravity` and native `fugato:gemini-native`.
+  Resolve relative executable paths from the task directory and launch the
+  same absolute path recorded for recovery.
+  Document [setup and Google's sign-in conditions](../../docs/antigravity.md).
+- Check readiness over ACP and list advertised Gemini models. Mark
+  `gemini-4-neon` as the Fugato default and request `xhigh` thinking.
+  If Neon is unavailable, use the current or first advertised Gemini model.
+  If `xhigh` is unavailable, keep the selected model's current level. The native
+  agent header and `fugato-live` show the settings from dispatch through selection.
+- Show the full approval text with whitespace preserved. Deny changed
+  operations, conflicting argument copies, questions over 16 KiB and
+  executions missing a command line. Denied commands remain blockers and
+  are excluded from checks that ran.
+- Report the provider, model and available turn token counts. Input includes
+  cache reads and writes. Background delivery accepts partial counts. Keep
+  context occupancy in `acpUsage`, refuse explicit token limits and ignore
+  saved token limits for Gemini tasks.
+- Refuse mid-turn `SendMessage`. A `needs_answer` report gives the required
+  first line, `Answer <questionId>`. Match the job's pending ID and accept
+  `Allow once` or `Deny` for approvals, or up to 8,000 characters for ordinary
+  questions. After the turn finishes, a plain brief starts the next assignment.
+- Keep the final report intact across repeated tool status updates. Drop the
+  old diff when an edit changes without supplying a new one.
+- Require agy 1.5.15+ for continuation. Exact job follow-ups retain the
+  backend. Use `--backend antigravity` with `--resume-last` or
+  `task-resume-candidate` to select a Gemini job.
+- Restore a matching result saved before a crash. A lost result stays unknown
+  and its assignment is never replayed. Check PID registration and prompt
+  timing before signalling a surviving agy process. Block concurrent prompts
+  on the same ACP session across workspaces. Scope admission, cleanup and
+  parent questions to the backend when session handles coincide.
+- Keep job records small when commands print a lot: stored command output is
+  capped at 16 KiB per command and 256 KiB per turn, keeping the start and end.
+  `fugato-live` shows a job whose details cannot be read from its workspace
+  index, so a finished job no longer appears as a stale running row.
+
 ## 1.7.2
 
 - Resolve a worker whose turn end was inferred from its final answer even when

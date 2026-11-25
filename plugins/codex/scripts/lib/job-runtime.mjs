@@ -8,6 +8,7 @@ import { inertIndexlessWorkspace } from "./indexless-state.mjs";
 import { APPROVAL_OPTIONS, ACTION_APPROVAL_OPTIONS, parseApprovalAnswer } from "./server-requests.mjs";
 import { finishJournalJob } from "./run-journal.mjs";
 import { buildWorkerReport } from "./worker-report.mjs";
+import { jobBackend } from "./backends.mjs";
 import { dedupeBlockers } from "./blockers.mjs";
 import { reportJobs, reportWorkerTarget } from "./worker-resolve.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -18,8 +19,12 @@ export const ACTIVE = new Set(["queued", "running"]);
 const INERT_INDEXLESS_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 // Thread IDs are global to the isolated runtime, unlike workspace job indexes.
 // Read matching records and check for unindexed owners across workspaces.
-export function recordedThreadJobs(threadId) {
+export function recordedThreadJobs(threadId, backend = null) {
   const inventory = { jobs: [], complete: true }, root = resolveStateRoot();
+  const matchesBackend = job => {
+    try { return backend === null || jobBackend(job) === backend; }
+    catch { inventory.complete = false; return false; }
+  };
   let directories;
   try { directories = fs.readdirSync(root, { withFileTypes: true }); }
   catch { inventory.complete = false; return inventory; }
@@ -57,7 +62,7 @@ export function recordedThreadJobs(threadId) {
     }
     const present = new Set(files.map(name => name.slice(0, -5)));
     for (const job of indexed.values()) {
-      if (job.threadId === threadId && !present.has(job.id)) inventory.complete = false;
+      if (job.threadId === threadId && !present.has(job.id) && matchesBackend(job)) inventory.complete = false;
     }
     for (const name of files) {
       const job = indexed.get(name.slice(0, -5));
@@ -72,6 +77,13 @@ export function recordedThreadJobs(threadId) {
             continue;
           }
           if (stored.threadId !== threadId) continue;
+        }
+        // The backend is part of the turn's identity. A different provider's
+        // records cannot own this turn. Conflicting copies still defer recovery.
+        if (backend && stored && typeof stored === "object") {
+          const matches = matchesBackend(stored);
+          if (job && matchesBackend(job) !== matches) inventory.complete = false;
+          if (!matches) continue;
         }
         if (!stored || stored.id !== name.slice(0, -5) || typeof stored.workspaceRoot !== "string" || !stored.workspaceRoot ||
             typeof stored.status !== "string" || !stored.status ||
@@ -92,7 +104,7 @@ export function recordedThreadJobs(threadId) {
           else if (!stored.turnId) continue;
         }
         inventory.jobs.push(stored);
-      } catch (error) { if (!inert || !(error instanceof SyntaxError)) inventory.complete = false; }
+      } catch (error) { if ((!job || matchesBackend(job)) && (!inert || !(error instanceof SyntaxError))) inventory.complete = false; }
     }
     if (inert) {
       try { if (inertIndexlessWorkspace(directory, { minAgeMs: INERT_INDEXLESS_MIN_AGE_MS }).reason) inventory.complete = false; }
@@ -110,7 +122,7 @@ export function turnInJobStartWindow(job, startedAt) {
   return startedAt >= since;
 }
 
-export function uniqueTurnAttribution(job, turn, inventory = recordedThreadJobs(job.threadId), admittingJobId = null) {
+export function uniqueTurnAttribution(job, turn, inventory = recordedThreadJobs(job.threadId, "codex"), admittingJobId = null) {
   if (!inventory.complete || turnInJobStartWindow(job, turn.startedAt) !== true) return false;
   return !inventory.jobs.some(candidate => {
     if (candidate.id === job.id && candidate.workspaceRoot === job.workspaceRoot) return false;
@@ -197,13 +209,16 @@ const resumableTask = job => job.jobClass === "task" && Boolean(job.threadId);
 export function continuationReport(job) {
   const continuationCommand = resumableTask(job) && job.id ? companionCommand(`task --continue ${quote(job.id)} --cwd ${quote(job.request?.cwd ?? job.workspaceRoot)} ${job.direct ? "--direct" : "--follow --report --json"}`) : null;
   return { continuationCommand,
-    continuationNote: continuationCommand ? "Starts one new turn on the same Codex thread with this job's recorded sandbox, write, model and browser-origin settings; append extra instructions as the prompt. It has not been run. Wait for any pending interruption to finish first." : "No resumable task thread was recorded; no continuation command is available." };
+    continuationNote: continuationCommand ? job.request?.backend === "antigravity"
+      ? "Starts a new turn on this Antigravity session with its recorded backend, model and thinking settings. Requires server session/load support. Wait for any pending interruption to finish before continuing."
+      : "Starts one new turn on the same Codex thread with this job's recorded sandbox, write, model and browser-origin settings; append extra instructions as the prompt. It has not been run. Wait for any pending interruption to finish first." : "No resumable task thread was recorded; no continuation command is available." };
 }
 // The details view retains the full report and the old direct-mode commands,
 // summary and expanded lists. JSON/feed callers keep their existing payloads.
 export function fullReport(payload, job = {}) {
   const reason = budgetReason(payload.interruptionReason ?? job.result?.interruptionReason ?? job.cancelRequested?.reason);
   const report = { ...payload,
+    ...(job.request?.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity", ...(job.result?.acpUsage ? { acpUsage: job.result.acpUsage } : {}) } : {}),
     ...(reason ? { reason: { ...reason, ...(job.budget ? {
       maximum: reason.limit === "max_minutes" ? job.budget.maxMinutes * 60000 : job.budget.maxTokens,
       consumed: reason.limit === "max_minutes" ? job.budget.consumedMs : job.budget.consumedTokens,
@@ -401,6 +416,7 @@ export function directReport(payload, job = {}, env = process.env) {
     status: full.status,
     worker,
     jobId,
+    ...(full.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity" } : {}),
     summary: truncate(summary, DIRECT_SUMMARY_LIMIT),
     ...(full.summaryTruncated || summary.length > DIRECT_SUMMARY_LIMIT ? { summaryTruncated: true } : {})
   };
@@ -441,7 +457,11 @@ export function directReport(payload, job = {}, env = process.env) {
   }
   if (full.assumptions?.length) report.assumptions = full.assumptions.slice(0, 12).map(brief);
   if (full.keyFindings?.length) report.keyFindings = full.keyFindings.slice(0, 12).map(brief);
-  if (full.usage) report.usage = full.usage;
+  if (full.usage) {
+    report.usage = full.usage;
+    const model = job.result?.model ?? job.request?.model;
+    if (report.backend === "antigravity" && typeof model === "string") report.model = truncate(redactActivity(model), 200);
+  }
   const busy = full.blockers?.find(blocker => blocker.code === "thread_busy");
   const runtimeBlocker = full.status === "blocked" && full.blockers?.find(blocker =>
     ["context_window_exceeded", "provider_refused", "auth_required"].includes(blocker.code));
@@ -610,7 +630,7 @@ function questionCallerGone(previous, caller) {
 // Tickets keep the existing slot's ownership/answer-transfer rules unchanged.
 export async function askParentQuestion(cwd, id, question, context = {}) {
   const job = readJobFile(resolveJobFile(cwd, id));
-  if (job.request?.permissionPolicy?.mapping !== "claude") return askParentQuestionSlot(cwd, id, question, context);
+  if (job.request?.permissionPolicy?.mapping !== "claude" && job.request?.backend !== "antigravity") return askParentQuestionSlot(cwd, id, question, context);
   const caller = context.caller ?? questionCaller, ticketId = randomUUID();
   const turnId = context.turnId ?? job.turnId;
   const deadline = Date.now() + (job.questionTimeoutSec ?? 900) * 1000;
@@ -860,6 +880,16 @@ export class JobRuntime {
   // Only an explicit answer grants anything. Mapped jobs queue every kind;
   // legacy Computer Use requests retain the single-slot fail-closed behavior.
   async approval(request) {
+    if (request.kind === "acp-permission") {
+      const matches = job => job.request?.backend === "antigravity" && job.threadId === request.binding?.threadId && job.turnId === request.binding?.turnId;
+      if (request.signal?.aborted || !matches(readJobFile(resolveJobFile(this.cwd, this.id)))) return "deny";
+      const { text, resolution } = await askParentQuestion(this.cwd, this.id,
+        { question: request.question, options: ACTION_APPROVAL_OPTIONS, kind: "action-approval", binding: request.binding },
+        { signal: this.abort.signal, cancelled: () => request.signal?.aborted, onProgress: this.onProgress, turnId: request.binding.turnId });
+      const current = readJobFile(resolveJobFile(this.cwd, this.id));
+      return resolution === "answered" && text === "Allow once" && !request.signal?.aborted && !this.abort.signal.aborted &&
+        !current.cancelRequested && ACTIVE.has(current.status) && matches(current) ? "once" : "deny";
+    }
     if (request.kind === "action-approval") {
       const job = readJobFile(resolveJobFile(this.cwd, this.id));
       if (request.signal?.aborted || job.threadId !== request.binding.threadId || job.turnId !== request.binding.turnId || !job.request?.permissionPolicy?.forwardActions) return "deny";
@@ -910,6 +940,7 @@ export function progressSnapshot(job) {
   const seconds = Math.floor(elapsedMs / 1000), elapsed = `${Math.floor(seconds / 60)}m${seconds % 60}s`;
   const phase = pending ? "needs_answer" : job.phase === "needs_answer" ? "running" : job.phase ?? job.status;
   return { status: pending ? "needs_answer" : job.status, jobId: job.id, threadId: job.threadId ?? null, turnId: job.turnId ?? null,
+    ...(job.request?.backend === "antigravity" || job.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity" } : {}),
     ...(job.agentName ? { agentName: job.agentName } : {}),
     ownerId: job.ownerId ?? null, sessionId: job.sessionId ?? null, ownerAttached: Boolean(job.ownerAttached), ...leaseSnapshot(job),
     headline: `${pending ? "waiting for parent" : job.currentItem?.summary ?? phase} · ${elapsed}`.slice(0, 60), phase, elapsed, elapsedMs,

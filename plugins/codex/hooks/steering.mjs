@@ -1,7 +1,8 @@
 // session.send runs in the sender before the recipient's queue (host d.ts
 // SessionSendInput/Result). session.receive runs inside the recipient's turn;
 // it is not our interception point while turn.step owns that turn's wait.
-import { isNativeType } from './presets.mjs';
+import { GEMINI_AGENT_TYPE, isNativeType } from './presets.mjs';
+export const GEMINI_BUSY = 'This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again.';
 const UNKNOWN_REASON = 'Codex steering outcome unknown; the message may or may not have reached the running turn and will not be resent automatically. Inspect the Fugato job before resending.';
 async function deliveryId($, session, agentId) {
   return `${session}:${agentId}:${await $.clock.now()}:${Math.random().toString(36).slice(2)}`;
@@ -22,11 +23,14 @@ export function registerSteering(on) {
   on('session.send', async ($, e, next) => {
     let attempted = false;
     try {
+      const agents = await $.agent.list();
+      const matches = agents.filter(agent => agent.id === e.to || agent.name?.toLowerCase() === e.to.toLowerCase());
+      if (matches.length === 1 && matches[0].type === GEMINI_AGENT_TYPE) {
+        return matches[0].status === 'running' ? { isDelivered: false, reason: GEMINI_BUSY } : next(e);
+      }
       // Only the main conversation steers. Subagent and teammate sends keep the
       // ordinary queue, where the teammate mailbox guard judges them.
       if (e.agentId || typeof e.text !== 'string' || !e.text.trim() || e.text.length > 65536) return next(e);
-      const agents = await $.agent.list();
-      const matches = agents.filter(agent => agent.id === e.to || agent.name?.toLowerCase() === e.to.toLowerCase());
       if (matches.length !== 1 || !isNativeType(matches[0].type) || matches[0].status !== 'running') return next(e);
       const session = await $.session.id();
       const state = await $.store.get(`native:v2:${session}:${matches[0].id}`);

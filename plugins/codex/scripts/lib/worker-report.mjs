@@ -139,6 +139,7 @@ export function buildWorkerReport(payload, meta = {}) {
     // message was prose and status/findings were inferred from it.
     ...(structured ? { reportFormat: "structured", declaredStatus: structured.status } : {}),
     jobId: meta.jobId ?? null,
+    ...(payload.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity" } : {}),
     threadId: payload.threadId ?? null,
     turnId: payload.turnId ?? null,
     exitCode: runtimeBlocker ? 2 : payload.status,
@@ -167,7 +168,8 @@ export function buildWorkerReport(payload, meta = {}) {
     verificationBasis: "Captured command events; parent has not independently verified.",
     ...(structured?.verification.length ? { claimedVerification: structured.verification.slice(0, 3).map(s => shorten(s)) } : {}),
     keyFindings: findings.slice(0, structured ? 5 : findingsLimit).map(s => shorten(s)),
-    findingsBasis: structured ? "Declared by Codex in its structured report, not independently verified; the summary is in the raw output file." : "Codex-reported, not independently verified; full output includes any omitted assumptions and details.",
+    findingsBasis: payload.backend === "antigravity" ? "Reported by the Antigravity worker; parent has not independently verified."
+      : structured ? "Declared by Codex in its structured report, not independently verified; the summary is in the raw output file." : "Codex-reported, not independently verified; full output includes any omitted assumptions and details.",
     assumptions,
     ...(browserBlocker ? { browserBlocker } : {}),
     blockers,

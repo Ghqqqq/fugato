@@ -51,8 +51,13 @@ export function jobState(job: CodexLiveJob): { word: string; color: ThemeKey } {
   }
 }
 
+export function hasIndexSummary(job: CodexLiveJob): boolean {
+  return 'fromWorkspaceIndex' in job && job.fromWorkspaceIndex === true;
+}
+
 function staleJob(job: CodexLiveJob | CodexLiveSession): boolean {
-  return job.detailsUnavailable || 'turns' in job && job.turns.some(turn => turn.detailsUnavailable);
+  const stale = (turn: CodexLiveJob) => turn.detailsUnavailable && !hasIndexSummary(turn);
+  return stale(job) || 'turns' in job && job.turns.some(stale);
 }
 
 export function jobRowColor(job: CodexLiveJob | CodexLiveSession): ThemeKey {
@@ -196,7 +201,7 @@ export function headerItem(job: CodexLiveJob, _now: number): FeedItem {
   return { key: 'job-header', title: header.name + header.detail, header, rowKind: 'notice',
     color: 'subtle', results: [
       ...(job.blockerCode ? [{ text: `Needs attention · ${job.blockerCode}`, color: 'warning' as const }] : []),
-      ...(job.detailsUnavailable ? [{ text: 'Details unavailable · showing the last good view', color: 'warning' as const }] : []),
+      ...(job.detailsUnavailable ? [{ text: hasIndexSummary(job) ? 'Details unavailable' : 'Details unavailable · showing the last good view', color: 'warning' as const }] : []),
     ] };
 }
 
@@ -794,7 +799,7 @@ export function footerLayout(job: CodexLiveJob | ForumRoom, state: CodexLiveStat
   const known = tokens.size > 0;
   const statusWord = job.unresolved ? 'unknown' : job.active && (job.question || job.status === 'waiting') || job.status === 'needs_input'
     ? 'needs answer' : ['cancelled', 'interrupted', 'stopped'].includes(job.status) ? 'stopped' : job.status === 'completed' ? 'done' : job.status === 'blocked' ? 'blocked' : word.toLowerCase();
-  const status = `${statusWord}${job.detailsUnavailable ? ' · stale' : ''}`;
+  const status = `${statusWord}${hasIndexSummary(job) ? ' · details unavailable' : job.detailsUnavailable ? ' · stale' : ''}`;
   const detail = ` · ${uses} tool${uses === 1 ? '' : 's'} · ${elapsed(job, state.nowMs)}`;
   return feedFooter(status + detail, color, columns, following, newLines, known ? `${compactNumber(total)} tokens` : '', status.length);
 }
@@ -854,6 +859,7 @@ export function timelineSpans(entry: TableEntry, axis: { start: number; end: num
   if (!Number.isFinite(start)) return [{ text: ' '.repeat(14) }];
   const first = cell(start);
   const ended = jobLifecycle(entry).finished ? Date.parse(entry.completedAt) : axis.end;
+  if (hasIndexSummary(entry) && !Number.isFinite(ended)) return [{ text: ' '.repeat(14) }];
   const last = Math.max(first, cell(Number.isFinite(ended) ? ended : axis.end));
   return compact(Array.from({ length: 14 }, (_, i) => ({ text: i < first ? ' ' : i <= last ? '━' : '╌',
     color: i <= last ? jobRowColor(entry) : 'inactive' })));

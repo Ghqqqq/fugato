@@ -94,6 +94,12 @@ function reportMessage(text) {
   } catch { /* ordinary message */ }
   return { text, body: text };
 }
+export function agentMessageActivity(text, provider = "codex", status = "completed") {
+  if (!text) return [];
+  const message = reportMessage(text);
+  return [{ type: "agentMessage", lifecycle: "completed", status, ...message,
+    ...(provider === "antigravity" ? { provider } : {}), text: snippet(message.text, 600), body: markedLimit(redactActivity(message.body), 4000) }];
+}
 function changeLineCounts(change) {
   const kind = change.kind?.type ?? change.kind;
   const diff = change.diff ?? change.kind?.unified_diff;
@@ -125,11 +131,8 @@ export function itemActivity(item, lifecycle, starts, key, now = Date.now()) {
   const durationMs = lifecycle === "completed" ? (Number.isFinite(item.durationMs) && item.durationMs >= 0 ? item.durationMs : start == null ? null : Math.max(0, now - start)) : null;
   const base = { type: item.type, status: statusOf(item, lifecycle), lifecycle };
   switch (item.type) {
-    case "agentMessage": {
-      if (lifecycle !== "completed" || !item.text) return [];
-      const message = reportMessage(item.text);
-      return [{ ...base, ...message, text: snippet(message.text, 600), body: markedLimit(redactActivity(message.body), 4000) }];
-    }
+    case "agentMessage":
+      return lifecycle === "completed" ? agentMessageActivity(item.text, "codex", base.status) : [];
     case "commandExecution": {
       const [first, ...rest] = redactActivity(item.command).split(/\r?\n/);
       const command = commandExcerpt(first, true);
@@ -230,7 +233,7 @@ export function formatActivity(event, options = {}) {
   const { root } = options;
   let detail;
   switch (event.type) {
-    case "agentMessage": detail = `Codex: ${event.text}`; break;
+    case "agentMessage": detail = `${event.provider === "antigravity" ? "Antigravity" : "Codex"}: ${event.text}`; break;
     case "commandExecution": {
       const result = activityResult(event);
       // Reserve space for the result before the emitter's 200-character cap:

@@ -12,10 +12,14 @@ import { getWorkspaceRuntimeStatus, restartBrokerRuntime } from "./lib/broker-li
 import { UNREACHABLE_GUIDANCE } from "./lib/runtime-errors.mjs";
 import { getToolAvailability, syncToolConfig } from "./lib/tool-config.mjs";
 import { buildWorkerReport, parseStructuredReport, persistTaskArtifacts, taskArtifactPaths } from "./lib/worker-report.mjs";
+import { boundCommandOutput } from "./lib/command-output.mjs";
 import { normalizeBrowserOrigins, normalizeBundleIds } from "./lib/server-requests.mjs";
 import { browserOriginSetup, computerUseSetup, transportSetup, defaultSandboxSetup, defaultModeSetup, permissionMappingSetup, readTomlField, dispatchSetup, dispatchPreference, contextSetup, budgetDefaultsSetup, personaModelsSetup, workerDefaultsSetup, readWorkerDefaults, normalizeRequestedModel, isSupportedReasoningEffort, ensureBrowserApproval, ensureComputerUseApproval, ensureProjectDocs, projectDocsSetup, SANDBOX_MODES } from "./lib/setup-config.mjs";
 import { budgetLimit, newJobBudget } from "./lib/job-budget.mjs";
 import { listModels, renderModels } from "./lib/models.mjs";
+import { ANTIGRAVITY_DEFAULT_MODEL, ANTIGRAVITY_DEFAULT_EFFORT, ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "./lib/antigravity.mjs";
+import { acpExecutable, acpProcessGone, isAntigravityJob, stopOrphanedAcpGroup } from "./lib/acp-process.mjs";
+import { acpSetting, jobBackend, normalizeBackend, validateAntigravityTask } from "./lib/backends.mjs";
 import { activityReader, formatActivity, redactActivity, snippet } from "./lib/activity.mjs";
 import { JobRuntime, ACTIVE, OWNER_GRACE_MS, seconds, ownerId, renewLease, requestCancel, answerQuestion, progressSnapshot, leaseExpiryReport, continuationReport, fullReport, directReport, envelopeBytes, adoptJob, ownershipNotice } from "./lib/job-runtime.mjs";
 import { reserveAgentName, releaseAgentName } from "./lib/agent-names.mjs";
@@ -174,6 +178,11 @@ runs add/close require journal use <runId> or --run, and tasks stay unlinked. On
 Show/validate fall back to the newest workspace run when none is active.`,
   task: `Usage: fugato task [options] <<'DUET_TASK'
 Read the brief only from stdin; implies --direct. Fresh unless --to/--thread/--continue/--resume/--resume-last.
+  --backend <codex|antigravity>  Worker runtime (default codex). Follow-ups inherit it; sessions cannot switch backends.
+    Antigravity uses agy acp and its own login. Discover Google models with fugato models --backend antigravity.
+    Google model/thinking defaults come from ACP, and permission requests go to the parent for Allow once/Deny.
+    Supports danger-full-access only; Codex sandbox/permission mapping, fork, fast tier, roundtable,
+    browser/Computer Use grants and token budgets are unavailable. Use --max-minutes for a time budget.
   --help, -h  Show help without starting anything; unknown task flags are errors.
   --name <label>  Prefer this worker name on a fresh thread; follow-ups keep their name.
     Use 1-64 ASCII letters, digits, _, . or -, starting with a letter or digit.
@@ -237,8 +246,9 @@ Never parse output files, poll or run two waits for one job. Continue user-stopp
 Compatibility: node "$CODEX_COMPANION" <subcommand> still works. Its task accepts positional text,
 --prompt-file <file>, --report/--json, --follow (feed wait), --detached (return handles),
 --background (legacy launch), and --feed-limit <n> (60; 0 unlimited), outside direct mode.`,
-  models: `fugato models lists models offered by the current Codex account.
-Usage: fugato models [--json] [--all]
+  models: `fugato models lists models offered by the selected worker runtime.
+Usage: fugato models [--backend codex|antigravity] [--cwd <dir>] [--json] [--all]
+Antigravity reads the authenticated ACP session's model/thinking options without sending a model prompt.
 Uses app-server model/list, falling back to the isolated model cache; reports the source.
   --json  Model descriptions, efforts, context windows and effective tiers with sources.
   --all  Include hidden models; --help, -h  Help without starting the runtime.`,
@@ -247,6 +257,8 @@ Uses app-server model/list, falling back to the isolated model cache; reports th
   --max-concurrent <n|off>  Fugato-wide worker turn limit (default off).
 Usage: fugato setup [options]
 Check isolated runtime readiness or change setup; --help, -h exits without changes.
+  --backend antigravity  Check Google ACP readiness using existing agy login, with no model prompt.
+    Accepts --cwd and --json; does not configure the Codex runtime. Missing login: agy acp --login.
   --cwd, -C <dir>  Workspace; --json  JSON output; --dry-run  Preview a setup change.
   --sync-tools  Sync tools; --profile <chrome|codex-app>  Tool profile; --replace-cua  Replace CUA config.
   --cua-template <file>  Absolute template path; --chatgpt-resources <dir>  Absolute resources path.
@@ -391,7 +403,7 @@ Tasks run through /fugato:roundtable <task>. Room commands: start, status <roomI
   "task-worker": `Usage: fugato task-worker --job-id <id> [--cwd <dir>]
 Internal detached worker entry point; --job-id selects a stored task.
   --cwd, -C  Workspace; --help, -h  Show help without starting a worker.`,
-  "task-resume-candidate": `Usage: fugato task-resume-candidate [--cwd <dir>] [--json]
+  "task-resume-candidate": `Usage: fugato task-resume-candidate [--backend <codex|antigravity>] [--cwd <dir>] [--json]
 Find the latest resumable task in this session; --json prints its handles.
   --cwd, -C  Workspace; --help, -h  Show help.`
 };
@@ -596,9 +608,22 @@ function projectDocsSummary() {
 }
 
 async function handleModels(argv) {
-  const { options, positionals } = parseCommandInput(argv, { booleanOptions: ["json", "all"] });
-  if (positionals.length) throw new Error("Usage: fugato models [--json] [--all]");
-  const catalog = await listModels({ all: Boolean(options.all) });
+  const { options, positionals } = parseCommandInput(argv, { valueOptions: ["backend", "cwd"], booleanOptions: ["json", "all"] });
+  if (positionals.length) throw new Error("Usage: fugato models [--backend codex|antigravity] [--cwd <dir>] [--json] [--all]");
+  if (normalizeBackend(options.backend) === "antigravity") {
+    const catalog = await listAntigravityModels(resolveCommandCwd(options));
+    const report = { backend: "antigravity", source: "antigravity-acp", models: catalog.data.map(model => ({
+      slug: model.model ?? model.id, displayName: model.displayName, isDefault: Boolean(model.isDefault),
+      isFugatoDefault: model.model === ANTIGRAVITY_DEFAULT_MODEL,
+      efforts: model.supportedReasoningEfforts?.map(value => value.reasoningEffort) ?? [], defaultEffort: model.defaultReasoningEffort ?? null
+    })), configOptions: catalog.configOptions };
+    const rows = report.models.map(model => [model.slug, model.displayName,
+      [model.isDefault && "current", model.isFugatoDefault && "Fugato default"].filter(Boolean).join(", "), model.efforts.join(", ")].map(escapeDiagnosticControls).join(" | "));
+    outputCommandResult(report, ["Google models from Antigravity ACP", "ID | Name | Selection | Thinking options for the current model", ...rows,
+      "Model and thinking values come from the server. Changing models can change the available thinking options.", ""].join("\n"), options.json);
+    return;
+  }
+  const catalog = await listModels({ all: Boolean(options.all), cwd: resolveCommandCwd(options) });
   const defaults = workerDefaultsSetup();
   const tiers = { strong: defaults.defaultModel, effort: defaults.defaultEffort, routine: defaults.ultraRoutineModel };
   const models = catalog.models.map(model => ({ ...model, inUse: [
@@ -611,11 +636,22 @@ async function handleModels(argv) {
 
 async function handleSetup(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "cua-template", "chatgpt-resources", "transport", "profile", "default-sandbox", "default-mode", "permission-mapping", "dispatch", "default-model", "default-effort", "ultra-routine-model", "browser-approval", "computer-use-approval", "project-docs", "agent-memory", "max-concurrent", "default-max-minutes", "default-max-tokens"],
+    valueOptions: ["backend", "cwd", "cua-template", "chatgpt-resources", "transport", "profile", "default-sandbox", "default-mode", "permission-mapping", "dispatch", "default-model", "default-effort", "ultra-routine-model", "browser-approval", "computer-use-approval", "project-docs", "agent-memory", "max-concurrent", "default-max-minutes", "default-max-tokens"],
     repeatableOptions: ["allow-browser-origin", "revoke-browser-origin", "allow-computer-app", "revoke-computer-app", "persona-model"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate", "sync-tools", "dry-run", "list-browser-origins", "list-computer-apps", "replace-cua"]
   });
   validatePositionalArity(positionals, 0, "setup");
+  if (normalizeBackend(options.backend) === "antigravity") {
+    if (Object.keys(options).some(key => !["backend", "cwd", "session", "json"].includes(key))) {
+      throw new Error("Antigravity setup accepts only --backend antigravity, --cwd and --json. Authenticate with agy acp --login.");
+    }
+    const cwd = resolveCommandCwd(options);
+    const catalog = await listAntigravityModels(cwd);
+    const report = { backend: "antigravity", ready: true, models: catalog.data.map(model => model.model ?? model.id),
+      detail: "Antigravity ACP initialized and created a session with the current CLI credentials. No model prompt was submitted." };
+    outputCommandResult(report, `${report.detail}\nAvailable models: ${report.models.map(escapeDiagnosticControls).join(", ")}\n`, options.json);
+    return;
+  }
   const computerUseFlags = options["computer-use-approval"] !== undefined || options["allow-computer-app"] || options["revoke-computer-app"] || options["list-computer-apps"];
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
@@ -833,9 +869,19 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
+  const backend = normalizeBackend(options.backend);
   const workspaceJobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const jobs = workspaceJobs.filter((job) => job.id !== options.excludeJobId && job.title !== "Codex Stop Gate Review");
+  const jobs = workspaceJobs.filter((job) => job.id !== options.excludeJobId && job.title !== "Codex Stop Gate Review"
+    && jobBackend(job) === backend);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
+  if (backend === "antigravity") {
+    for (const [index, job] of visibleJobs.entries()) {
+      if (!ACTIVE.has(job.status)) continue;
+      const stored = restoreMissingTaskRecord(workspaceRoot, job);
+      if (needsAcpRecovery(stored)) await reconcileLostTurn(workspaceRoot, stored);
+      visibleJobs[index] = readStoredJob(workspaceRoot, job.id) ?? stored;
+    }
+  }
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
     throw new Error(`Task ${activeTask.id} is still running. Use /fugato:status before continuing it.`);
@@ -846,7 +892,7 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
     return { id: trackedTask.threadId };
   }
 
-  if (sessionId) {
+  if (sessionId || backend === "antigravity") {
     return null;
   }
 
@@ -989,11 +1035,20 @@ function taskBrief(request) {
   return prompt?.trim() || (request.threadId || request.resumeLast ? DEFAULT_CONTINUE_PROMPT : "");
 }
 
-function threadBlocker(workspaceRoot, jobs, threadId, jobId) {
+function admissionInventory(workspaceRoot, jobs, threadId, backend) {
+  const local = jobs.filter(job => job.threadId === threadId && jobBackend(job) === backend);
+  if (backend !== "antigravity") return { jobs: local, complete: true };
+  // ACP session handles span workspaces. A crashed wrapper can leave a
+  // submitted prompt alive after its PID-based session lock is reclaimed.
+  const inventory = recordedThreadJobs(threadId, backend);
+  const foreign = inventory.jobs.filter(job => job.workspaceRoot !== workspaceRoot);
+  return { jobs: local.concat(foreign), complete: inventory.complete };
+}
+
+function threadBlocker(workspaceRoot, jobs, jobId, current) {
   const order = (a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")) || a.id.localeCompare(b.id);
-  const current = jobs.find(job => job.id === jobId);
-  const candidates = jobs.filter(job => job.id !== jobId && job.threadId === threadId)
-    .map(job => readStoredJob(workspaceRoot, job.id) ?? job)
+  const candidates = jobs.filter(job => job.id !== jobId)
+    .map(job => job.workspaceRoot && job.workspaceRoot !== workspaceRoot ? job : readStoredJob(workspaceRoot, job.id) ?? job)
     .filter(job => job.status !== "blocked" && (ACTIVE.has(job.status) || ((job.turnId || job.turnSubmission || job.status === "failed") && unresolvedTask(job))));
   // Prefer the actual turn over queued follow-ups that will themselves be
   // refused. With no turn yet, the oldest reservation wins admission.
@@ -1001,12 +1056,13 @@ function threadBlocker(workspaceRoot, jobs, threadId, jobId) {
     ?? candidates.filter(job => !current || order(job, current) < 0).sort(order)[0];
 }
 
-function threadBusyExecution(workspaceRoot, predecessor, request, taskMetadata) {
-  const stored = readStoredJob(workspaceRoot, predecessor.id) ?? predecessor;
-  const blocker = threadBusyBlocker(workspaceRoot, stored);
+function threadBusyExecution(workspaceRoot, threadId, predecessor, request, taskMetadata) {
+  const root = predecessor?.workspaceRoot ?? workspaceRoot;
+  const blocker = predecessor ? threadBusyBlocker(root, readStoredJob(root, predecessor.id) ?? predecessor)
+    : { code: "thread_busy", message: `Ownership of Antigravity session ${threadId} is unknown because its cross-workspace job inventory is incomplete.` };
   // Preserve the foreground CLI's stderr diagnostic alongside its typed result.
   if (!request.detached) process.stderr.write(`${blocker.message}\n`);
-  return buildTaskExecution({ status: 0, threadId: predecessor.threadId, turnId: null, finalMessage: blocker.message, blockers: [blocker] }, request, taskMetadata);
+  return buildTaskExecution({ status: 0, threadId, turnId: null, finalMessage: blocker.message, blockers: [blocker] }, request, taskMetadata);
 }
 
 function threadBusyBlocker(workspaceRoot, stored) {
@@ -1018,7 +1074,9 @@ function threadBusyBlocker(workspaceRoot, stored) {
     ? `node ${quote(path.join(ROOT_DIR, "bin", "fugato"))} cancel ${quote(stored.id)} --cwd ${quote(workspaceRoot)} --json` : null;
   const ownerReport = directReport(progressSnapshot(stored), stored);
   const blocker = { code: "thread_busy", predecessorJobId: stored.id, predecessorStatus: stored.status,
-    message: `Codex thread ${stored.threadId} ${condition} in task ${stored.id}. ${cancelCommand ? "Use recoveryCommand to check it, or cancelCommand to interrupt that exact turn and confirm it stopped." : "Resolve that predecessor with the recovery command before continuing."}`,
+    message: isAntigravityJob(stored)
+      ? `Antigravity session ${stored.threadId} ${condition} in task ${stored.id}. Check that task with recoveryCommand or stop its ACP process with cancelCommand.`
+      : `Codex thread ${stored.threadId} ${condition} in task ${stored.id}. ${cancelCommand ? "Use recoveryCommand to check it, or cancelCommand to interrupt that exact turn and confirm it stopped." : "Resolve that predecessor with the recovery command before continuing."}`,
     recoveryCommand, ...(cancelCommand ? { cancelCommand } : {}),
     ...(ownerReport.status === "needs_answer" && ownerReport.question?.id
       ? { question: ownerReport.question, answerCommand: ownerReport.next } : {}) };
@@ -1032,9 +1090,11 @@ const withGitContext = (context, brief) => brief.trim() && context ? context + b
 async function executeTaskRun(request) {
   requireTaskRequest(request.prompt ?? "", request.resumeLast, request.threadId);
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureCodexAvailable(request.cwd);
+  const backend = normalizeBackend(request.backend);
+  if (backend === "codex") ensureCodexAvailable(request.cwd);
 
   const taskMetadata = buildTaskRunMetadata({
+    backend,
     prompt: request.prompt,
     resumeLast: Boolean(request.resumeLast || request.threadId)
   });
@@ -1042,6 +1102,7 @@ async function executeTaskRun(request) {
   let resumeThreadId = request.threadId ?? null;
   if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
+      backend,
       excludeJobId: request.jobId
     });
     if (!latestThread) {
@@ -1051,25 +1112,34 @@ async function executeTaskRun(request) {
   }
 
   if (resumeThreadId) {
-    for (const candidate of listJobs(workspaceRoot).filter(job => job.threadId === resumeThreadId && job.id !== request.jobId)) {
-      restoreMissingTaskRecord(workspaceRoot, candidate);
+    const jobs = listJobs(workspaceRoot);
+    const inventory = admissionInventory(workspaceRoot, jobs, resumeThreadId, backend);
+    if (!inventory.complete) return threadBusyExecution(workspaceRoot, resumeThreadId, null, request, taskMetadata);
+    for (const candidate of inventory.jobs) {
+      if (candidate.id === request.jobId) continue;
+      const root = candidate.workspaceRoot ?? workspaceRoot;
+      const stored = restoreMissingTaskRecord(root, candidate);
+      if (needsAcpRecovery(stored)) await reconcileLostTurn(root, stored);
     }
-    const predecessor = threadBlocker(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, request.jobId);
+    const predecessor = threadBlocker(workspaceRoot, inventory.jobs, request.jobId, jobs.find(job => job.id === request.jobId));
     // A lost turn/start response leaves no turn ID. Read that predecessor's
     // thread before admission, just as we reconcile an exact recorded turn.
-    if (predecessor) await reconcileLostTurn(workspaceRoot, predecessor, { admittingJobId: request.jobId });
+    if (predecessor) await reconcileLostTurn(predecessor.workspaceRoot ?? workspaceRoot, predecessor, { admittingJobId: request.jobId });
     // Claim the target before starting a turn. updateState serializes competing
     // workers; unrelated threads remain free to run in parallel. Recovery does
     // network I/O outside this lock; always recheck all blockers after it.
-    let blocker;
+    let blocker, incomplete;
     updateState(workspaceRoot, (state) => {
-      blocker = threadBlocker(workspaceRoot, state.jobs, resumeThreadId, request.jobId);
-      if (blocker) return;
+      const latest = admissionInventory(workspaceRoot, state.jobs, resumeThreadId, backend);
+      incomplete = !latest.complete;
+      if (incomplete) return;
       const current = state.jobs.find((job) => job.id === request.jobId);
+      blocker = threadBlocker(workspaceRoot, latest.jobs, request.jobId, current);
+      if (blocker) return;
       if (!current) throw new Error("The current task record is missing; refusing to resume a thread without tracking its active turn.");
       current.threadId = resumeThreadId;
     });
-    if (blocker) return threadBusyExecution(workspaceRoot, blocker, request, taskMetadata);
+    if (incomplete || blocker) return threadBusyExecution(workspaceRoot, resumeThreadId, blocker, request, taskMetadata);
   }
 
   const before = snapshotWorkspace(workspaceRoot);
@@ -1077,19 +1147,29 @@ async function executeTaskRun(request) {
   // Only an owned (detached/--follow) job has a parent polling for questions, so
   // only there can a Computer Use request be forwarded; a plain foreground run
   // keeps "never" and such a request fails closed at once.
-  const approvalPolicy = request.permissionPolicy ? (request.detached ? request.permissionPolicy.approvalPolicy : "never") : request.detached ? FORWARDED_APPROVALS_LABEL : "never";
-  updateJob(workspaceRoot, request.jobId, () => ({ preExistingChanges: before.preExistingChanges, sandbox, approvalPolicy }));
-  request.onProgress?.(`Sandbox: ${sandbox}; approval policy: ${approvalPolicy}${request.detached ? " (Computer Use app requests are forwarded to the parent)" : ""}. Captured workspace baseline (${before.status}).`);
+  const approvalPolicy = backend === "antigravity" ? request.detached ? "antigravity+ask-parent" : "antigravity+deny-requests"
+    : request.permissionPolicy ? (request.detached ? request.permissionPolicy.approvalPolicy : "never") : request.detached ? FORWARDED_APPROVALS_LABEL : "never";
+  // Record the executable checked for this request; the runner launches exactly
+  // this path and recovery compares against it.
+  const executable = backend === "antigravity" ? resolveAntigravityExecutable(request.cwd) : null;
+  updateJob(workspaceRoot, request.jobId, () => ({ preExistingChanges: before.preExistingChanges, sandbox, approvalPolicy,
+    ...(backend === "antigravity" ? { acpExecutable: executable ?? acpExecutable(request.cwd) } : {}) }));
+  request.onProgress?.(backend === "antigravity"
+    ? `Antigravity ACP uses its own tool permissions without a Fugato filesystem sandbox; approval policy: ${approvalPolicy}. Captured workspace baseline (${before.status}).`
+    : `Sandbox: ${sandbox}; approval policy: ${approvalPolicy}${request.detached ? " (Computer Use app requests are forwarded to the parent)" : ""}. Captured workspace baseline (${before.status}).`);
 
   const runtime = new JobRuntime(workspaceRoot, request.jobId, { foreground: !request.detached, parentPid: LAUNCH_PARENT_PID, onProgress: request.onProgress });
   let result, memberThreadId = null;
   try {
     if (!request.detached) runtime.abort.signal.throwIfAborted();
-    result = await runAppServerTurn(workspaceRoot, {
+    result = await (backend === "antigravity" ? runAntigravityTurn : runAppServerTurn)(workspaceRoot, {
+    // Without a resolved path the runner checks the request directory again and
+    // fails before launch; it never falls back to the workspace root.
+    ...(backend === "antigravity" ? { requestCwd: request.cwd, modelDefault: request.modelDefault, effortDefault: request.effortDefault, ...(executable ? { executable } : {}) } : {}),
     executionCwd: fs.realpathSync(request.cwd),
     jobId: request.jobId,
     onThreadBusy: (threadId, turnIds) => {
-      const owner = recordedThreadJobs(threadId).jobs.find(job => job.id !== request.jobId && (turnIds.includes(job.turnId) || (!turnIds.length && ACTIVE.has(job.status))));
+      const owner = recordedThreadJobs(threadId).jobs.find(job => job.id !== request.jobId && jobBackend(job) === backend && (turnIds.includes(job.turnId) || (!turnIds.length && ACTIVE.has(job.status))));
       const blocker = owner ? threadBusyBlocker(owner.workspaceRoot, owner) : { code: "thread_busy" };
       return { ...blocker, turnId: turnIds[0], message: `Codex thread ${threadId} ${turnIds.length ? `has in-progress or unresolved turn ${turnIds.join(", ")}` : "has a turn awaiting acceptance"}. ${blocker.message ?? "Resolve that turn before continuing."}` };
     },
@@ -1132,12 +1212,13 @@ async function executeTaskRun(request) {
       // Capture cleanup is only recorded after sending turn/interrupt. A stop
       // observed after capture completed must not claim an interrupt was sent.
       updateJob(workspaceRoot, request.jobId, current => ({
-        turnInterruptAttempted: Boolean(current.backgroundTerminals),
-        turnInterrupted: Boolean(current.backgroundTerminals && result?.turnEnded && result?.turn?.status === "interrupted")
+        turnInterruptAttempted: backend === "antigravity" ? Boolean(result?.turnInterruptAttempted ?? current.turnInterruptAttempted) : Boolean(current.backgroundTerminals),
+        turnInterrupted: backend === "antigravity" ? Boolean(result?.turnEnded && result?.turn?.status === "interrupted") : Boolean(current.backgroundTerminals && result?.turnEnded && result?.turn?.status === "interrupted")
       }));
     } finally { runtime.close(); }
   }
-  if (runtime.reason) Object.assign(result, { interruptionReason: runtime.reason, interruptionConfirmed: Boolean(result.turnEnded), status: 1 });
+  if (runtime.reason) Object.assign(result, { interruptionReason: runtime.reason,
+    interruptionConfirmed: backend === "antigravity" ? result.interruptionConfirmed === true : Boolean(result.turnEnded), status: 1 });
 
   Object.assign(result, compareWorkspaceSnapshots(before, snapshotWorkspace(workspaceRoot), result.touchedFiles));
   return buildTaskExecution(result, request, taskMetadata);
@@ -1166,6 +1247,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
   );
   const payload = {
     status: result.status,
+    ...(request.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity", ...(result.acpUsage ? { acpUsage: result.acpUsage } : {}) } : {}),
     jobId: request.jobId,
     threadId: result.threadId,
     turnId: result.turnId,
@@ -1180,12 +1262,12 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
     sandboxPolicy: result.sandboxPolicy ?? null,
     approvalPolicy: result.approvalPolicy ?? "unknown",
     model: result.model ?? request.model ?? null,
-    effort: result.effort ?? request.effort ?? null,
+    effort: result.effort ?? (request.backend === "antigravity" ? null : request.effort ?? null),
     serviceTier: result.serviceTier ?? request.serviceTier ?? null,
     approvedBrowserOrigins: result.approvedBrowserOrigins ?? request.approvedBrowserOrigins ?? [],
     approvedComputerApps: result.approvedComputerApps ?? request.approvedComputerApps ?? [],
     blockers: result.blockers ?? [],
-    commandExecutions: result.commandExecutions ?? [],
+    commandExecutions: boundCommandOutput(result.commandExecutions ?? []),
     ...(result.usage ? { usage: result.usage } : {}),
     reasoningSummary: result.reasoningSummary,
     startupTimings: result.startupTimings ?? {}, startupWarning: result.startupWarning ?? null,
@@ -1194,6 +1276,15 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
     interruptionReason: result.interruptionReason ?? null, interruptionConfirmed: result.interruptionConfirmed ?? null
   };
   const trackedJob = readStoredJob(resolveWorkspaceRoot(request.cwd), request.jobId);
+  // The ACP peer can exit without replying to session/cancel or session/prompt.
+  // Publish process exit separately from an acknowledgement of the assignment.
+  let acpEnd;
+  if (request.backend === "antigravity" && result.turnEnded === false &&
+      (trackedJob.turnSubmission === null || acpProcessGone(trackedJob))) {
+    acpEnd = acpTurnEnd(trackedJob);
+    updateJob(resolveWorkspaceRoot(request.cwd), request.jobId, () => acpEnd);
+    Object.assign(payload, acpEnd);
+  }
   const sharedChanges = payload.touchedFiles?.length
     ? workspaceChangeAttribution({ ...trackedJob, completedAt: result.completedAt ?? nowIso() }, listJobs(resolveWorkspaceRoot(request.cwd)))
     : {};
@@ -1203,6 +1294,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
   Object.assign(payload, { ...(trackedJob?.agentName ? { agentName: trackedJob.agentName } : {}), ownerId: trackedJob?.ownerId ?? null, sessionId: trackedJob?.sessionId ?? null });
   const artifacts = persistTaskArtifacts(resolveWorkspaceRoot(request.cwd), request.jobId, payload);
   const report = buildWorkerReport(payload, { jobId: request.jobId, ...artifacts });
+  if (acpEnd) Object.assign(report, acpEnd, { summary: acpEnd.recovery.detail });
   if (sharedChanges.changedFilesShared) Object.assign(report, { changedFilesShared: true, changedFilesNote: sharedChanges.changedFilesNote });
   Object.assign(report, { ...(trackedJob?.agentName ? { agentName: trackedJob.agentName } : {}), ownerId: payload.ownerId, sessionId: payload.sessionId }, leaseExpiryReport({ ...trackedJob, threadId: payload.threadId, result: payload }));
   if (payload.interruptionReason) {
@@ -1250,7 +1342,7 @@ function buildReviewJobMetadata(reviewName, target) {
   };
 }
 
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
+function buildTaskRunMetadata({ prompt, resumeLast = false, backend = "codex" }) {
   if (!resumeLast && process.env.CODEX_COMPANION_STOP_REVIEW_GATE === "1" && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
     return {
       title: "Codex Stop Gate Review",
@@ -1258,7 +1350,7 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
     };
   }
 
-  const title = resumeLast ? "Codex Resume" : "Codex Task";
+  const title = backend === "antigravity" ? resumeLast ? "Gemini Resume" : "Gemini Task" : resumeLast ? "Codex Resume" : "Codex Task";
   const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
   return {
     title,
@@ -1313,7 +1405,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   });
   // Set once on creation; adoption may change sessionId, never this origin.
   // A null submission distinguishes new, never-submitted jobs from legacy ones.
-  const record = { ...job, turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
+  const record = { ...job, ...(identity.backend === "antigravity" ? { backend: identity.backend, request: { backend: identity.backend, ...identity.settings } } : {}),
+    turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
     ...(lifecycle.budget ? { budget: lifecycle.budget } : {}),
     ...(identity.dispatchNonce ? { dispatchNonce: identity.dispatchNonce } : {}),
     ...(identity.dispatchToolUseId ? { dispatchToolUseId: identity.dispatchToolUseId,
@@ -1323,7 +1416,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   // Reserve the name under the same workspace lock that publishes job state.
   // Concurrent dispatches see this queued reservation before either launches.
   const stored = listJobs(workspaceRoot);
-  const inheritedPrevious = !identity.continued && identity.threadId ? resolveThreadInheritance(workspaceRoot, identity.threadId).job : null;
+  const inheritedPrevious = !identity.continued && identity.threadId
+    ? latestThreadJob(workspaceRoot, identity.threadId, { backend: identity.backend, startedOnly: true }) : null;
   let duplicateDispatch, releaseReservation;
   updateState(workspaceRoot, state => {
     const currentIds = new Set(state.jobs.map(candidate => candidate.id));
@@ -1333,7 +1427,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
       if (duplicateDispatch) return;
     }
     const threadCandidates = identity.threadId ? [...candidates, inheritedPrevious]
-      .filter(candidate => candidate?.threadId === identity.threadId)
+      .filter(candidate => candidate?.threadId === identity.threadId && jobBackend(candidate) === identity.backend)
       .sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")) || b.id.localeCompare(a.id)) : [];
     // Another session may use a different name on this thread. Preserve this
     // session's identity while retaining explicit --continue job semantics.
@@ -1360,7 +1454,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   // another worker, even if a competing launcher has not published handles yet.
   if (duplicateDispatch) return { ...duplicateDispatch, dispatchReused: true };
   try {
-    const linkedRun = linkJournalJob({ ...record, cwd: identity.cwd, model: identity.model, effort: identity.effort, request: { run: identity.run, ...(identity.roundtable ? { roundtable: identity.roundtable } : {}) } }, taskBrief(identity));
+    const linkedRun = linkJournalJob({ ...record, cwd: identity.cwd, model: identity.settings.model, effort: identity.settings.effort, request: { run: identity.run, ...(identity.roundtable ? { roundtable: identity.roundtable } : {}) } }, taskBrief(identity));
     if (linkedRun) {
       Object.assign(record, linkedRun);
       updateJob(workspaceRoot, record.id, () => linkedRun);
@@ -1395,11 +1489,11 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   return record;
 }
 
-function buildTaskRequest({ cwd, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins = [], approvedComputerApps = [], resumeLast, threadId, jobId, report, detached = false, developerInstructions, claudeMd, skills, agentType, agentMemory, claudeInstructionsBase, gitContext, budget, permissionPolicy, roundtable }) {
+function buildTaskRequest({ cwd, backend = "codex", settings, serviceTier, prompt, write, sandbox, approvedBrowserOrigins = [], approvedComputerApps = [], resumeLast, threadId, jobId, report, detached = false, developerInstructions, claudeMd, skills, agentType, agentMemory, claudeInstructionsBase, gitContext, budget, permissionPolicy, roundtable }) {
   return {
     cwd,
-    model,
-    effort,
+    ...(backend === "antigravity" ? { backend } : {}),
+    ...settings,
     serviceTier,
     prompt,
     developerInstructions,
@@ -1688,6 +1782,23 @@ function checkLivePermission(options, workspaceRoot, job) {
   }
 }
 
+function antigravityTaskSettings(options, previous, recorded) {
+  const settings = {};
+  const defaults = [
+    ["model", "selectedModel", ANTIGRAVITY_DEFAULT_MODEL],
+    ["effort", "selectedEffort", ANTIGRAVITY_DEFAULT_EFFORT]
+  ];
+  for (const [key, selectedKey, fallback] of defaults) {
+    const actual = previous?.result?.[key] ?? previous?.[selectedKey];
+    const inherited = actual ?? recorded[key];
+    const marker = key + "Default";
+    settings[key] = acpSetting(options[key] ?? inherited ?? fallback, key);
+    // A continued job may have ended before ACP applied its default request.
+    if (options[key] === undefined && actual == null && (inherited == null || previous?.request?.[marker])) settings[marker] = true;
+  }
+  return settings;
+}
+
 async function handleTask(argv) {
   // Parsing --session updates process.env; keep the inherited transcript's
   // original session identity so a nested host cannot relabel its parent's path.
@@ -1695,8 +1806,13 @@ async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, nativePermissionOptions({ ...COMMAND_OPTIONS.task,
     internalValueOptions: [...(COMMAND_OPTIONS.task.internalValueOptions ?? []), "agent-type"] }));
   const declaredAgentType = options["agent-type"];
-  if (declaredAgentType !== undefined && !["fugato:codex-native", "fugato:codex-reviewer", "fugato:codex-implementer", "fugato:codex-investigator"].includes(declaredAgentType)) {
+  if (declaredAgentType !== undefined && !["fugato:codex-native", "fugato:codex-reviewer", "fugato:codex-implementer", "fugato:codex-investigator", "fugato:gemini-native"].includes(declaredAgentType)) {
     throw new Error("--agent-type requires a declared native agent type.");
+  }
+  if (options.backend !== undefined) normalizeBackend(options.backend);
+  if (declaredAgentType === "fugato:gemini-native") {
+    if (options.backend !== undefined && options.backend !== "antigravity") throw new Error("The Gemini native worker requires --backend antigravity.");
+    options.backend = "antigravity";
   }
   const budgetDefaults = budgetDefaultsSetup();
   const budget = newJobBudget(
@@ -1734,13 +1850,15 @@ async function handleTask(argv) {
     seconds(options["timeout-sec"], WAIT_MAX_SEC, "--timeout-sec", WAIT_MAX_SEC);
   }
   let cwd = resolveCommandCwd(options);
-  let explicitJob = false;
+  let selectedJob = null;
+  let threadBackend = options.backend;
   if (options.to !== undefined) {
     for (const flag of ["thread", "continue", "fresh", "resume", "resume-last"]) {
       if (options[flag] !== undefined) throw new Error(`--to cannot be combined with --${flag}.`);
     }
     const selected = resolveWorkerTarget(cwd, options.to.trim());
-    explicitJob = selected.job.id === options.to.trim();
+    if (selected.job.id === options.to.trim()) selectedJob = selected.job;
+    threadBackend = jobBackend(selected.job);
     if (selected.job.jobClass !== "task" || !selected.job.threadId) throw new Error(`Worker ${options.to} has no resumable Codex thread.`);
     options.thread = selected.job.threadId;
     cwd = selected.cwd;
@@ -1750,50 +1868,55 @@ async function handleTask(argv) {
   // Bind the handle once so a later lookup cannot select a different thread.
   if (options.resume || options["resume-last"]) {
     if (options.thread !== undefined || options.continue !== undefined || options.fresh) throw new Error("Choose --thread, --continue, --fresh, or --resume/--resume-last; these options cannot be combined.");
-    const latest = await resolveLatestTrackedTaskThread(resolveWorkspaceRoot(cwd));
-    if (!latest) throw new Error("No previous Codex task thread was found for this repository.");
+    threadBackend = normalizeBackend(options.backend);
+    const latest = await resolveLatestTrackedTaskThread(resolveWorkspaceRoot(cwd), { backend: threadBackend });
+    if (!latest) throw new Error(`No previous ${threadBackend === "antigravity" ? "Antigravity task session" : "Codex task thread"} was found for this repository.`);
     options.thread = latest.id;
   }
-  let inheritance = options.thread ? resolveThreadInheritance(cwd, options.thread.trim(), { allowCrossSessionFallback: explicitThread || explicitJob }) : null;
-  const inherited = inheritance?.job;
-  if (inherited && options.to === undefined && options.cwd === undefined) cwd = inherited.request?.cwd ?? inherited.workspaceRoot ?? cwd;
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  // Run choice belongs to this dispatch, independently of inherited runtime
-  // settings and grants. Reject invalid selections before any worker starts.
-  validateTaskRun(cwd, options.run);
   // --continue <job-id>: one more turn on a stopped/finished job's own thread,
   // inheriting that job's recorded authorization and runtime choices so a
   // replacement worker does not have to reconstruct them.
-  const continued = options.continue === undefined ? null : readStoredJob(workspaceRoot, String(options.continue).trim());
+  let continued = options.continue === undefined ? null : readStoredJob(resolveWorkspaceRoot(cwd), String(options.continue).trim());
   if (options.continue !== undefined) {
     if (!continued) throw new Error(`No stored job found for --continue ${options.continue}.`);
     if (continued.jobClass !== "task" || !continued.threadId) throw new Error(`Job ${continued.id} has no resumable Codex thread; nothing to continue.`);
+    if (needsAcpRecovery(continued)) {
+      await reconcileLostTurn(resolveWorkspaceRoot(cwd), continued);
+      continued = readStoredJob(resolveWorkspaceRoot(cwd), continued.id);
+    }
     if (ACTIVE.has(continued.status)) throw new Error(`Job ${continued.id} is still ${continued.status}; wait for it to end (or cancel it) before continuing its thread.`);
-    for (const flag of ["thread", "fresh", "resume", "resume-last", "write", "model", "effort", "fast", "normal"]) {
+    for (const flag of ["backend", "thread", "fresh", "resume", "resume-last", "write", "model", "effort", "fast", "normal"]) {
       if (options[flag] !== undefined) throw new Error(`--continue inherits the original job's ${flag} setting; do not pass --${flag}.`);
     }
     if (options["approve-browser-origin"]?.length) throw new Error("--continue inherits the original job's approved browser origins; do not pass --approve-browser-origin.");
     if (options["approve-computer-app"]?.length) throw new Error("--continue inherits the original job's approved Computer Use apps; do not pass --approve-computer-app.");
+    selectedJob = continued;
   }
-  const sourceJob = continued ? startedThreadSettings(continued) ? continued
-    : resolveThreadInheritance(cwd, continued.threadId, { allowCrossSessionFallback: true }).job : inherited;
+  let threadId = continued ? continued.threadId : options.thread?.trim() ?? null;
+  const inheritance = threadId ? resolveThreadInheritance(cwd, threadId, {
+    selectedJob, backend: threadBackend, continued: Boolean(continued), allowCrossSessionFallback: explicitThread || Boolean(selectedJob)
+  }) : null;
+  const sourceJob = inheritance?.job;
   const previousRequest = sourceJob?.request;
+  if (sourceJob && !continued && options.to === undefined && options.cwd === undefined) cwd = previousRequest?.cwd ?? sourceJob.workspaceRoot ?? cwd;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  validateTaskRun(cwd, options.run);
   if (continued && options.sandbox !== undefined && startedThreadSettings(continued) && recordedThreadSettings(continued).sandbox) {
     throw new Error("--continue inherits the original job's sandbox setting; do not pass --sandbox.");
   }
-  const sourceSession = (sourceJob?.sessionId === undefined ? sourceJob?.ownerId : sourceJob.sessionId) || null;
-  const sameSession = sourceSession === (getCurrentClaudeSessionId()?.trim() || null);
   // Handles select thread settings, not another Claude session's permission.
   // Never copy grants added only to the job by runtime answers.
   const grants = requestGrantsInSession(sourceJob);
   const grantRequest = grants ? previousRequest : null;
-  if (continued) inheritance = { details: {
-    jobId: sourceJob?.id ?? null, scope: sameSession ? "session" : "workspace",
-    settingsInherited: Boolean(sourceJob), requestGrantsInherited: grants,
-    note: grants ? "Inherited settings and recorded request grants from this session's job; runtime-only grants were excluded."
-      : "Inherited settings from the continued job; no request grants recorded in this session were inherited."
-  } };
   const recordedSettings = recordedThreadSettings(sourceJob);
+  const backend = normalizeBackend(options.backend ?? inheritance?.backend);
+  if (inheritance?.backend && backend !== inheritance.backend) {
+    throw new Error("A worker session keeps its original backend. Start a fresh task to change --backend.");
+  }
+  if (backend === "antigravity" && options["max-tokens"] === undefined && budget.maxTokens !== null) {
+    budget.maxTokens = null;
+    process.stderr.write("Ignoring the saved default max-tokens for Antigravity: ACP reports token usage only when a turn ends, so Fugato cannot stop a turn at a token budget.\n");
+  }
   const recordedSandbox = recordedSettings.sandbox;
   if ((continued || options.thread?.trim()) && !SANDBOX_MODES.includes(recordedSandbox) && options.sandbox === undefined) {
     const message = "No recorded sandbox settings are available for this thread; pass --sandbox explicitly before continuing.";
@@ -1810,12 +1933,13 @@ async function handleTask(argv) {
   const lifecycle = { budget, owner: options.owner, leaseSec: seconds(options["lease-sec"] ?? process.env.CODEX_COMPANION_LEASE_SEC, options.direct ? 1800 : 180, "--lease-sec"), questionTimeoutSec: seconds(options["question-timeout-sec"], 900, "--question-timeout-sec") };
   if ((options.roundtable !== undefined) !== (options.persona !== undefined)) throw new Error("--roundtable and --persona must be supplied together.");
   const previousRoundtable = continued?.request?.roundtable ?? previousRequest?.roundtable
-    ?? (options.thread ? latestThreadJob(cwd, options.thread)?.request?.roundtable : null);
+    ?? (options.thread ? latestThreadJob(cwd, options.thread, { backend })?.request?.roundtable : null);
   const roundtable = options.roundtable !== undefined ? { roomId: options.roundtable, persona: options.persona } : previousRoundtable;
   if ((continued || options.thread) && options.roundtable !== undefined &&
       (!previousRoundtable || previousRoundtable.roomId !== roundtable.roomId || previousRoundtable.persona !== roundtable.persona)) {
     throw new Error("A resumed thread keeps its original roundtable/persona binding; start a fresh thread to seat a new member.");
   }
+  if (backend === "antigravity" && roundtable) throw new Error("Antigravity roundtable personas are not supported yet. Dispatch independent Gemini workers with --backend antigravity.");
   const seating = roundtable ? validateMember(roundtable.roomId, roundtable.persona, getCurrentClaudeSessionId()) : null;
   if (seating?.member.threadId && seating.member.threadId !== (continued?.threadId ?? options.thread)) throw new Error("Roundtable member already has a thread; continue that thread with --to or --thread.");
   // Member activity always journals to the room's run, never the session's
@@ -1829,23 +1953,24 @@ async function handleTask(argv) {
       throw new Error(`Roundtable member ${roundtable.persona} must use its recorded workspace; pass --cwd ${JSON.stringify(workspace)}.`);
     }
   }
-  const defaults = readWorkerDefaults();
-  const model = normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model;
-  const effort = normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort;
+  const defaults = backend === "codex" ? readWorkerDefaults() : {};
+  const settings = backend === "antigravity" ? antigravityTaskSettings(options, sourceJob, recordedSettings) : {
+    model: normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model,
+    effort: normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort
+  };
   if (options.fast && options.normal) throw new Error("Choose either --fast or --normal.");
   const serviceTier = options.fast ? "priority" : options.normal || options.fast === false ? null : recordedSettings.serviceTier ?? null;
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = false;
   const fresh = Boolean(options.fresh);
-  let threadId = continued ? continued.threadId : options.thread?.trim() ?? null;
   if (options.thread !== undefined && (!threadId || threadId.startsWith("--"))) {
     throw new Error("Provide a non-empty thread ID for --thread.");
   }
   if (threadId && fresh) {
     throw new Error("Choose --thread, --fresh, or --resume/--resume-last; these options cannot be combined.");
   }
-  const contextRequest = previousRequest ?? (threadId ? latestThreadJob(cwd, threadId)?.request : null);
+  const contextRequest = previousRequest ?? (threadId ? latestThreadJob(cwd, threadId, { backend })?.request : null);
   const claudeInstructions = prepareClaudeInstructions({
     sessionId: process.env[SESSION_ID_ENV], cwd, sessionCwd: options["session-cwd"],
     previousRequest: contextRequest?.claudeInstructionsBase !== undefined ? { ...contextRequest, developerInstructions: contextRequest.claudeInstructionsBase } : contextRequest,
@@ -1872,6 +1997,10 @@ async function handleTask(argv) {
   }
   const permissionPolicy = taskPermissionPolicy(options, cwd, previousRequest?.permissionPolicy);
   if (permissionPolicy) sandbox = permissionPolicy.sandbox;
+  if (backend === "antigravity") {
+    validateAntigravityTask({ options, sandbox, permissionPolicy, budget, roundtable });
+    if (permissionMappingSetup().permissionMapping === "claude") throw new Error("Antigravity ACP does not support Claude permission mapping. Use a Codex worker while permission mapping is enabled.");
+  }
   write = sandbox !== "read-only";
   const agentType = contextRequest?.agentType ?? declaredAgentType ?? (nativeAgentName ? "fugato:codex-native" : null);
   const skillContext = threadId ? { skills: contextRequest?.skills ?? [], text: "" } : prepareClaudeSkills({ agentType, cwd });
@@ -1902,29 +2031,33 @@ async function handleTask(argv) {
   }
   // The browser is unrestricted by default: mirror the saved preference into
   // the browser runtime's own file before Codex starts (a no-op once written).
-  try { ensureBrowserApproval(); } catch (error) { process.stderr.write(`Browser approval preference not applied: ${error.message}\n`); }
-  // Computer Use: in mirror mode (the default) the apps the user marked "always
-  // allow" in their Codex app are copied into the isolated runtime's own
-  // approval file (read-only on ~/.codex; a no-op once in step).
-  try { ensureComputerUseApproval(); } catch {
-    // Retry an interrupted mirror before starting the runtime. Persistent
-    // failures leave the old allowlist or a fully recorded new one; pending
-    // provenance is retained, so no partial grant becomes explicit consent.
-    try { ensureComputerUseApproval(); } catch (error) { process.stderr.write(`Computer Use approval preference not applied: ${error.message}\n`); }
+  if (backend === "codex") {
+    try { ensureBrowserApproval(); } catch (error) { process.stderr.write(`Browser approval preference not applied: ${error.message}\n`); }
+    // Computer Use: in mirror mode (the default) the apps the user marked "always
+    // allow" in their Codex app are copied into the isolated runtime's own
+    // approval file (read-only on ~/.codex; a no-op once in step).
+    try { ensureComputerUseApproval(); } catch {
+      // Retry an interrupted mirror before starting the runtime. Persistent
+      // failures leave the old allowlist or a fully recorded new one; pending
+      // provenance is retained, so no partial grant becomes explicit consent.
+      try { ensureComputerUseApproval(); } catch (error) { process.stderr.write(`Computer Use approval preference not applied: ${error.message}\n`); }
+    }
+    // Project instructions: let Codex read CLAUDE.md where no AGENTS.md exists
+    // (its own project_doc_fallback_filenames; a no-op once written).
+    try { ensureProjectDocs(); } catch (error) { process.stderr.write(`Project instructions preference not applied: ${error.message}\n`); }
   }
-  // Project instructions: let Codex read CLAUDE.md where no AGENTS.md exists
-  // (its own project_doc_fallback_filenames; a no-op once written).
-  try { ensureProjectDocs(); } catch (error) { process.stderr.write(`Project instructions preference not applied: ${error.message}\n`); }
   const taskMetadata = buildTaskRunMetadata({
+    backend,
     prompt,
     resumeLast: Boolean(resumeLast || threadId)
   });
 
   if (options.background || options.detached || options.follow || options.direct) {
-    ensureCodexAvailable(cwd);
+    if (backend === "antigravity") ensureAntigravityAvailable(cwd);
+    else ensureCodexAvailable(cwd);
 
     if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
     if (job.dispatchReused) {
       await waitForJob(workspaceRoot, job, { owner: job.ownerId, timeoutSec: options["timeout-sec"], direct: true, quiet: options.quiet, toolUseId: dispatchToolUseId });
       return;
@@ -1935,8 +2068,8 @@ async function handleTask(argv) {
       budget,
       permissionPolicy,
       cwd,
-      model,
-      effort,
+      backend,
+      settings,
       serviceTier,
       prompt,
       write,
@@ -1976,8 +2109,8 @@ async function handleTask(argv) {
   }
 
   if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
-  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
+  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, settings, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
   if (options.run !== undefined) job.request.run = options.run;
   if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
   Object.assign(job.request, forkRequest);
@@ -1989,8 +2122,8 @@ async function handleTask(argv) {
         ...claudeInstructions,
         permissionPolicy,
         cwd,
-        model,
-        effort,
+        backend,
+        ...settings,
         serviceTier,
         prompt,
         write,
@@ -2084,6 +2217,7 @@ async function handleTaskWorker(argv) {
 // Reports stored by earlier releases lack the run settings; fill them from the
 // recorded request so task/wait/result --report always show them.
 function withRunSettings(report, request) {
+  if (request?.backend === "antigravity") Object.assign(report, { backend: "antigravity", provider: "Google Antigravity" });
   for (const key of ["model", "effort", "serviceTier"]) report[key] ??= request?.[key] ?? null;
   if (request?.forked) {
     for (const key of ["forked", "forkSourceSha256", "forkImportId", "forkLabel", "threadId"]) report[key] = request[key];
@@ -2171,11 +2305,106 @@ async function handleInferredTurnRecheck(argv) {
   } catch { /* Optional recovery must never surface a helper failure to the user. */ }
 }
 
+function acpTurnEnd(job) {
+  const turnResolution = job.turnSubmission === null ? "notStarted" : "unknown";
+  const detail = turnResolution === "notStarted"
+    ? "The worker stopped before submitting the Antigravity prompt."
+    : "The owned Antigravity process exited without a confirmed prompt result. The turn outcome is unknown. The assignment has not been replayed.";
+  return { turnEnded: true, turnResolution, interruptionConfirmed: false,
+    recovery: { status: "recovered", source: "antigravity-acp", threadId: job.threadId ?? null,
+      turnId: job.turnId ?? null, turnStatus: turnResolution, detail } };
+}
+
+// A record can still need its final status published after its turn has
+// already ceased to block the session. Leave unclaimed queued launches alone.
+function needsAcpRecovery(job) {
+  return isAntigravityJob(job) && job.jobClass === "task" && !job.recovered && !job.result?.turnEnded
+    && (ACTIVE.has(job.status) ? Boolean(job.pid) : ["failed", "interrupted", "cancelled"].includes(job.status))
+    && !processAlive(job.pid);
+}
+
+function readEndedAcpResult(job, artifacts) {
+  if (!job.threadId || !job.turnId) return null;
+  try {
+    const result = JSON.parse(fs.readFileSync(artifacts.resultFile, "utf8"));
+    if (result?.backend !== "antigravity" || result.jobId !== job.id || result.threadId !== job.threadId ||
+        result.turnId !== job.turnId || result.turnEnded !== true || !Number.isInteger(result.status) ||
+        typeof result.rawOutput !== "string") return null;
+    const ownReason = result.interruptionReason;
+    const turnResolution = result.turnResolution ?? (ownReason ? result.interruptionConfirmed ? "interrupted" : "unknown"
+      : result.status === 0 ? "completed" : "failed");
+    const reason = ownReason || job.cancelRequested?.reason;
+    const stopStatus = reason === "cancelled_by_user" ? "cancelled" : "interrupted";
+    if (reason && !ownReason) {
+      // Cancellation won the publication lock after the worker saved its
+      // result. Preserve the actual turn outcome across a retry of recovery.
+      Object.assign(result, { status: 1, workerStatus: stopStatus, turnResolution,
+        interruptionReason: reason, interruptionConfirmed: result.interruptionConfirmed === true });
+      const temporary = artifacts.resultFile + "." + randomUUID() + ".tmp";
+      try {
+        fs.writeFileSync(temporary, JSON.stringify(result, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+        fs.renameSync(temporary, artifacts.resultFile);
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
+    }
+    const report = buildWorkerReport(result, { jobId: job.id, ...artifacts });
+    const status = reason ? stopStatus : report.status;
+    if (reason) Object.assign(report, continuationReport(job));
+    const recovery = result.recovery ?? { status: "recovered", source: "result-artifact", threadId: job.threadId,
+      turnId: job.turnId, turnStatus: turnResolution, detail: "Recovered the matching final Antigravity result saved before the worker exited." };
+    const completedAt = job.completedAt ?? nowIso();
+    return { ...artifacts, status, phase: status === "completed" ? "done" : status, completedAt, pid: null,
+      recovered: true, recoveredAt: nowIso(), recovery, turnEnded: true, turnResolution,
+      interruptionConfirmed: result.interruptionConfirmed === true, errorMessage: result.error ?? null,
+      result: { ...result, ...artifacts, workerStatus: status }, report: { ...report, status, recovery },
+      summary: snippet(firstMeaningfulLine(redactActivity(result.rawOutput), result.error ?? recovery.detail), 300) };
+  } catch (error) {
+    if (error.code === "ENOENT" || error instanceof SyntaxError || error instanceof TypeError) return null;
+    throw error;
+  }
+}
+
+function reconcileAcpTurn(workspaceRoot, stored, isCurrent) {
+  const current = updateJob(workspaceRoot, stored.id, latest => {
+    if (!isCurrent(latest) || !needsAcpRecovery(latest)) return null;
+    const artifacts = taskArtifactPaths(workspaceRoot, latest.id);
+    const ended = readEndedAcpResult(latest, artifacts);
+    if (ended) return ended;
+    const stopped = ACTIVE.has(latest.status)
+      ? { status: "failed", phase: "failed", completedAt: nowIso(), pid: null } : {};
+    const gone = acpProcessGone(latest);
+    if (!gone && latest.turnSubmission !== null) {
+      const detail = "The Antigravity worker exited without a prompt result. Exit of its owned ACP process is unconfirmed.";
+      return { ...stopped, turnResolution: "unknown", recovery: { status: "unknown", source: "antigravity-acp", detail } };
+    }
+    const end = acpTurnEnd(latest), status = stopped.status ?? latest.status;
+    const result = { status: 1, backend: "antigravity", threadId: latest.threadId ?? null, turnId: latest.turnId ?? null,
+      error: latest.errorMessage ?? end.recovery.detail, ...latest.result, ...end, workerStatus: status };
+    // A crash between the artifact write and terminal publication can leave
+    // captured output on disk. Keep it available for inspection.
+    if (!fs.existsSync(artifacts.rawOutputFile)) fs.writeFileSync(artifacts.rawOutputFile, result.rawOutput ?? "", { mode: 0o600 });
+    fs.writeFileSync(artifacts.resultFile, JSON.stringify(result, null, 2) + "\n", { mode: 0o600 });
+    const report = { ...(latest.report ?? buildWorkerReport(result, { jobId: latest.id, ...artifacts })),
+      status, ...end, summary: end.recovery.detail };
+    return { ...stopped, ...artifacts, ...end, ...(gone ? { acpProcessExited: true } : {}),
+      recovered: true, recoveredAt: nowIso(), result, report, summary: end.recovery.detail };
+  });
+  if (current.recovered) recordFinishedJob(current);
+  return { outcome: current.turnResolution ?? "unknown", result: current.result, recovery: current.recovery };
+}
+
 export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null, interruptRequested = false, admittingJobId = null, isCurrent = () => true, privateWhenBusy = false } = {}) {
   let stored = restoreMissingTaskRecord(workspaceRoot, job);
   if (!isCurrent(stored)) return { outcome: "unknown" };
+  // Each ACP connection owns one process. A second connection cannot read
+  // the lost turn's result, including through a session/load history replay.
+  if (needsAcpRecovery(stored)) return reconcileAcpTurn(workspaceRoot, stored, isCurrent);
   if (!unresolvedTask(stored)) {
     return { outcome: stored?.recovered ? stored.recovery?.turnStatus ?? stored.status : "unknown", result: stored?.result };
+  }
+  if (jobBackend(stored) === "antigravity") {
+    return { outcome: "unknown", recovery: stored.recovery };
   }
   // A queued launch without a PID is not evidence of a dead worker. Legacy
   // terminal records without turn handles must also retain their outcome.
@@ -2200,7 +2429,7 @@ export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null,
     const attributionConfirmed = latest => {
       if (result.turnStatus === "notStarted" && stored.turnSubmission === null) return latest.turnSubmission === null;
       if (!latest.threadId || latest.turnId) return true;
-      const inventory = recordedThreadJobs(latest.threadId);
+      const inventory = recordedThreadJobs(latest.threadId, "codex");
       return result.turnId ? uniqueTurnAttribution(latest, { id: result.turnId, startedAt: result.turnStartedAt }, inventory, admittingJobId) : inventory.complete;
     };
     if (!stored.turnId) {
@@ -2321,7 +2550,7 @@ async function refreshJobSnapshot(cwd, reference) {
   const { workspaceRoot, job } = snapshot;
   const stored = restoreMissingTaskRecord(workspaceRoot, job);
   if (stored) recordFinishedJob(stored);
-  if (!unresolvedTask(stored)) return buildSingleJobSnapshot(cwd, job.id);
+  if (!needsAcpRecovery(stored) && !unresolvedTask(stored)) return buildSingleJobSnapshot(cwd, job.id);
   const { recovery } = await reconcileLostTurn(workspaceRoot, job);
   // A concurrent reader may have recovered while this read was unavailable.
   // Prefer its committed terminal result over our transient recovery notice.
@@ -2474,7 +2703,7 @@ async function handleResult(argv) {
 
 function handleTaskResumeCandidate(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["backend", "cwd"],
     booleanOptions: ["json"]
   });
   validatePositionalArity(positionals, 0, "task-resume-candidate");
@@ -2483,7 +2712,8 @@ function handleTaskResumeCandidate(argv) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
   const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
+  const backend = normalizeBackend(options.backend);
+  const candidate = findLatestResumableTaskJob(jobs.filter(job => jobBackend(job) === backend));
 
   const payload = {
     available: Boolean(candidate),
@@ -2493,6 +2723,7 @@ function handleTaskResumeCandidate(argv) {
         ? null
         : {
             id: candidate.id,
+            ...(jobBackend(candidate) === "antigravity" ? { backend: "antigravity" } : {}),
             status: candidate.status,
             title: candidate.title ?? null,
             summary: candidate.summary ?? null,
@@ -2578,6 +2809,7 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
       confirmation: confirmed || alreadyEnded ? "confirmed" : "unconfirmed",
       turnInterruptAttempted: attempted,
       turnInterrupted: attempted && (current.turnInterrupted ?? confirmed), reason: "cancelled_by_user",
+      ...(isAntigravityJob(current) && current.recovery?.detail ? { detail: current.recovery.detail } : {}),
       backgroundTerminals: current.backgroundTerminals ?? { cleaned: false, detail: "Background terminal cleanup has not been confirmed." } };
     report(payload);
     if (!confirmed && !alreadyEnded) process.exitCode = 2;
@@ -2593,6 +2825,9 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
     const target = resolveWorkerTarget(cwd, reference, { command: "cancel", nameState: "cancel", legacyReferences: true });
     namedWorker = target.job.agentName?.toLowerCase() === reference.toLowerCase();
     ({ cwd, reference } = target);
+  } else {
+    selectedTarget = resolveCancelableJob(cwd, reference, { env: process.env });
+    if (isAntigravityJob(selectedTarget.job)) reference = selectedTarget.job.id;
   }
   if (reference) {
     const snapshot = buildSingleJobSnapshot(cwd, reference);
@@ -2606,11 +2841,36 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
     if (namedWorker && stored?.status === "blocked" && stored.threadId) {
       const predecessorId = stored.result?.blockers?.find(blocker => blocker.code === "thread_busy")?.predecessorJobId;
       const predecessor = predecessorId && readStoredJob(snapshot.workspaceRoot, predecessorId);
-      if (predecessor?.threadId === stored.threadId && unresolvedTask(predecessor)) stored = predecessor;
+      if (predecessor?.threadId === stored.threadId && jobBackend(predecessor) === jobBackend(stored) && unresolvedTask(predecessor)) stored = predecessor;
     }
     if (stored) selectedTarget = { workspaceRoot: snapshot.workspaceRoot, job: stored };
     if (stored && expect && !expect(stored)) {
       reportUnchanged(snapshot.workspaceRoot, stored);
+      return;
+    }
+    if (isAntigravityJob(stored)) {
+      let current = stored;
+      if (ACTIVE.has(current.status) || unresolvedTask(current)) {
+        current = requestCancel(snapshot.workspaceRoot, stored.id, "cancelled_by_user", { expect });
+        if (!current) { reportUnchanged(snapshot.workspaceRoot, stored); return; }
+      }
+      // Give the live worker its chance to send session/cancel on the original
+      // connection. A dead worker can no longer signal its orphaned group.
+      for (const deadline = Date.now() + 6000; Date.now() < deadline && ACTIVE.has(current.status)
+          && (!current.pid || processAlive(current.pid));) {
+        await sleep(100);
+        current = readStoredJob(snapshot.workspaceRoot, stored.id);
+      }
+      if (expect && !expect(current)) { reportUnchanged(snapshot.workspaceRoot, current); return; }
+      if (!processAlive(current.pid) && current.acpProcessPid && !current.acpProcessExited) {
+        await stopOrphanedAcpGroup(current);
+        if (acpProcessGone(current)) {
+          current = updateJob(snapshot.workspaceRoot, stored.id, latest => latest.acpProcessPid === current.acpProcessPid
+            && !processAlive(latest.pid) ? { acpProcessExited: true } : null);
+        }
+      }
+      if (needsAcpRecovery(current)) await reconcileLostTurn(snapshot.workspaceRoot, current);
+      reportOutcome(readStoredJob(snapshot.workspaceRoot, stored.id));
       return;
     }
     if (stored && !ACTIVE.has(stored.status) && !unresolvedTask(stored)) {
@@ -2642,7 +2902,7 @@ async function cancelWorker(cwd, reference, report, { expect = null } = {}) {
         stored = readStoredJob(snapshot.workspaceRoot, stored.id) ?? stored;
       }
       if (stored.recovered && stored.recovery?.turnStatus === "notStarted") {
-        const inventory = stored.threadId ? recordedThreadJobs(stored.threadId) : { jobs: [], complete: true };
+        const inventory = stored.threadId ? recordedThreadJobs(stored.threadId, "codex") : { jobs: [], complete: true };
         const otherOwner = inventory.jobs.find(candidate => candidate.id !== stored.id &&
           (processAlive(candidate.pid) || (candidate.turnId && (ACTIVE.has(candidate.status) || unresolvedTask(candidate)))));
         const backgroundTerminals = stored.threadId && inventory.complete && !otherOwner
@@ -2945,7 +3205,7 @@ async function waitForJob(workspaceRoot, job, { owner, timeoutSec, minIntervalSe
       if (moved) { detachReason = "moved"; stopRenewal(); await finish({ ...moved, ...reported(), cursor }, 2); return; }
       if (attached && current.ownerWaitToken !== waitToken) { stopRenewal(); throw new Error("This owner wait was replaced; the replacement is responsible for waiting."); }
       let recovery = null;
-      if (unresolvedTask(current)) {
+      if (needsAcpRecovery(current) || unresolvedTask(current)) {
         let resolution;
         if (Date.now() >= recoveryRetryAt) {
           resolution = await reconcileLostTurn(workspaceRoot, current);

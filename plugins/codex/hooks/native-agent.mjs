@@ -2,10 +2,10 @@
 // No Node globals/imports in this sandbox; all host work goes through $.
 import { cleanDisplayText } from '../scripts/lib/display-text.mjs';
 import { lifecycleStoreSize, forgetLifecycle, pendingLifecycle, captureStartContext, lifecycleBrief, observeStop, prepareLifecycleStep, abandonLifecycleStop } from './lifecycle-hooks.mjs';
-import { registerSteering } from './steering.mjs';
+import { GEMINI_BUSY, registerSteering } from './steering.mjs';
 import { registerRoundtableNotifier, startRoundtableNotifier, stopRoundtableMember, roundtableNotice, settleRoundtableNotice, isRoundtableNoticeTurn } from './roundtable-notifier.mjs';
 import { PERSONA_IDS } from '../scripts/lib/roundtable-personas.mjs';
-import { AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
+import { AGENT_TYPE, GEMINI_AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
 import { PREFIX, BINDING_FAILED, keyFor, bindingFailedKey, startedTypes, knownTypes, ours } from './native-identity.mjs';
 import { register as teammateReceive, teammateUnsupported, paneTeammate } from './native-teams.mjs';
 import { cleanCommand, displayPath, quoteWord } from './command-display.mjs';
@@ -87,13 +87,16 @@ const ended = (job, state) => (['interrupted', 'cancelled'].includes(job.status)
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_RECORDS = 128, MAX_STORE_SIZE = 2 * 1024 * 1024;
 const nativeAgents = { plugin: 'fugato', key: 'nativeAgents' };
+const displayModel = job => job.result?.model || job.selectedModel || job.request?.model;
+const displayEffort = job => job.result?.effort ?? (job.selectedEffort !== undefined ? job.selectedEffort : job.request?.effort);
 // Display metadata only; the durable binding remains the execution authority.
 async function publishActivity($, state, job) {
   try {
     const current = await $.store.get(keyFor(state.session, state.agentId));
     if (current && bindingTurn(current) !== bindingTurn(state)) return;
     const entry = { jobId: job.id, threadId: job.threadId || '', workspace: job.request?.cwd || state.cwd || '',
-      name: job.agentName || state.name || state.agentId, model: job.request?.model || 'unknown' };
+      name: job.agentName || state.name || state.agentId, model: displayModel(job) || 'unknown',
+      ...(job.request?.backend === 'antigravity' ? { backend: 'antigravity' } : {}) };
     for (let attempt = 0; attempt < 8; attempt++) {
       const { value = {}, version } = await $.state.get(nativeAgents);
       const models = { ...value[state.agentId]?.models, [entry.jobId]: entry.model };
@@ -116,9 +119,13 @@ async function activityModel($, jobId) {
   return 'unknown';
 }
 const stateSize = state => JSON.stringify(state ?? null).length * 4;
+const backendFor = state => state.backend ?? state.preset?.backend ?? PRESETS[state.type]?.backend ?? 'codex';
+const runtimeLabel = state => backendFor(state) === 'antigravity' ? 'Antigravity' : 'Codex';
+const agentProse = text => /^(?:Codex|Antigravity):/.test(text);
+const GEMINI_FALLBACK = 'Check fugato status before retrying. For a confirmed unstarted assignment, dispatch fugato task --backend antigravity through background Bash; use the existing worker handle for a continuation.';
 const finished = state => state?.finishedAt && !state.incoming
   && state.status !== 'needs_answer' && state.answer?.status !== 'needs_answer';
-const ALLOWED = '--model, --effort, --sandbox, --fast/--normal, --cwd, --fork, --max-minutes, --max-tokens, --roundtable, --persona';
+const ALLOWED = '--backend, --model, --effort, --sandbox, --fast/--normal, --cwd, --fork, --max-minutes, --max-tokens, --roundtable, --persona';
 // Display only: an entry exists only while this module owns a live flight.
 const liveProgress = new Map();
 const toolAgents = new Map(), agentDisplays = new Map();
@@ -131,6 +138,17 @@ const COORDINATOR_SUFFIX = '\n\nAddress this before completing your current task
 // exact framing so run-log binding can still match them.
 const coordinatorBody = text => text.startsWith(COORDINATOR_PREFIX) && text.endsWith(COORDINATOR_SUFFIX)
   ? text.slice(COORDINATOR_PREFIX.length, -COORDINATOR_SUFFIX.length) : text;
+const incomingBody = (state, text) => state?.jobId || state?.intent || state?.answeredTurn ? coordinatorBody(text) : text;
+function geminiAnswer(text) {
+  const newline = text.indexOf('\n');
+  const header = (newline < 0 ? text : text.slice(0, newline)).trim();
+  const match = /^Answer (\S+)$/.exec(header);
+  return match && { id: match[1], body: newline < 0 ? '' : text.slice(newline + 1) };
+}
+function geminiAnswerNext(state, question) {
+  const approval = question.kind === 'action-approval';
+  return `SendMessage to ${state.name || state.agentId}: "Answer ${question.id}\n${approval ? 'Allow once' : '<your answer>'}"${approval ? ' (or Deny)' : ''}`;
+}
 const logKey = (agentId, turnId) => JSON.stringify([agentId, turnId]);
 const invalidateProgress = $ => {
   try { $.ui.invalidate('ui.render'); } catch { /* Display must never affect a turn. */ }
@@ -242,12 +260,14 @@ function updateDisplay($, state, job) {
   feed.cwd = view.cwd = job?.request?.cwd ?? state.cwd;
   view.role = state.roundtable?.persona || (/^fugato:codex-(reviewer|investigator|implementer)$/.exec(state.type)?.[1] ?? 'worker');
   view.name = state.worker || state.name || view.name;
-  if (typeof state.effort === 'string') view.effort = state.effort;
+  if (backendFor(state) === 'codex' && typeof state.effort === 'string') view.effort = state.effort;
   if (job) {
     view.jobId = job.id || state.jobId;
     const request = job.request;
-    if (typeof request?.model === 'string') view.model = request.model;
-    if (typeof request?.effort === 'string') view.effort = request.effort;
+    const model = displayModel(job), effort = displayEffort(job);
+    if (typeof model === 'string') view.model = model;
+    if (typeof effort === 'string') view.effort = effort;
+    else if (job.selectedEffort === null) delete view.effort;
     if (typeof request?.sandbox === 'string') view.sandbox = request.sandbox;
     if (request && Object.hasOwn(request, 'serviceTier')) view.speed = request.serviceTier === 'priority' ? 'fast' : 'normal';
     view.question = ACTIVE.includes(job.status) && job.pendingQuestion?.answer === undefined
@@ -262,9 +282,10 @@ const elapsedDisplay = ms => {
 };
 const commandStart = text => /^▸/.test(text) || /^Bash\(.*\) · running\s*$/.test(text);
 function logEntry(text) {
-  if (/^Codex worker .+ (?:running|started) · /.test(text)
-    || /^Codex tokens \(provider:|^Open Codex activity:|^\s*(?:└|⎿)\s*Done\b/.test(text)) return null;
-  if (text.startsWith('Codex:')) return { kind: 'message', title: text.slice(6).trim() };
+  if (/^(?:Codex|Antigravity) worker .+ (?:running|started) · /.test(text)
+    || /^(?:Codex|Antigravity) tokens \(provider:|^Open (?:Codex|Antigravity) activity:|^\s*(?:└|⎿)\s*Done\b/.test(text)) return null;
+  const prose = /^(?:Codex|Antigravity):/.exec(text);
+  if (prose) return { kind: 'message', title: text.slice(prose[0].length).trim() };
   if (text.startsWith('? Waiting for Claude:')) return { kind: 'question', title: text.slice(21).trim() };
   if (/^(?:↳ )?answered\b/i.test(text)) return { kind: 'answered', title: '↳ answered' };
   const event = (title, result) => ({ kind: 'event', title, result, running: result === 'running' });
@@ -620,8 +641,10 @@ const nativeNext = (state, status, blockers = []) => {
     ['context_window_exceeded', 'provider_refused', 'auth_required', 'native_remote_isolation', 'native_teammate_unsupported'].includes(blocker.code));
   if (blocker?.code === 'context_window_exceeded') return 'Start a new native agent with a shorter brief.';
   if (blocker?.code === 'provider_refused') return 'Start a new native agent with a reworded brief.';
-  if (blocker?.code === 'auth_required') return 'Run /fugato:setup, then start a new native agent.';
-  if (blocker?.code === 'native_remote_isolation') return 'Start a local native agent, optionally with isolation: "worktree".';
+  if (blocker?.code === 'auth_required') return backendFor(state) === 'antigravity'
+    ? 'Run agy acp --login, then start a new Gemini agent.' : 'Run /fugato:setup, then start a new native agent.';
+  if (blocker?.code === 'native_remote_isolation') return backendFor(state) === 'antigravity'
+    ? 'Start a local Gemini agent without isolation.' : 'Start a local native agent, optionally with isolation: "worktree".';
   if (blocker?.code === 'native_teammate_unsupported') return 'Use in-process teammate mode or a local subagent; stop any pane teammate already started.';
   return `SendMessage to ${state.name || state.agentId} ${status === 'needs_answer' ? 'with the answer' : 'to continue'}`;
 };
@@ -646,7 +669,7 @@ const RECOVERY_STATUSES = ['unknown', 'unreachable'];
 const UNSETTLED = [...ACTIVE, ...RECOVERY_STATUSES];
 const REPORT_STATUSES = new Set([...ACTIVE, ...RECOVERY_STATUSES, 'completed', 'needs_input', 'needs_answer', 'blocked',
   'failed', 'interrupted', 'cancelled', 'owner_stopped', 'ownership_moved']);
-const REPORT_FIELDS = new Set(['status', 'worker', 'jobId', 'summary', 'summaryTruncated', 'blockers',
+const REPORT_FIELDS = new Set(['status', 'worker', 'jobId', 'backend', 'provider', 'model', 'summary', 'summaryTruncated', 'blockers',
   'question', 'changedFiles', 'changedFilesShared', 'changedFilesNote', 'checks', 'assumptions', 'keyFindings', 'usage', 'next', 'details', 'notice',
   'changedFilesOmitted', 'keyFindingsOmitted', 'assumptionsOmitted', 'blockersOmitted',
   'verificationOmitted', 'claimedVerificationOmitted', 'touchedFilesOmitted', 'preExistingChangesOmitted',
@@ -697,14 +720,19 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   try { report = JSON.parse(props.text.trim()); } catch { return null; }
   if (!report || typeof report !== 'object' || Array.isArray(report)
     || Object.keys(report).some(key => !REPORT_FIELDS.has(key))
+    || ('backend' in report && report.backend !== 'antigravity')
+    || ('provider' in report && (report.backend !== 'antigravity' || report.provider !== 'Google Antigravity'))
+    || ('model' in report && (report.backend !== 'antigravity' || typeof report.model !== 'string' || report.model.length > 200))
     || (Object.hasOwn(report, 'changedFilesShared') && report.changedFilesShared !== true)
     || (Object.hasOwn(report, 'changedFilesNote') && (typeof report.changedFilesNote !== 'string' || report.changedFilesNote.length > 600))
     || !REPORT_STATUSES.has(report.status) || ACTIVE.includes(report.status) || RECOVERY_STATUSES.includes(report.status)
     || !(report.worker === null || typeof report.worker === 'string')
     || !(report.next === null || (typeof report.next === 'string' && (report.next.startsWith('SendMessage to ')
-      || (Array.isArray(report.blockers) && (report.next === nativeNext({}, report.status, report.blockers)
+      || (Array.isArray(report.blockers) && (report.next === nativeNext(report, report.status, report.blockers)
+        || (report.backend === 'antigravity' && report.next === GEMINI_FALLBACK
+          && report.blockers.some(blocker => blocker?.code === 'native_adapter_unavailable'))
         || report.blockers.some(blocker => ['native_capacity', 'native_binding_gone', 'native_message_too_large'].includes(blocker?.code)
-          && report.next === admissionBlocked(blocker.code, {}).next))))))
+          && report.next === admissionBlocked(blocker.code, report).next))))))
     || !(report.notice === undefined || typeof report.notice === 'string')
     || !(report.details === null || (typeof report.details === 'string' && /^(?:fugato|duet) result /.test(report.details)))
     || !((typeof report.jobId === 'string' && /^(task|review|job)-/.test(report.jobId))
@@ -737,6 +765,9 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   const total = (Array.isArray(report.checks?.ran) ? report.checks.ran.length : 0) + count(report.checks?.omitted);
   const failed = count(report.checks?.failed);
   if (total || failed) add('checks', [[span(`${total} passed`), ...(failed ? [span(' · ', 'subtle'), span(`${failed} failed`, 'error')] : [])]]);
+  if (report.backend === 'antigravity' && Number.isSafeInteger(report.usage?.totalTokens) && report.usage.totalTokens >= 0) {
+    add('usage', [[span(`Google Antigravity · ${plain(report.model || view?.model) || 'unknown model'} · ${compactNumber(report.usage.totalTokens)} tokens`)]]);
+  }
   listed('claimed', report.checks?.claimed, 3, report.claimedVerificationOmitted);
   listed('findings', report.keyFindings, 3, report.keyFindingsOmitted);
   const blockers = Array.isArray(report.blockers) ? report.blockers.map(blocker =>
@@ -744,11 +775,24 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   if (count(report.blockersOmitted)) blockers.push(`+${report.blockersOmitted} more`);
   add('blocker', blockers.map(value => [span(value, 'warning')]), 'warning');
   const question = typeof report.question === 'string' ? { text: report.question } : report.question;
-  const questionLines = plain(question?.text) ? [[span(plain(question.text), 'warning')]] : [];
   const options = strings(question?.options).map((option, index) => `${index + 1}. ${option}`);
   if (count(question?.optionsOmitted)) options.push(`+${question.optionsOmitted} more`);
-  if (options.length) questionLines.push([span(options.join('  '), 'warning')]);
-  add('question', questionLines, 'warning');
+  if (report.backend === 'antigravity' && report.notice) add('notice', [[span(plain(report.notice), 'warning')]], 'warning');
+  if (report.backend === 'antigravity' && question?.kind === 'action-approval' && typeof question.text === 'string') {
+    // Keep the operation and its choices together. Let the host wrap literal
+    // text so fact clipping cannot change a path or hide the end of an edit.
+    groups.push({ label: 'question', rows: [{ type: 'Box', props: { flexDirection: 'column' }, children: [
+      span('  question', 'warning'), span(question.text, 'warning', { wrap: 'wrap' }),
+      ...(options.length ? [span(options.join('  '), 'warning', { wrap: 'wrap' })] : [])
+    ] }] });
+  } else {
+    const questionLines = plain(question?.text) ? [[span(plain(question.text), 'warning')]] : [];
+    if (options.length) questionLines.push([span(options.join('  '), 'warning')]);
+    add('question', questionLines, 'warning');
+  }
+  if (report.backend === 'antigravity' && report.status === 'needs_answer' && report.next) {
+    groups.push({ label: 'next', rows: [span(report.next, 'text', { wrap: 'wrap' })] });
+  } else if (report.backend === 'antigravity' && report.next === GEMINI_FALLBACK) add('next', [[span(report.next)]]);
   // Reserve the last status and essential facts before allocating summary rows.
   const summary = typeof report.summary === 'string' && report.summary.trim() ? report.summary : '';
   let budget = Math.max(0, lineLimit - (summary ? 1 : 0) - (summary && groups.length ? 1 : 0)
@@ -767,7 +811,7 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   if (rows.length && facts.length) rows.push(blankRow(e));
   rows.push(...facts);
   if (rows.length) rows.push(blankRow(e));
-  rows.push(statusRow(e, { ...view, status: report.status, name: report.worker || view?.name || 'Codex', totalTokens: report.usage?.totalTokens }));
+  rows.push(statusRow(e, { ...view, status: report.status, name: report.worker || view?.name || 'Codex', totalTokens: report.backend === 'antigravity' ? undefined : report.usage?.totalTokens }));
   return { type: 'Box', props: { flexDirection: 'column' }, children: rows };
 }
 // Details name the exact job: a worker name moves to its newest job after a follow-up.
@@ -775,6 +819,7 @@ const nativeDetails = state => state.jobId ? `fugato result '${state.jobId}' --d
 function blocked(message, state = {}, code = 'native_adapter_error') {
   const summary = boundedText(message, 1200), blockers = [{ code, message: summary }];
   return { status: 'blocked', worker: state.worker || null, jobId: state.jobId || null, summary,
+    ...(backendFor(state) === 'antigravity' ? { backend: 'antigravity', provider: 'Google Antigravity' } : {}),
     blockers, next: nativeNext(state, 'blocked', blockers),
     details: nativeDetails(state) };
 }
@@ -814,9 +859,10 @@ function parsePrompt(text) {
       if (inline !== undefined || (seen.has('--fast') && seen.has('--normal'))) invalid();
       flags.push(flag); continue;
     }
-    if (!['--model', '--effort', '--sandbox', '--cwd', '--max-minutes', '--max-tokens', '--roundtable', '--persona'].includes(flag)) invalid();
+    if (!['--backend', '--model', '--effort', '--sandbox', '--cwd', '--max-minutes', '--max-tokens', '--roundtable', '--persona'].includes(flag)) invalid();
     const value = inline ?? tokens[++i];
     if (!value || value.startsWith('--') || value.includes('\0')) invalid();
+    if (flag === '--backend' && !['codex', 'antigravity'].includes(value)) invalid();
     if (flag === '--persona' && !PERSONA_IDS.includes(value)) invalid();
     if (flag === '--cwd') cwd = value;
     else flags.push(flag, value);
@@ -831,7 +877,7 @@ function admissionBlocked(code, state) {
     : code === 'native_message_too_large'
       ? ['Native message exceeds the adapter message limit; nothing was launched.', 'Start a new native agent with a shorter brief.']
       : ['The native agent binding is no longer retained; nothing was launched.', 'Start a new native agent.'];
-  return { ...blocked(message, state, code), next };
+  return { ...blocked(message, state, code), next: code === 'native_capacity' && backendFor(state) === 'antigravity' ? GEMINI_FALLBACK : next };
 }
 
 const SPAWN_GRACE_MS = 10 * 60 * 1000;
@@ -1114,7 +1160,7 @@ async function companion($, state, args, input = '', progress) {
         if (end) {
           const text = line.trimEnd();
           if (!overflow && (/^\[\d+\] /.test(text) || /^… \d+ progress lines omitted$/.test(text))) {
-            try { const value = text.replace(/^\[\d+\] /, ''); await progress.line(value.slice(0, value.startsWith('Codex:') ? 607 : 200)); }
+            try { const value = text.replace(/^\[\d+\] /, ''); await progress.line(value.slice(0, agentProse(value) ? 607 : 200)); }
             catch (error) { progressError($, error); }
           }
           line = ''; overflow = false;
@@ -1200,9 +1246,9 @@ const save = ($, state, { fields, valid = () => true, close = false,
 async function saveReport($, state, report) {
   try { await save($, state); }
   catch (error) {
-    // A terminal companion report may already be marked delivered. Preserve
-    // it on cache failure; pending questions still need their routing state.
-    if (!report || report.status === 'needs_answer' || UNSETTLED.includes(report.status)) throw error;
+    // Terminal reports may already be marked delivered. Gemini can recover
+    // its pending question from the job. Codex needs its routing state saved.
+    if (!report || UNSETTLED.includes(report.status) || (state.type !== GEMINI_AGENT_TYPE && report.status === 'needs_answer')) throw error;
   }
 }
 async function handles($, state, jobId, recovery = false, persist = true, { waitMs = 0, report, ...timing } = {}) {
@@ -1216,6 +1262,8 @@ async function handles($, state, jobId, recovery = false, persist = true, { wait
     || (job.result?.inferredCompletion === true && job.result.turnEnded === false);
   Object.assign(state, { jobId: job.id, ownerId: job.ownerId, threadId: job.threadId, worker: job.agentName,
     status: unresolved ? job.recovery?.status || 'unknown' : job.status });
+  if (job.request?.backend === 'antigravity') state.backend = 'antigravity';
+  else delete state.backend;
   if (unresolved) delete state.finishedAt;
   updateDisplay($, state, job);
   await publishActivity($, state, job);
@@ -1239,9 +1287,29 @@ async function reconcile($, state, recovery = false, allowAbsent = false, { pers
   if (matches.length !== 1) throw new Error('Native launch intent has no unique recorded job. Refusing to redispatch; inspect fugato status before retrying.');
   return handles($, state, matches[0].id, recovery, persist, { ...timing, report });
 }
+// An addressed answer is reserved syntax even after its job has ended. For
+// live jobs the companion projects the unexpired question and atomically
+// checks that same ID again when the answer command attaches.
+async function geminiMessageRefusal($, state, job, reply, oversized) {
+  if (!job || !ACTIVE.includes(job.status)) {
+    if (job && !ended(job, state)) return blocked(GEMINI_BUSY, state);
+    if (reply || oversized === 'answer') return blocked('That answer is stale. Its question is no longer pending.', state);
+    if (oversized) return admissionBlocked('native_message_too_large', state);
+    return;
+  }
+  const current = await snapshot($, state, ['result', job.id, '--report']);
+  if (current.jobId !== job.id) throw new Error('Fugato report does not match the recorded job handle.');
+  if (current.status !== 'needs_answer') return blocked(GEMINI_BUSY, state);
+  const { question } = current;
+  const body = reply?.body ?? '', decision = body.trim();
+  if (reply && reply.id === question.id && decision && body.length <= 8000
+    && (question.kind !== 'action-approval' || decision === 'Allow once' || decision === 'Deny')) return;
+  const reason = oversized === 'answer' || body.length > 8000 ? 'The answer exceeds the 8000-character limit.' : 'This message did not answer the pending question.';
+  return { ...current, notice: reason + ' ' + geminiAnswerNext(state, question) };
+}
 async function drive($, e, state, progress) {
   if (state.isTeammate && state.v === undefined && !state.incoming && !state.intent && !state.jobId) {
-    return blocked('The host delivered no local loop start for this Codex teammate; use in-process teammate mode or a local subagent.', state, 'native_teammate_unsupported');
+    return blocked(`The host delivered no local loop start for this ${runtimeLabel(state)} teammate; use in-process teammate mode or a local subagent.`, state, 'native_teammate_unsupported');
   }
   // Block only a binding known to have failed: permissionMode is optional in
   // the host API, and agents from earlier versions have none.
@@ -1250,7 +1318,8 @@ async function drive($, e, state, progress) {
     if (!state.incoming && !state.intent && bindingTurn(state) === undefined && !state.jobId) {
       await nativeHostState($, 'native-unavailable');
       return { ...blocked('The host did not deliver the native turn start; nothing was dispatched.', state, 'native_adapter_unavailable'),
-        next: 'Run `fugato status` first, then use background Bash `fugato task` as described in the `fugato:native-fallback` skill.' };
+        next: backendFor(state) === 'antigravity' ? GEMINI_FALLBACK
+          : 'Run `fugato status` first, then use background Bash `fugato task` as described in the `fugato:native-fallback` skill.' };
     }
     return blocked('Native dispatch context unavailable (store full, oversized message, or failed turn.start); nothing was launched.', state);
   }
@@ -1272,21 +1341,29 @@ async function drive($, e, state, progress) {
   } else {
     // Only later SendMessage turns carry host framing. An initial Agent brief
     // may contain that exact text as a literal example.
-    const previousTurn = state.jobId || state.intent || state.answeredTurn;
-    let input = previousTurn ? coordinatorBody(state.incoming.text) : state.incoming.text, args, questionChanged = false, resumedWait = false;
-    const notice = state.incoming.notice, previousAnswer = state.answer;
+    let input = incomingBody(state, state.incoming.text), args, questionChanged = false, resumedWait = false;
+    const { notice, oversized } = state.incoming, previousAnswer = state.answer;
     if (notice?.duplicate) return previousAnswer || blocked('Roundtable notice already received; no work was repeated.', state);
+    const gemini = state.type === GEMINI_AGENT_TYPE && !notice;
     const answeringDisplayedQuestion = !notice && state.answer?.status === 'needs_answer';
-    if (!input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
-    // Overlapping stop handlers may have saved a stale status; the job record
-    // decides before a new message is routed as a dispatch or an answer.
-    if (state.jobId && (notice || answeringDisplayedQuestion || ACTIVE.includes(state.status) || state.status === 'needs_answer')) {
-      // Read only: the save below persists it together with the new intent.
-      const job = await handles($, state, state.jobId, false, false);
-      // questionId is the question last returned to Claude, never merely the
-      // latest one read by a heartbeat, recovery or this pre-answer refresh.
+    if (!gemini && !input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
+    const refresh = gemini || notice || answeringDisplayedQuestion || ACTIVE.includes(state.status) || state.status === 'needs_answer';
+    const job = state.jobId && refresh ? await handles($, state, state.jobId, false, false) : null;
+    let answerId;
+    if (gemini) {
+      const reply = geminiAnswer(input);
+      const refusal = await geminiMessageRefusal($, state, job, reply, oversized);
+      if (refusal) return refusal;
+      if (reply) {
+        answerId = reply.id;
+        input = reply.body;
+        state.status = 'needs_answer';
+      }
+    } else if (job) {
+      // Codex answers remain bound to the question last returned to Claude.
       const pending = ACTIVE.includes(job.status) && job.pendingQuestion?.answer === undefined ? job.pendingQuestion : null;
-      questionChanged = pending?.id !== state.questionId;
+      answerId = state.questionId;
+      questionChanged = pending?.id !== answerId;
       // A pending question keeps the job running; its report says needs_answer.
       if (pending) state.status = 'needs_answer';
       if (notice) {
@@ -1298,7 +1375,8 @@ async function drive($, e, state, progress) {
         if (ACTIVE.includes(job.status) || !ended(job, state)) return blocked('Roundtable notice is waiting for the current job to end.', state);
         await settleRoundtableNotice($, notice, 'accepted');
       }
-      if (answeringDisplayedQuestion && !pending) {
+      const expiredAnswer = answeringDisplayedQuestion && !pending;
+      if (expiredAnswer) {
         // The persisted displayed result fixes this message's intent, even if
         // another answer path completed the job while the adapter was unloaded.
         state.intent = { session: state.session, agentId: e.agentId, turnId: e.turnId, kind: 'answer', nonce: nonceFor(state.session, e.agentId, e.turnId) };
@@ -1309,7 +1387,7 @@ async function drive($, e, state, progress) {
       }
       if (resumedWait) {
         // Fall through to the shared wait below.
-      } else if (answeringDisplayedQuestion && !pending) {
+      } else if (expiredAnswer) {
         await save($, state);
         const current = await companion($, state, ['result', state.jobId, '--report']);
         if (current.jobId !== state.jobId) throw new Error('Fugato report does not match the recorded job handle.');
@@ -1320,26 +1398,29 @@ async function drive($, e, state, progress) {
         return { ...current, next: nativeNext(state, current.status),
           notice: 'The earlier question was already resolved or ended. Send a new brief to start new work.' };
       }
+    }
+    if (job && (!gemini || answerId)) {
       if (job.request?.permissionPolicy && job.request.permissionPolicy.mode !== (state.claudePermissionMode ?? state.permissionMode ?? 'unknown')) {
         await companion($, state, ['cancel', state.jobId, '--json']);
-        return blocked('Native permission mode changed; the live Codex turn must stop before continuing.', state, 'native_permission_mode_changed');
+        return blocked(`Native permission mode changed; the live ${runtimeLabel(state)} turn must stop before continuing.`, state, 'native_permission_mode_changed');
       }
       if ((state.status === 'needs_answer' || resumedWait) && state.permissionMode === 'plan' && job.request?.sandbox !== 'read-only') {
-        return blocked('Plan mode cannot resume a writable Codex turn; answer outside plan mode or start a read-only agent.', state, 'native_plan_mode_read_only');
+        return blocked(`Plan mode cannot resume a writable ${runtimeLabel(state)} turn; answer outside plan mode or start a read-only agent.`, state, 'native_plan_mode_read_only');
       }
     }
     if (resumedWait) {
       args = ['wait', state.jobId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
       input = '';
-    } else if (ACTIVE.includes(state.status)) return blocked('A Codex job is already running. Wait for completion before sending another assignment.', state);
+    } else if (ACTIVE.includes(state.status)) return blocked(`${backendFor(state) === 'antigravity' ? 'An' : 'A'} ${runtimeLabel(state)} job is already running. Wait for completion before sending another assignment.`, state);
     else if (state.status === 'needs_answer') {
       // Headers are task settings only. A question answer's body is verbatim.
       state.intent = { session: state.session, agentId: e.agentId, turnId: e.turnId, kind: 'answer', nonce: nonceFor(state.session, e.agentId, e.turnId) };
       args = questionChanged
         ? ['wait', state.jobId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC]
-        : ['answer', state.jobId, '--question', state.questionId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
+        : ['answer', state.jobId, '--question', answerId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
       if (questionChanged) input = '';
     } else {
+      if (!input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
       if (parsed.flags.includes('--roundtable')) {
@@ -1351,7 +1432,17 @@ async function drive($, e, state, progress) {
         if (state.threadId) for (const flag of ['--roundtable', '--persona']) parsed.flags.splice(parsed.flags.indexOf(flag), 2);
       }
       try { parsed = applyPreset(parsed, state.preset, state.permissionMode); }
-      catch (error) { if (error.code === 'native_preset_sandbox') return blocked(error.message, state, error.code); throw error; }
+      catch (error) { if (['native_preset_sandbox', 'native_preset_backend'].includes(error.code)) return blocked(error.message, state, error.code); throw error; }
+      // Older bindings could cache a rejected backend before recording a job.
+      if (!state.jobId && !state.threadId) delete state.backend;
+      const backendAt = parsed.flags.indexOf('--backend');
+      const backend = backendAt < 0 ? backendFor(state) : parsed.flags[backendAt + 1];
+      if (state.threadId && backend !== backendFor(state)) {
+        return blocked('A native worker continuation keeps its original backend. Start a new native agent to change it.', state, 'native_backend_changed');
+      }
+      if (backend === 'antigravity' && state.permissionMode === 'plan') {
+        return blocked('Antigravity ACP cannot enforce the read-only sandbox required by plan mode. Use a read-only Codex worker.', state, 'native_plan_mode_read_only');
+      }
       if (state.permissionMode === 'plan') {
         const sandboxAt = parsed.flags.indexOf('--sandbox');
         if (sandboxAt >= 0 && ['workspace-write', 'danger-full-access'].includes(parsed.flags[sandboxAt + 1])) {
@@ -1359,10 +1450,10 @@ async function drive($, e, state, progress) {
         }
         if (sandboxAt < 0) parsed.flags.push('--sandbox', 'read-only');
       }
-      if (!state.threadId && state.effort && !parsed.flags.includes('--effort')) parsed.flags.push('--effort', state.effort);
+      if (!state.threadId && backend === 'codex' && state.effort && !parsed.flags.includes('--effort')) parsed.flags.push('--effort', state.effort);
       input = parsed.brief;
       if (!input.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
-      if (state.jobId && !state.threadId) return blocked('Previous job has no Codex thread handle; refusing a replacement thread.', state);
+      if (state.jobId && !state.threadId) return blocked(`Previous job has no ${runtimeLabel(state)} thread handle; refusing a replacement thread.`, state);
       if (parsed.cwd) {
         const absolute = /^(\/|[A-Za-z]:[\\/])/.test(parsed.cwd) ? parsed.cwd : `${state.cwd}/${parsed.cwd}`;
         const directory = await $.fs.stat(absolute, { resolve: true });
@@ -1386,9 +1477,16 @@ async function drive($, e, state, progress) {
       if (state.intent.kind === 'task') input = await lifecycleBrief($, state, input);
       report = await companion($, state, args, input, progress);
       if (resumedWait && report && typeof report === 'object') report = { ...report,
-        notice: 'The earlier question had already expired or been answered; this message was not delivered to Codex. Waited for the running job instead.' };
+        notice: `The earlier question had already expired or been answered; this message was not delivered to ${runtimeLabel(state)}. Waited for the running job instead.` };
     }
     catch (error) {
+      if (gemini && args[0] === 'answer' && error.message === 'Question is no longer pending; no answer was sent.') {
+        // Another answer won the companion lock after validation. Re-read the
+        // question for display only; never retry the submission.
+        const latest = await handles($, state, state.jobId, false, false);
+        const refusal = await geminiMessageRefusal($, state, latest, { id: answerId, body: input });
+        if (refusal) return refusal;
+      }
       if (error.launchNotStarted || (state.intent.kind === 'task' && error.launchRejected
         && await reconcile($, state, true, true) === null)) {
         // An exited companion's error AND an authoritative empty nonce lookup close
@@ -1510,7 +1608,8 @@ async function recheck($, state) {
   const job = state.jobId ? await handles($, state, state.jobId, true)
     : state.intent?.kind === 'task' ? await reconcile($, state, true) : null;
   if (job?.pendingQuestion && ACTIVE.includes(job.status)) {
-    // A displayed question's final save may have been lost. Admit a message
+    if (state.type === GEMINI_AGENT_TYPE) return true;
+    // A displayed Codex question's final save may have been lost. Admit a message
     // only to re-show the current question, never guess which one was shown.
     state.status = 'needs_answer'; state.questionId = null;
     await save($, state);
@@ -1521,13 +1620,13 @@ async function recheck($, state) {
   return true;
 }
 const cancelledReport = (state, status) => ({ status, worker: state.worker || null, jobId: state.jobId,
-  summary: 'Stopped from /tasks; the Codex turn was cancelled.', next: nativeNext(state, status),
+  summary: `Stopped from /tasks; the ${runtimeLabel(state)} turn was cancelled.`, next: nativeNext(state, status),
   details: nativeDetails(state) });
 // Claude Code refuses host process calls in a dispatch aborted from /tasks, so
 // the step cannot confirm its own stop. The host has killed the owner wait,
 // which makes the worker interrupt; turn.complete records the confirmation.
 const stoppingReport = state => ({ status: 'interrupted', worker: state.worker || null, jobId: state.jobId,
-  summary: `Stopped from /tasks. The owner wait was stopped, so the worker interrupts the Codex turn and ends the commands it started; fugato status ${state.worker || state.jobId} shows the recorded confirmation.`,
+  summary: `Stopped from /tasks. The owner wait was stopped, so the worker interrupts the ${runtimeLabel(state)} turn and ends the commands it started; fugato status ${state.worker || state.jobId} shows the recorded confirmation.`,
   next: nativeNext(state, 'interrupted'), details: nativeDetails(state) });
 async function stoppedReport($, state) {
   const deadline = await $.clock.now() + 4500;
@@ -1563,7 +1662,7 @@ function observer() {
 }
 function progressFor($, e, state, publish, currentFlight) {
   let starting, lookup, busy = false, keepaliveInFlight = false, stopped = false, lastAt, lastStreamedAt, startedAt;
-  let enrichmentDeadline, enrichmentFailed = false;
+  let enrichmentDeadline, enrichmentFailed = false, selectionTimer;
   let noticing = Promise.resolve();
   const feed = liveProgress.get(e.agentId);
   const attemptId = state.incoming?.attemptId ?? state.intent?.attemptId;
@@ -1581,7 +1680,7 @@ function progressFor($, e, state, publish, currentFlight) {
     lastStreamedAt = await $.clock.now();
   };
   const notice = (value, final = false, alreadyStreamed = false) => {
-    const text = value.slice(0, final ? 1000 : value.startsWith('Codex:') ? 607 : 200);
+    const text = value.slice(0, final ? 1000 : agentProse(value) ? 607 : 200);
     const pending = noticing.then(async () => {
       if (!active()) return;
       // The display log has its own short dedupe window. Command starts never
@@ -1621,12 +1720,28 @@ function progressFor($, e, state, publish, currentFlight) {
       let job;
       try { job = await lookup; } finally { lookup = null; }
       if (!active()) return;
-      const fields = ['jobId', 'ownerId', 'threadId', 'worker'];
+      const fields = ['jobId', 'ownerId', 'threadId', 'worker', ...(observed.backend ? ['backend'] : [])];
       for (const field of fields) state[field] = observed[field];
       if (!state.status || ACTIVE.includes(state.status)) state.status = observed.status;
       await persist(fields);
-      await notice(`Codex worker ${job.agentName || state.name} started · job ${job.id} · ${job.request?.model} / ${job.request?.effort} / ${job.request?.sandbox}`);
+      const gemini = job.request?.backend === 'antigravity';
+      const model = gemini ? displayModel(job) : job.request?.model;
+      const effort = gemini ? displayEffort(job) : job.request?.effort;
+      await notice(`${runtimeLabel(state)} worker ${job.agentName || state.name} started · job ${job.id} · ${model ?? 'server default'} / ${effort ?? 'server default'} / ${job.request?.sandbox}`);
       if (!active()) return;
+      // The first snapshot can precede ACP startup. Refresh the display until
+      // the server confirms selection, even when the worker is otherwise quiet.
+      if (gemini && !job.selectedModel && ACTIVE.includes(job.status)) {
+        selectionTimer = $.clock.every(2000, async () => {
+          if (!active() || lookup) return;
+          lookup = handles($, { ...state }, job.id, false, false, { timeoutMs: 2000 });
+          try {
+            const latest = await lookup;
+            if (latest.selectedModel || !ACTIVE.includes(latest.status)) selectionTimer.cancel();
+          } catch (error) { progressError($, error); }
+          finally { lookup = null; }
+        });
+      }
       notices.started = true;
       await persist();
     })().catch(error => { enrichmentFailed = true; throw error; }).finally(() => { starting = null; });
@@ -1636,23 +1751,25 @@ function progressFor($, e, state, publish, currentFlight) {
     start,
     async stop() {
       stopped = true;
+      selectionTimer?.cancel();
       // The host bounds and terminates this process. Join it before releasing
       // the flight; late lookup results cannot publish or persist anything.
       await optional(() => lookup);
     },
-    async usage(value) {
+    async usage(value, reportedModel) {
       if (!active() || notices.usage) return;
       const count = number => String(number).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
       const lines = [];
       if (value && ['inputTokens', 'cachedInputTokens', 'outputTokens', 'totalTokens'].every(key => Number.isSafeInteger(value[key]) && value[key] >= 0)) {
-        const model = cleanDisplayText(await activityModel($, state.jobId)).slice(0, 100);
-        lines.push(`Codex tokens (provider: OpenAI Codex, model ${model}) · ${count(value.inputTokens)} input · ${count(value.cachedInputTokens)} cached · ${count(value.outputTokens)} output · ${count(value.totalTokens)} total`);
+        const model = cleanDisplayText(reportedModel || await activityModel($, state.jobId)).slice(0, reportedModel ? 200 : 100);
+        const provider = backendFor(state) === 'antigravity' ? 'Google Antigravity' : 'OpenAI Codex';
+        lines.push(`${runtimeLabel(state)} tokens (provider: ${provider}, model ${model}) · ${count(value.inputTokens)} input · ${count(value.cachedInputTokens)} cached · ${count(value.outputTokens)} output · ${count(value.totalTokens)} total`);
       }
       try {
         if ((await $.command.list()).some(command => command.name === 'fugato-live')) {
           if (feed?.view) feed.view.pane = true;
           const name = cleanDisplayText(state.worker || state.name || state.agentId).replace(/\s+/g, ' ').slice(0, 100);
-          lines.push(`Open Codex activity: /fugato-live ${name}`);
+          lines.push(`Open ${runtimeLabel(state)} activity: /fugato-live ${name}`);
         }
       } catch { /* The companion pane is optional. */ }
       if (!lines.length) return;
@@ -1678,7 +1795,7 @@ function progressFor($, e, state, publish, currentFlight) {
       if (!active() || keepaliveInFlight) return;
       const seconds = Math.floor((now - startedAt) / 1000);
       const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
-      const text = () => `Codex worker ${state.worker || state.name || state.agentId} running · ${elapsed}`.slice(0, 200);
+      const text = () => `${runtimeLabel(state)} worker ${state.worker || state.name || state.agentId} running · ${elapsed}`.slice(0, 200);
       // Keep the watchdog alive before any ancillary work, even while an older
       // lookup or notice is pending. Only keepalives bypass durable admission.
       const due = now - lastStreamedAt >= HEARTBEAT_MS;
@@ -1801,12 +1918,16 @@ export function register(on) {
     const respond = async input => {
       const response = await next(input);
       if (paneTeammate(response?.result)) return { deny: JSON.stringify(blocked(
-        `The host started teammate ${response.result.name || input.name || response.result.teammate_id} in a separate pane without a local loop. No Codex job was dispatched; stop that teammate and select in-process mode.`, {}, 'native_teammate_unsupported')) };
+        `The host started teammate ${response.result.name || input.name || response.result.teammate_id} in a separate pane without a local loop. No ${runtimeLabel({ type: input.subagent_type })} job was dispatched; stop that teammate and select in-process mode.`, {}, 'native_teammate_unsupported')) };
       return response;
     };
     if (e.tool === 'Agent' && isNativeType(e.subagent_type)) {
-      if (e.isolation === 'remote') return { deny: JSON.stringify(blocked(
-        'Codex needs a local runtime; isolation: "remote" is unsupported. Use a local agent or isolation: "worktree".', {}, 'native_remote_isolation')) };
+      const agentType = { type: e.subagent_type };
+      const gemini = backendFor(agentType) === 'antigravity';
+      if (e.isolation === 'remote' || (gemini && e.isolation === 'worktree')) return { deny: JSON.stringify(blocked(
+        gemini
+          ? `Antigravity does not support isolation: "${e.isolation}". Start a local Gemini agent without isolation.`
+          : 'Codex needs a local runtime; isolation: "remote" is unsupported. Use a local agent or isolation: "worktree".', agentType, 'native_remote_isolation')) };
       const unsupported = await teammateUnsupported($, e);
       if (unsupported) return { deny: JSON.stringify(blocked(unsupported, {}, 'native_teammate_unsupported')) };
       const session = await $.session.id(), key = keyFor(session, e.tool_use_id);
@@ -1842,7 +1963,7 @@ export function register(on) {
             if (name === e.name || !response || response.deny !== undefined) return response;
             const requested = e.name === undefined ? '' : ` (requested ${JSON.stringify(e.name)})`;
             return { ...response, context: [...(Array.isArray(response.context) ? response.context : []),
-              `Codex worker named ${name}${requested}; use SendMessage to ${name} for follow-ups.`] };
+              `${runtimeLabel({ type: e.subagent_type })} worker named ${name}${requested}; use SendMessage to ${name} for follow-ups.`] };
           }
         }
       }
@@ -1901,7 +2022,8 @@ export function register(on) {
         // One small durable guard (not the admission scan) until turn.start
         // persists the binding, so a reload in between still fails closed.
         await $.store.set(bindingFailedKey(session, result.agentId), { bindingPending: true, at: await $.clock.now(),
-          type: e.subagentType, ...(isTeammate ? { isTeammate: true } : {}) }).catch(() => {});
+          type: e.subagentType,
+          ...(isTeammate ? { isTeammate: true } : {}) }).catch(() => {});
       }
       return result;
     } finally { bindings.delete(spawnBinding); if (!bindings.size) spawning.delete(session); release(); }
@@ -1940,7 +2062,7 @@ export function register(on) {
       // another agent's turn.start budget runs while it waits there.
       let state, candidate, bindingFailed;
       const refuse = async code => {
-        refusals.set(key, { turnId: e.turnId, report: admissionBlocked(code, state || { agentId: e.agentId, name: agent.name }) });
+        refusals.set(key, { turnId: e.turnId, report: admissionBlocked(code, candidate || state || { type: agent.type, agentId: e.agentId, name: agent.name }) });
         agentDisplays.delete(e.agentId);
         invalidateProgress($);
         resumedSpawns.delete(key); observedBindings.delete(key);
@@ -1959,8 +2081,19 @@ export function register(on) {
           await Promise.all(own.map(binding => binding.pending));
           state = await $.store.get(key);
         }
-        // Reject oversized input before recheck, pruning or any binding write.
-        if (e.text.length > 65536) return await refuse('native_message_too_large');
+        let incomingText = e.text, oversized;
+        if (incomingText.length > 65536) {
+          const body = incomingBody(state, incomingText);
+          if (body.length > 65536) {
+            if (agent.type !== GEMINI_AGENT_TYPE || !(state?.jobId || state?.intent)) return await refuse('native_message_too_large');
+            // Keep oversized input out of the binding. The live question at
+            // receipt decides which refusal to show. A padded valid header
+            // still counts only its extracted answer body.
+            const reply = geminiAnswer(body);
+            if (reply && reply.id.length <= 128 && reply.body.length <= 8000) incomingText = `Answer ${reply.id}\n${reply.body}`;
+            else { oversized = reply ? 'answer' : 'brief'; incomingText = ''; }
+          }
+        }
         rememberPrompt($, e);
         if (state) restoreBinding(key, state);
         if (state?.answeredTurn === e.turnId || state?.intent?.turnId === e.turnId || state?.incoming?.turnId === e.turnId) {
@@ -1974,11 +2107,16 @@ export function register(on) {
           return;
         }
         if (state?.intent && state.intent.turnId !== state.answeredTurn && !await isClosed($, state)
-          && !await recheck($, state).catch(() => false)) return;
+          && !await recheck($, state).catch(() => false)) {
+          if (agent.type === GEMINI_AGENT_TYPE && ACTIVE.includes(state.status)) {
+            refusals.set(key, { turnId: e.turnId, report: blocked(GEMINI_BUSY, state) });
+          }
+          return;
+        }
         if (refusals.get(key)?.report.blockers[0].code === 'native_binding_gone') return await refuse('native_binding_gone');
         refusals.delete(key);
         candidate = { ...(state || { type: agent.type || AGENT_TYPE, session, agentId: e.agentId, name: (agent.name !== e.agentId && agent.name) || observedBindings.get(key)?.name,
-          bindingPending: !observedBindings.has(key) }), turnId: e.turnId, incoming: { turnId: e.turnId, text: e.text, ...(notice ? { notice } : {}) } };
+          bindingPending: !observedBindings.has(key) }), turnId: e.turnId, incoming: { turnId: e.turnId, text: incomingText, ...(oversized ? { oversized } : {}), ...(notice ? { notice } : {}) } };
         bindingFailed = await $.store.get(bindingFailedKey(session, e.agentId));
         if (bindingFailed) candidate.bindingPending = true;
         restoreBinding(key, candidate);
@@ -2006,6 +2144,7 @@ export function register(on) {
             ...(candidate.bindingPending ? { bindingPending: true } : {}) };
           delete value.finishedAt;
           restoreBinding(key, value);
+          if (value.type === GEMINI_AGENT_TYPE) delete value.returnedTurn; // Discard the obsolete sender routing marker.
           if (budget.count + Number(!budget.keepSize) > MAX_RECORDS
             || budget.size - budget.keepSize + stateSize(value) > MAX_STORE_SIZE) return 'native_capacity';
           if (!latest && (resumedSpawns.has(key) || (!observedBindings.has(key) && !bindingFailed))) return 'native_binding_gone';
@@ -2038,7 +2177,9 @@ export function register(on) {
     if (!running) {
       // Do not wait on another turn's stream (which spends this hook's budget).
       // One agent owns the dispatch lock; a concurrent turn is refused.
-      if (dispatching.has(key)) return yield* finish(e, blocked('Another turn is active for this native agent; retry after it finishes.', { agentId: e.agentId }));
+      if (dispatching.has(key)) return yield* finish(e, agent.type === GEMINI_AGENT_TYPE
+        ? blocked(GEMINI_BUSY, { agentId: e.agentId, type: agent.type })
+        : blocked('Another turn is active for this native agent; retry after it finishes.', { agentId: e.agentId }));
       running = { listeners: new Set(), done: false,
         feed: { agentId: e.agentId, turnId: e.turnId, entries: [], omitted: 0 },
         display: { turnId: e.turnId, name: agent.name || e.agentId, elapsedMs: 0, status: 'running' } };
@@ -2062,7 +2203,7 @@ export function register(on) {
             } catch { /* A display tick cannot affect the flight. */ }
           });
         } catch { /* Rendering still updates on progress if timers are unavailable. */ }
-        const state = await $.store.get(key) || { session, agentId: e.agentId, name: agent.name,
+        const state = await $.store.get(key) || { type: agent.type, session, agentId: e.agentId, name: agent.name,
           ...(agent.isTeammate || agent.teammateId ? { isTeammate: true } : {}) };
         if (notice && state.incoming?.turnId === e.turnId) state.incoming.notice = notice;
         // Display context only; never persist it or perform host I/O in render.
@@ -2086,6 +2227,9 @@ export function register(on) {
         let report, uncertain = false, stopping = false;
         try {
           report = await drive($, e, state, progress);
+          if (state.type === GEMINI_AGENT_TYPE && report.status === 'needs_answer') {
+            report = { ...report, next: geminiAnswerNext(state, report.question) };
+          }
           if (report.status === 'owner_stopped') {
             stopping = true;
             report = await stoppedReport($, state) || report;
@@ -2096,7 +2240,7 @@ export function register(on) {
             delete state.finishedAt;
             report = { ...report, status: 'blocked' };
           }
-          await progress.usage(report.usage);
+          await progress.usage(report.usage, report.backend === 'antigravity' ? report.model : undefined);
         } catch (error) {
           const aborted = state.intent?.turnId === e.turnId && (next.signal?.aborted || error?.name === 'AbortError' || /process\.spawn\(.*\) aborted$/.test(error?.message || ''));
           if (aborted) {
@@ -2124,7 +2268,7 @@ export function register(on) {
           // questionId means shown to Claude, not observed in the job. Earlier
           // saves can fail and turn the response into blocked; only this path
           // commits the question whose needs_answer report we actually return.
-          if (report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
+          if (state.type !== GEMINI_AGENT_TYPE && report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
           try { await save($, state); }
           catch (error) {
             // The companion may already have marked a terminal report as
@@ -2155,7 +2299,7 @@ export function register(on) {
           if (Number.isFinite(running.display.startedAt)) running.display.elapsedMs = Math.max(0, await $.clock.now() - running.display.startedAt);
         } catch { /* Keep the last tick. */ }
         for (const item of running.listeners) item.close();
-        flights.delete(flight);
+        if (flights.get(flight) === running) flights.delete(flight);
         if (dispatching.get(key) === running) dispatching.delete(key);
         if (liveProgress.get(e.agentId) === running.feed) {
           liveProgress.delete(e.agentId);

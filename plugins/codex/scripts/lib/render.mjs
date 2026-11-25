@@ -1,6 +1,7 @@
 import { isolatedCodexCommand } from "./codex-home.mjs";
 import { cleanDisplayText } from "./display-text.mjs";
 import { renderUsageTotals } from "./run-journal.mjs";
+import { continuationReport } from "./job-runtime.mjs";
 import fs from "node:fs";
 
 const REVIEW_OUTPUT_SCHEMA = JSON.parse(fs.readFileSync(new URL("../../schemas/review-output.schema.json", import.meta.url), "utf8"));
@@ -131,6 +132,7 @@ function formatCodexResumeCommand(job) {
   if (!job?.threadId) {
     return null;
   }
+  if (job.request?.backend === "antigravity" || job.backend === "antigravity") return continuationReport(job).continuationCommand;
   return isolatedCodexCommand(["resume", job.threadId]);
 }
 
@@ -195,11 +197,11 @@ function pushJobDetails(lines, job, options = {}) {
     lines.push(`  Duration: ${job.duration}`);
   }
   if (job.threadId) {
-    lines.push(`  Codex session ID: ${job.threadId}`);
+    lines.push(`  ${job.request?.backend === "antigravity" || job.backend === "antigravity" ? "Antigravity" : "Codex"} session ID: ${job.threadId}`);
   }
   const resumeCommand = formatCodexResumeCommand(job);
   if (resumeCommand) {
-    lines.push(`  Resume in Codex: ${resumeCommand}`);
+    lines.push(`  ${job.request?.backend === "antigravity" || job.backend === "antigravity" ? "Continue in Fugato" : "Resume in Codex"}: ${resumeCommand}`);
   }
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
@@ -518,7 +520,8 @@ export function renderStoredJobResult(job, storedJob) {
   const structured = result.structured;
   const status = report.status ?? storedJob?.status ?? job.status ?? "unknown";
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = threadId ? isolatedCodexCommand(["resume", threadId]) : null;
+  const google = storedJob?.request?.backend === "antigravity" || job.backend === "antigravity";
+  const resumeCommand = formatCodexResumeCommand({ ...job, ...storedJob, threadId });
   // Keep the final summary (or formatted review) intact until display cleanup.
   const summary = isStructuredReviewStoredResult(storedJob) && storedJob?.rendered
     ? storedJob.rendered
@@ -541,7 +544,7 @@ export function renderStoredJobResult(job, storedJob) {
   const apps = result.approvedComputerApps ?? job.approvedComputerApps ?? [];
   if (origins.length) lines.push("", `Approved browser origins (this job): ${origins.join(", ")}`);
   if (apps.length) lines.push("", `Approved Computer Use apps (this job): ${apps.join(", ")}`);
-  if (threadId) lines.push("", `Codex session ID: ${threadId}`, `Resume in Codex: ${resumeCommand}`);
+  if (threadId) lines.push("", `${google ? "Antigravity" : "Codex"} session ID: ${threadId}`, `${google ? "Continue in Fugato" : "Resume in Codex"}: ${resumeCommand}`);
   lines.push("", resultNextAction(status, report.continuationCommand ?? job.continuationCommand ?? resumeCommand));
   return cleanDisplayText(`${lines.join("\n")}\n`);
 }
