@@ -402,9 +402,9 @@ export function directReport(payload, job = {}, env = process.env) {
   /** @type {Record<string, any> & { summary: string }} */
   const report = {
     status: full.status,
-    ...(job.request?.backend === "antigravity" || full.backend === "antigravity" ? { backend: "antigravity" } : {}),
     worker,
     jobId,
+    ...(full.backend === "antigravity" ? { backend: "antigravity", provider: "Google Antigravity" } : {}),
     summary: truncate(summary, DIRECT_SUMMARY_LIMIT),
     ...(full.summaryTruncated || summary.length > DIRECT_SUMMARY_LIMIT ? { summaryTruncated: true } : {})
   };
@@ -445,7 +445,11 @@ export function directReport(payload, job = {}, env = process.env) {
   }
   if (full.assumptions?.length) report.assumptions = full.assumptions.slice(0, 12).map(brief);
   if (full.keyFindings?.length) report.keyFindings = full.keyFindings.slice(0, 12).map(brief);
-  if (full.usage) report.usage = full.usage;
+  if (full.usage) {
+    report.usage = full.usage;
+    const model = job.result?.model ?? job.request?.model;
+    if (report.backend === "antigravity" && typeof model === "string") report.model = truncate(redactActivity(model), 200);
+  }
   const busy = full.blockers?.find(blocker => blocker.code === "thread_busy");
   const runtimeBlocker = full.status === "blocked" && full.blockers?.find(blocker =>
     ["context_window_exceeded", "provider_refused", "auth_required"].includes(blocker.code));
