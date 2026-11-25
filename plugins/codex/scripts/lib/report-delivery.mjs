@@ -210,8 +210,8 @@ export function isC2Report(value) {
   if ("changedFilesNote" in value && (typeof value.changedFilesNote !== "string" || value.changedFilesNote.length > 600)) return false;
   if ("blockers" in value && (!Array.isArray(value.blockers) || !value.blockers.every(b => object(b) && typeof b.code === "string" && typeof b.message === "string"))) return false;
   if ("checks" in value && (!object(value.checks) || !strings(value.checks.ran) || !strings(value.checks.claimed) || !count(value.checks.omitted))) return false;
-  if ("usage" in value && (!object(value.usage) || Object.keys(value.usage).length !== usageFields.length
-      || !usageFields.every(key => count(value.usage[key])))) return false;
+  if ("usage" in value && (!object(value.usage) || Object.keys(value.usage).length === 0
+      || !Object.entries(value.usage).every(([key, number]) => usageFields.includes(key) && count(number)))) return false;
   if ("question" in value) {
     const q = value.question;
     if (!object(q) || !nullableString(q.id) || typeof q.kind !== "string" || typeof q.text !== "string" || !strings(q.options)

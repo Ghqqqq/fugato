@@ -207,6 +207,19 @@ test('report blocks preserve summary lines, ordered facts, colours and the sixty
   expect(JSON.stringify(report)).toBe(input);
   expect(reportMarkdown({ text: input, isSummary: true })).toBe(null);
 });
+
+test('action-approval cards show the full literal operation before the decisions', () => {
+  const text = 'Edit report  file.txt\n\nReplacement:\n    ' + 'long value  '.repeat(110) + '`**literal  end**`';
+  const report = { status: 'needs_answer', jobId: 'task-action', worker: 'Gemini', summary: 'Permission requested.',
+    next: 'SendMessage to Gemini with the answer', details: null,
+    question: { kind: 'action-approval', text, options: ['Allow once', 'Deny'] } };
+  const leaves = (node: any): string[] => typeof node === 'string' ? [node] : node.children.flatMap(leaves);
+  const card = reportMarkdown({ text: JSON.stringify(report) }, { viewport: { columns: 32 } });
+  const content = leaves(card);
+  expect(content).toContain(text);
+  expect(content.indexOf('1. Allow once  2. Deny') > content.indexOf(text)).toBe(true);
+});
+
 // Migrate captured display labels and the expanded flag help; preserve the
 // recorded execution, requests and lifecycle ordering.
 const captures = recordedCaptures.map(capture => {
