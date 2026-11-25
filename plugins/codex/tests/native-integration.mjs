@@ -15,6 +15,7 @@ import { AGENT_TYPE } from '../hooks/native-agent.mjs';
 import { AGENT_NAMES } from '../scripts/lib/agent-names.mjs';
 import { instructionInventory } from '../hooks/claude-memory.mjs';
 import { EXECUTOR_FRAMING, writeClaudeSnapshot } from '../scripts/lib/claude-memory.mjs';
+import { directReport } from '../scripts/lib/job-runtime.mjs';
 import { isC2Report } from '../scripts/lib/report-delivery.mjs';
 import { updateJob } from '../scripts/lib/state.mjs';
 import { register as reportHooks } from '../hooks/report-delivery.mjs';
@@ -197,7 +198,9 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
             }
             if (syntheticUsage && request.argv[2] === 'task') {
               const report = JSON.parse(record.chunks.filter(c => c.stream === 'stdout').map(c => c.text).join('').trim().split('\n').at(-1));
-              const chunk = { stream: 'stdout', text: JSON.stringify({ ...report, usage: syntheticUsage }) + '\n' };
+              const job = report.backend === 'antigravity' && jobs().find(job => job.id === report.jobId);
+              const withUsage = job ? directReport({ ...job.report, usage: syntheticUsage }, job, env) : { ...report, usage: syntheticUsage };
+              const chunk = { stream: 'stdout', text: JSON.stringify(withUsage) + '\n' };
               record.chunks.push(chunk); record.timeline?.push({ chunk }); yield chunk;
             }
             settle(record.exit); return record.exit;
@@ -1333,6 +1336,148 @@ test('native Gemini worker dispatches ACP, keeps its backend on reload and omits
   assert.equal(f.jobs().length, 2);
 });
 
+const geminiType = 'fugato:gemini-native';
+const renderCard = async (f, report) => {
+  const card = await f.invoke('ui.render', { component: 'AssistantMessage', viewport: { columns: 120 },
+    props: { text: JSON.stringify(report) } }, async () => assert.fail('Native report fell through to raw JSON'));
+  assert.equal(card.type, 'Box');
+  return card.children.map(row => renderLeaves(row).join('')).join('\n');
+};
+
+test('a Gemini compact report renders as a card and attaches to a bound background delivery', async () => {
+  const f = fixture('review-ok', 'gemini-report');
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`).binary;
+  const report = await f.turn('Produce the report.', 1, false, { agentType: geminiType });
+  assert.equal(report.backend, 'antigravity');
+  assert.equal(report.provider, 'Google Antigravity');
+  assert.match(await renderCard(f, report), /Antigravity fixture answer/);
+
+  const marker = JSON.parse(fs.readFileSync(`${f.root}/isolated/duet/sessions/native-session/${report.jobId}.json`));
+  const job = f.jobs()[0];
+  job.deliveryBindings = [{ sessionId: 'native-session', toolUseId: 'background-tool' }];
+  fs.writeFileSync(marker.jobFile, JSON.stringify(job));
+  f.env.CLAUDE_CODE_TMPDIR = f.root;
+  const tasks = `${f.root}/claude-${process.getuid?.() ?? 0}/repo/native-session/tasks`;
+  fs.mkdirSync(tasks, { recursive: true });
+  const file = `${tasks}/background-task.output`;
+  fs.writeFileSync(file, JSON.stringify(report) + '\n');
+  const notification = `<task-notification><task-id>background-task</task-id><tool-use-id>background-tool</tool-use-id><output-file>${file}</output-file><status>completed</status><summary>Done</summary></task-notification>`;
+  f.reload(false, reportHooks);
+  const { context } = await f.invoke('prompt.submit', { origin: { kind: 'task-notification' }, text: notification }, async e => e);
+  const attached = JSON.parse(context[0].split('\n')[1]);
+  assert.ok(isC2Report(attached));
+  assert.deepEqual([attached.jobId, attached.backend, attached.provider, attached.summary],
+    [report.jobId, 'antigravity', 'Google Antigravity', report.summary]);
+});
+
+test('a rejected Antigravity launch leaves a fresh Codex retry with its original effort', async () => {
+  const f = fixture('review-ok');
+  const refused = await f.turn('DUET: --backend antigravity --sandbox read-only\nUse a sandbox.', 1, false, { effort: 'high' });
+  assert.equal(refused.status, 'blocked');
+  assert.equal(f.jobs().length, 0);
+  assert.notEqual(f.readStore()['native:v2:native-session:native-agent'].backend, 'antigravity');
+  f.reload();
+  const report = await f.turn('Retry with Codex.', 2, false, { wake: true });
+  assert.equal(report.status, 'completed', JSON.stringify(report));
+  const args = f.capture.processes.filter(p => p.kind === 'spawn' && p.request.argv[2] === 'task').at(-1).request.argv;
+  assert.ok(args.includes('--fresh'));
+  assert.equal(args.includes('--backend'), false);
+  assert.equal(args[args.indexOf('--effort') + 1], 'high');
+  assert.ok(!('backend' in report) && !('provider' in report));
+  assert.equal(f.jobs()[0].request.effort, 'high');
+});
+
+test('a fresh Gemini capacity refusal points to the Antigravity fallback', async () => {
+  const f = fixture('review-ok', 'gemini-full', { hostOnly: true });
+  f.setStore({ 'native:v2:foreign:busy': { v: 2, type: AGENT_TYPE, session: 'foreign', agentId: 'busy',
+    incoming: { turnId: 'running', text: 'x'.repeat(524288) } } });
+  const refused = await f.turn('Start a Gemini worker.', 1, false, { agentType: geminiType });
+  assert.equal(refused.blockers[0].code, 'native_capacity');
+  assert.match(refused.next, /fugato task --backend antigravity/);
+  assert.doesNotMatch(refused.next, /native-fallback/);
+  assert.match(await renderCard(f, refused), /fugato task --backend\s+antigravity/);
+  assert.equal(f.jobs().length, 0);
+});
+
+test('Gemini refuses both Agent isolation modes before spawn or name reservation', async () => {
+  const f = fixture('review-ok', 'gemini-isolation', { hostOnly: true });
+  for (const isolation of ['worktree', 'remote']) {
+    const response = await f.invoke('tool.call', { tool: 'Agent', subagent_type: geminiType, isolation },
+      async () => assert.fail('Unsupported isolation reached Agent spawn'));
+    const refused = JSON.parse(response.deny);
+    assert.match(refused.summary, new RegExp(isolation));
+    assert.match(refused.next, /without isolation/);
+  }
+  assert.deepEqual(f.capture.processes, []);
+});
+
+test('native Gemini usage identifies Google Antigravity and the reported model only when usage exists', async () => {
+  const f = fixture('review-ok', 'gemini-usage');
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`).binary;
+  const first = await f.turn('Finish without reporting token usage.', 1, false, { agentType: geminiType });
+  assert.ok(!first.usage);
+  assert.doesNotMatch(await renderCard(f, first), /tokens/);
+  assert.doesNotMatch(JSON.stringify(f.capture.notices), /tokens \(provider:/);
+
+  const usage = { inputTokens: 30, cachedInputTokens: 10, outputTokens: 7, reasoningOutputTokens: 0, totalTokens: 37 };
+  f.withUsage(usage);
+  const report = await f.turn('Report tokens.', 2, false, { wake: true });
+  const notices = f.capture.notices.map(notice => notice.message.content[0].text).join('\n');
+  assert.match(notices, /Antigravity tokens \(provider: Google Antigravity, model fixture-gemini\).*37 total/);
+  assert.doesNotMatch(notices, /OpenAI Codex/);
+  assert.match(await renderCard(f, report), /Google Antigravity · fixture-gemini · 37 tokens/);
+  f.reload();
+  assert.ok(isC2Report(report));
+  assert.match(await renderCard(f, report), /Google Antigravity · fixture-gemini · 37 tokens/);
+});
+
+test('a Gemini assignment queued before a permission question runs after its explicit answer', async () => {
+  const f = fixture('review-ok', 'gemini-queue');
+  const acp = installFakeAntigravity(`${f.root}/acp`, { behavior: 'permission' });
+  const gate = `${f.root}/allow-start`;
+  f.env.FUGATO_ANTIGRAVITY_BIN = `${f.root}/bin/gated-agy`;
+  fs.writeFileSync(f.env.FUGATO_ANTIGRAVITY_BIN, `#!/bin/sh\nif [ "$2" != "--help" ]; then while [ ! -e "${gate}" ]; do sleep 0.05; done; fi\nexec "${acp.binary}" "$@"\n`, { mode: 0o755 });
+  const inbox = [];
+  const enqueue = async e => { inbox.push(e.text); return { isDelivered: true }; };
+  f.$.session.send = e => f.invoke('session.send', { ...e, agentId: 'native-agent', origin: { kind: 'plugin', name: 'fugato' } }, enqueue);
+  const send = text => f.invoke('session.send', { to: 'native-agent', text, origin: { kind: 'model' } }, enqueue);
+  const receive = number => f.turn(`The coordinator sent a message while you were working:\n${inbox.shift()}\n\nAddress this before completing your current task.`, number, false, { wake: true });
+  const running = f.turn('Request permission.', 1, false, { agentType: geminiType });
+  await until(() => f.jobs().some(job => job.status === 'running'));
+  // Start the send before the permission RPC. Delay its recipient lookup
+  // until after the question is returned, when its text would otherwise approve.
+  let release;
+  const gateLookup = new Promise(resolve => { release = resolve; });
+  const list = f.$.agent.list;
+  f.$.agent.list = async () => { f.$.agent.list = list; await gateLookup; return list(); };
+  const early = send('Allow once');
+  fs.writeFileSync(gate, '');
+  const question = await running.finally(release);
+  assert.equal(question.status, 'needs_answer');
+  assert.deepEqual(await early, { isDelivered: true });
+  f.reload();
+  const parked = await receive(2);
+  assert.equal(parked.question.id, question.question.id);
+  assert.equal(f.capture.processes.filter(p => p.request.argv[2] === 'answer').length, 0);
+  assert.deepEqual(acp.state().serverResponses, []);
+  await send('Deny');
+  const resolved = await receive(3);
+  assert.equal(resolved.blockers[0].code, 'approval_denied', JSON.stringify(resolved));
+  assert.equal(resolved.jobId, question.jobId);
+  assert.equal(acp.state().serverResponses[0].result.outcome.optionId, 'deny-this');
+  assert.equal(inbox.length, 1);
+  const followup = await receive(4);
+  assert.equal(followup.status, 'needs_answer', JSON.stringify(followup));
+  const jobs = f.jobs();
+  assert.equal(jobs.length, 2);
+  const next = jobs.find(job => job.id === followup.jobId);
+  assert.equal(next.threadId, jobs.find(job => job.id === question.jobId).threadId);
+  assert.equal(next.request.prompt, 'Allow once');
+  await send('Allow once');
+  assert.equal((await receive(5)).status, 'completed');
+  assert.deepEqual(inbox, []);
+});
+
 test('native Gemini requests fail closed for plan mode, unknown backends and readonly sandboxes', async () => {
   const f = fixture('review-ok', 'gemini-restrictions');
   const type = 'fugato:gemini-native';
@@ -1362,7 +1507,10 @@ test('native Gemini permission answers and /tasks stop retain the ACP job bindin
   assert.equal(question.question.kind, 'action-approval');
   assert.match(question.question.text, /Antigravity/);
   f.reload();
-  const answer = await f.turn('Allow once', 2, false, { wake: true });
+  let delivered;
+  await f.invoke('session.send', { to: 'native-agent', text: 'Allow once', origin: { kind: 'model' } },
+    async e => { delivered = e.text; return { isDelivered: true }; });
+  const answer = await f.turn(delivered, 2, false, { wake: true });
   assert.equal(answer.status, 'completed', JSON.stringify(answer));
   assert.equal(answer.jobId, question.jobId);
   assert.equal(f.jobs().length, 1);

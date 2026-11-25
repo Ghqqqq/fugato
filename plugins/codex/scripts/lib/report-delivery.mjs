@@ -15,7 +15,7 @@ const object = value => value !== null && typeof value === "object" && !Array.is
 const strings = value => Array.isArray(value) && value.every(item => typeof item === "string");
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const nullableString = value => value === null || typeof value === "string";
-const fields = new Set(["status", "worker", "jobId", "summary", "summaryTruncated", "blockers", "question", "changedFiles", "changedFilesOmitted", "changedFilesShared", "changedFilesNote", "checks", "assumptions", "keyFindings", "usage", "next", "details"]);
+const fields = new Set(["status", "worker", "jobId", "backend", "provider", "model", "summary", "summaryTruncated", "blockers", "question", "changedFiles", "changedFilesOmitted", "changedFilesShared", "changedFilesNote", "checks", "assumptions", "keyFindings", "usage", "next", "details"]);
 const usageFields = ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"];
 const terminal = new Set(["completed", "needs_input", "blocked", "failed", "cancelled", "interrupted", "owner_stopped", "error"]);
 const noticeLimit = 5, graceMs = 10000;
@@ -200,6 +200,9 @@ export function isC2Report(value) {
       || !["completed", "needs_input", "blocked", "failed", "cancelled", "queued", "running", "needs_answer", "ownership_moved", "interrupted", "owner_stopped", "error", "unknown", "unreachable"].includes(value.status)
       || !id(value.jobId) || !nullableString(value.worker) || typeof value.summary !== "string" || value.summary.length > 8000
       || !nullableString(value.next) || !nullableString(value.details)) return false;
+  if (("backend" in value && value.backend !== "antigravity")
+      || ("provider" in value && (value.backend !== "antigravity" || value.provider !== "Google Antigravity"))
+      || ("model" in value && (value.backend !== "antigravity" || typeof value.model !== "string" || value.model.length > 200))) return false;
   if ("summaryTruncated" in value && typeof value.summaryTruncated !== "boolean") return false;
   for (const key of ["changedFiles", "assumptions", "keyFindings"]) if (key in value && !strings(value[key])) return false;
   if ("changedFilesOmitted" in value && !count(value.changedFilesOmitted)) return false;
