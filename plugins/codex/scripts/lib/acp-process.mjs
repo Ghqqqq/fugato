@@ -35,6 +35,7 @@ function processIdentity(job) {
   const pid = job.acpProcessPid;
   if (!Number.isSafeInteger(pid) || pid <= 1) return "unknown";
   if (!pidExists(pid)) return "absent";
+  /** @type {import("node:child_process").SpawnSyncOptionsWithStringEncoding} */
   const options = { encoding: "utf8", timeout: 1000, windowsHide: true };
   let command, startedAt;
   if (process.platform === "win32") {
