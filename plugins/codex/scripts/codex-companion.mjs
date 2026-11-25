@@ -12,6 +12,7 @@ import { getWorkspaceRuntimeStatus, restartBrokerRuntime } from "./lib/broker-li
 import { UNREACHABLE_GUIDANCE } from "./lib/runtime-errors.mjs";
 import { getToolAvailability, syncToolConfig } from "./lib/tool-config.mjs";
 import { buildWorkerReport, parseStructuredReport, persistTaskArtifacts, taskArtifactPaths } from "./lib/worker-report.mjs";
+import { boundCommandOutput } from "./lib/command-output.mjs";
 import { normalizeBrowserOrigins, normalizeBundleIds } from "./lib/server-requests.mjs";
 import { browserOriginSetup, computerUseSetup, transportSetup, defaultSandboxSetup, defaultModeSetup, permissionMappingSetup, readTomlField, dispatchSetup, dispatchPreference, contextSetup, budgetDefaultsSetup, personaModelsSetup, workerDefaultsSetup, readWorkerDefaults, normalizeRequestedModel, isSupportedReasoningEffort, ensureBrowserApproval, ensureComputerUseApproval, ensureProjectDocs, projectDocsSetup, SANDBOX_MODES } from "./lib/setup-config.mjs";
 import { budgetLimit, newJobBudget } from "./lib/job-budget.mjs";
@@ -1264,7 +1265,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
     approvedBrowserOrigins: result.approvedBrowserOrigins ?? request.approvedBrowserOrigins ?? [],
     approvedComputerApps: result.approvedComputerApps ?? request.approvedComputerApps ?? [],
     blockers: result.blockers ?? [],
-    commandExecutions: result.commandExecutions ?? [],
+    commandExecutions: boundCommandOutput(result.commandExecutions ?? []),
     ...(result.usage ? { usage: result.usage } : {}),
     reasoningSummary: result.reasoningSummary,
     startupTimings: result.startupTimings ?? {}, startupWarning: result.startupWarning ?? null,

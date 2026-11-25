@@ -1,4 +1,4 @@
-import { test, expect } from 'claude-code/testing';
+import { test, expect, mock } from 'claude-code/testing';
 import { commandDisplay, fitCommand } from '../hooks/command';
 import type { On } from 'claude-code';
 import type { CodexLiveMarker, CodexLiveState, ForumRoom } from '../types';
@@ -106,6 +106,66 @@ test('clearing the final job hides its row and retains its record', async ($, on
   expect(emptyLines(60).slice(0, 4).map(line => width(line.spans[0]!.text))).toEqual([28, 28, 28, 28]);
   expect((await ui.find({ key: 'footer' }))?.text).toContain('this session');
   expect(await ui.find({ key: 'clear-finished' })).toBe(undefined);
+  await ui.unmount();
+});
+
+test('an unreadable private job finishes from its workspace index and can be cleared', async ($, on) => {
+  const clock = mock.clock(on, { now: epoch });
+  const started = epoch - 109 * 3600 * 1000;
+  const completedAt = new Date(started + 2000).toISOString();
+  let readable = true;
+  const folder = '/isolated/duet/sessions/session-a';
+  const jobFile = (id: string) => `/state/workspace/jobs/${id}.json`;
+  const indexFile = '/state/workspace/state.json';
+  const reads: string[] = [];
+  mock.env(on, { CODEX_COMPANION_HOME: '/isolated' });
+  on('session.start', ($, e) => ({ cwd: e.cwd }));
+  on('session.id', () => ({ value: 'session-a' }));
+  on('command.register', ($, e) => ({ value: { command: e.name } }));
+  on('fs.exists', () => ({ value: false }));
+  on('fs.list', ($, e) => ({ value: e.path === folder ? (readable ? ['job-a'] : ['job-a', 'job-b']).map(id =>
+    ({ name: `${id}.json`, kind: 'file' as const, size: 100, mtimeMs: epoch, isLink: false })) : [] }));
+  on('fs.stat', () => ({ value: { kind: 'file', size: 100, mtimeMs: readable ? 1 : 2, isLink: false } }));
+  on('fs.read', ($, e) => {
+    reads.push(e.path);
+    if (e.path.startsWith(folder + '/')) {
+      const id = e.path.slice(folder.length + 1, -5);
+      return { value: JSON.stringify({ ...marker(id), v: 1, jobFile: jobFile(id), createdAt: new Date(started).toISOString() }) };
+    }
+    if (e.path === indexFile) return { value: JSON.stringify({ jobs: ['job-a', 'job-b'].map(id => ({
+      id, jobClass: 'task', sessionId: 'session-a', status: 'completed', completedAt, updatedAt: completedAt,
+      summary: 'Indexed summary', request: { model: 'gpt-6-astra', effort: 'xhigh' } })) }) };
+    if (e.path === jobFile('job-a') && readable) return { value: JSON.stringify({ id: 'job-a', status: 'running',
+      activity: [{ seq: 1, type: 'agentMessage', text: 'Still running' }] }) };
+    return { deny: 'File exceeds read limit' };
+  });
+  on('ui.panes', () => ({ value: [] }));
+  on('ui.open', () => ({ value: { isPlaced: true } }));
+  const writes = track(on);
+  await $.session.start({ cwd: '/workspace', surface: 'terminal', isInteractive: true });
+  await clock.advance(1000);
+  expect(writes.at(-1)?.jobs[0]).toMatchObject({ active: true, detailsLoaded: true });
+  expect(reads.includes(indexFile)).toBe(false);
+  readable = false;
+  await clock.advance(1000);
+  const state = writes.at(-1)!;
+  expect(reads.filter(path => path === indexFile).length).toBe(1);
+  for (const id of ['job-a', 'job-b']) expect(state.jobs.find(job => job.id === id)).toMatchObject({
+    status: 'completed', finished: true, active: false, completedAt, detailsUnavailable: true,
+    model: 'gpt-6-astra', effort: 'xhigh', label: 'Indexed summary' });
+  expect(state.jobs.find(job => job.id === 'job-a')?.events[0]?.text).toBe('Still running');
+  const ui = await $.ui.mount({ plugin: 'fugato-live', surface: 'terminal', component: 'Pane', requestId: 'fugato-live',
+    props: { ...props, bodyColumns: 100 } });
+  const row = (await ui.find({ key: 'job-a' }))?.text;
+  expect(row).toContain('✓');
+  expect(row).toContain('astra xhigh');
+  expect(row).toContain('2s');
+  expect(row).toContain('━' + '╌'.repeat(13));
+  expect((await ui.find({ key: 'live-status' }))?.text).toContain('done · details unavailable');
+  await ui.press({ key: 'clear-finished' });
+  await clock.advance(10000);
+  expect(await ui.find({ key: 'job-a' })).toBe(undefined);
+  expect(visibleJobs(writes.at(-1)!)).toEqual([]);
   await ui.unmount();
 });
 
