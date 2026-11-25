@@ -42,11 +42,13 @@ Both role flags are refused on follow-ups, `--to`, `--thread`, `--resume`,
 `--resume-last`, `--continue`, `--fork` and roundtable seat dispatch. With
 `--fork`, pass the selected Codex model and effort explicitly.
 
-The worker backend fallback is separate from this dispatch route. Retry a
-Gemini job on Codex only after a classified authentication failure before
-prompt submission. Dispatch a fresh `fugato:codex-native` job with the row's
-explicit Codex fallback model and effort and no role flag. Never retry
-automatically after a blocked job, a permission denial or a submitted turn.
+For Gemini authentication fallback, confirm both the normalized
+`Antigravity authentication is required.` message and a `notStarted` turn
+resolution. If native dispatch is unavailable or Bash is selected, use
+background `fugato task --model '<m>' --effort '<e>' --normal` with the same
+brief on stdin. Substitute the row's Codex fallback model and effort. This
+is a fresh Codex dispatch with no role flag. Blocked jobs, permission denials
+and submitted turns do not qualify.
 
 Task text belongs in briefs, never control-CLI arguments or a generated shell command. For a permitted Bash fallback, send the brief on stdin through a single-quoted `DUET_TASK` heredoc; never interpolate raw slash arguments into executable shell source.
 

@@ -196,8 +196,9 @@ Sixteen native read-only workers were measured in flight together; larger or
 heavy mutating fan-out is not a measured guarantee.
 
 Choose a [worker role](ultra-codex.md#worker-roles) for each fresh assignment
-with `--role <id>`. Apply `--high-stakes` when the rule applies. Speed is
-normal unless requested. The reminder shows the effective role table.
+with `--role <id>`. Apply `--high-stakes` when the rule applies. Use normal
+speed by default and `--fast` only for Codex rows when the user requests it.
+The reminder shows the effective role table.
 
 ### `/fugato:pair`
 
@@ -417,9 +418,9 @@ fugato setup --role-model id=model[:effort] [--role-model id=model[:effort]]… 
 
 Repeat `--role-model` to set multiple roles. Use `id=default` to clear a
 role's saved settings. The high-stakes tuple is fixed. The legacy
-`--ultra-routine-model` shortcut sets the default model for `scan`,
-`implement`, `investigate` and `review`. See
-[worker model configuration](configuration.md#default-worker-models).
+`--ultra-routine-model` shortcut supplies a saved Codex model for `scan`,
+`implement`, `investigate` and `review` unless a role has its own saved model.
+See [worker model configuration](configuration.md#default-worker-models).
 
 `fugato setup --default-mode off|ultra|pair|duel|roundtable` saves the orchestration mode for
 fresh Claude sessions and `/clear` (default `off`); run it separately from other

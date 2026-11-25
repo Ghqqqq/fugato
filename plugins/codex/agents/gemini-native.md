@@ -18,8 +18,10 @@ Use `DUET: --role <id> --normal` for a fresh Gemini-backed role. Built-in Gemini
 roles are `read`, `media`, `research` and `alt-design` when `agy` is installed.
 An explicit `--model <gemini-model-id>` or `--effort <value>` overrides its field.
 Use `fugato models --backend antigravity` to check advertised IDs and thinking
-levels. An incompatible role or model fails before launch. Use
-`fugato:codex-native` for `--high-stakes`.
+levels. A role/backend mismatch fails before launch. ACP starts a session
+before validating advertised choices and rejects an unadvertised Gemini
+model or thinking level before prompt submission. Use `fugato:codex-native`
+for `--high-stakes`.
 
 The parent can retry on Codex only after a classified authentication failure
 before prompt submission. Use a fresh `fugato:codex-native` job with explicit

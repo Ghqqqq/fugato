@@ -106,8 +106,13 @@ For a standalone read-only review of uncommitted or branch changes, run
 
 ## Modes
 
-All four orchestration modes run Codex workers. Run a command with a task to use
-a mode once, or add `on` (as in `/fugato:pair on`) to keep it for the session.
+Fugato dispatches workers by role from a default table with Sol for routine
+work, Astra for hard and high-stakes work, and Gemini rows when `agy` is
+installed. Run `fugato models` to see the effective table and
+`fugato setup --role-model` to change a role.
+
+Run a command with a task to use a mode once, or add `on` (as in
+`/fugato:pair on`) to keep it for the session.
 
 <table>
 <tr>

@@ -50,19 +50,22 @@ explicit per-room model.
 Explicit user model or effort choices override the corresponding role
 fields. Honor those choices and omit `--high-stakes` when passing either
 explicit flag. The combination is an error. The Agent tool's effort is not
-forwarded when either role flag is in the DUET header. Preserve explicit
-user speed choices.
+forwarded when either role flag is in the DUET header. Use `--fast` only
+for Codex rows when the user requests it.
 
 Both role flags apply only to fresh dispatches. Follow-ups, `--to`,
 `--thread`, `--resume`, `--resume-last`, `--continue`, `--fork` and
 roundtable seat dispatch refuse them. Follow-ups inherit recorded settings.
-Use explicit `--model` or `--effort` to change them on the same thread.
+Change the model or effort on the same thread with explicit flags in a
+SendMessage DUET header or on `fugato task --to` or `--thread`.
+The `--continue` form always inherits model and effort and refuses overrides.
 
-Retry a Gemini assignment on Codex only after a classified authentication
-failure before prompt submission. Start a fresh `fugato:codex-native` job
-with the same brief, the row's explicit fallback `--model` and `--effort`,
-and no role flag. Blocked jobs, permission denials and submitted turns never
-trigger an automatic fallback.
+Retry a Gemini assignment on Codex only when the job shows the normalized
+`Antigravity authentication is required.` message and a `notStarted` turn
+resolution. Start a fresh Codex job with the same brief, the row's explicit
+fallback `--model` and `--effort`, and no role flag. Use `fugato:codex-native`
+on the native route or follow the `fugato:native-fallback` skill for Bash.
+Blocked jobs, permission denials and submitted turns do not qualify.
 
 ## Save role settings
 
@@ -74,13 +77,17 @@ fugato setup --role-model id=model[:effort]
 fugato setup --role-model id=default
 ```
 
-Repeat `--role-model` for different roles. `id=default` clears the saved
-model and effort. The high-stakes tuple is fixed and cannot be saved as a role.
-The legacy `--ultra-routine-model` shortcut sets the model of `scan`,
-`implement`, `investigate` and `review`. A saved `--default-model`
-supplies the model for `debug`, `architect`, `verify` and `judge`.
-Saved role fields take precedence. Roleless Codex dispatches still use
-`--default-model` and `--default-effort`.
+Repeat `--role-model` with each role at most once per command. Omitting the
+effort clears its saved value. `id=default` clears both saved fields.
+Setting or resetting `high-stakes` returns
+`the high-stakes tuple is fixed at gpt-6.2-astra/xhigh`.
+The legacy `--ultra-routine-model` shortcut supplies a saved Codex model for
+`scan`, `implement`, `investigate` and `review`. Use
+`--ultra-routine-model default` to clear it. A saved Codex `--default-model`
+supplies the model for `debug`, `architect`, `verify` and `judge`. Saved role
+settings take precedence. Roles inherit only models from these legacy
+settings. Roleless Codex dispatches still use `--default-model` and
+`--default-effort`.
 
 Check the effective table after applying changes. The mode reminders also
 show the roles in use. Saved changes apply to new dispatches.

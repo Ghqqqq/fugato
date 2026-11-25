@@ -64,9 +64,9 @@ For orchestration in every fresh session without a CLAUDE.md, use
   and migrations, public API or compatibility guarantees, concurrency or process
   lifecycle, release or CI, publishing, core architecture, or at the user's
   request. Honor explicit user model and effort choices and omit
-  `--high-stakes` if passing either explicit flag. Use `--normal` unless the
-  user requests `--fast`. Use a Codex row and `--sandbox read-only` for
-  enforced read-only work.
+  `--high-stakes` if passing either explicit flag. Use `--normal` by default.
+  Use `--fast` only for Codex rows when the user requests it. Use a Codex
+  row and `--sandbox read-only` for enforced read-only work.
 - Read each worker's actual diff and evidence against the acceptance criteria,
   rerun checks, run integration checks and request corrections when needed. A
   success message alone is not completion. Never simulate a notification, tool

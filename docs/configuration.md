@@ -198,8 +198,10 @@ dispatch. The Agent tool's effort is omitted when the DUET header contains
 `--high-stakes` selects the fixed Codex tuple `gpt-6.2-astra` / `xhigh`.
 The flag conflicts with explicit model or effort flags. Follow-ups, `--to`,
 `--thread`, `--resume`, `--resume-last`, `--continue`, `--fork` and
-roundtable seats refuse both role flags. Follow-ups inherit recorded settings
-unless explicitly overridden.
+roundtable seats refuse both role flags. Follow-ups inherit recorded settings.
+To change the model or effort on the same thread, use a SendMessage DUET
+header, `--to` or `--thread`. The `--continue` form always inherits both
+settings and refuses their override flags.
 
 ### Save role settings
 
@@ -211,17 +213,20 @@ fugato setup --role-model implement=gpt-6.2-sol:high --role-model review=gpt-6.2
 fugato setup --role-model review=default
 ```
 
-Repeat `--role-model id=model[:effort]` for different roles, or use
-`id=default` to clear both saved fields for a role. A model-only change
-clears a previously saved effort. Role overrides live under `[roles.<id>]` in
-`<isolated-home>/duet/config.toml`. The high-stakes tuple cannot be configured.
+Repeat `--role-model id=model[:effort]` for different roles, specifying each
+role only once per command. Use `id=default` to clear both saved fields.
+Omitting the effort clears its saved value. Role overrides live under
+`[roles.<id>]` in `<isolated-home>/duet/config.toml`. Setup refuses to set
+or reset `high-stakes` and reports
+`the high-stakes tuple is fixed at gpt-6.2-astra/xhigh`.
 Use `/fugato:setup` for the same flags in Claude Code.
 
-The legacy `--ultra-routine-model` shortcut sets the model for `scan`,
-`implement`, `investigate` and `review`. A saved Codex
+The legacy `--ultra-routine-model` shortcut supplies the model for `scan`,
+`implement`, `investigate` and `review` only when the saved value is a Codex
+model. Use `--ultra-routine-model default` to clear it. A saved Codex
 `--default-model` supplies the model for `debug`, `architect`, `verify` and
-`judge`. A saved role model takes precedence. These legacy settings supply
-models only. Roleless Codex dispatches use `--default-model` and
+`judge`. A saved role model takes precedence. Role efforts never inherit
+these legacy settings. Roleless Codex dispatches use `--default-model` and
 `--default-effort` (built-in `gpt-6-astra` / `xhigh`). The three legacy
 flags can be used alone or together. Use `default` to clear a saved legacy
 setting. Run model setup changes separately from other setup actions.

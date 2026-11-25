@@ -342,9 +342,10 @@ Use the effective role table from `fugato models`. The default rows are:
 | `research` | Source research and synthesis | `gemini-4-neon` / `high` | `gpt-6.2-sol` / `high` |
 | `alt-design` | Independent alternative designs | `gemini-4-neon` / `xhigh` | `gpt-6.2-astra` / `xhigh` |
 
-On a fresh dispatch use `--role <id>` and `--normal` unless the user
-asks for `--fast`. Use `fugato:gemini-native` for Gemini rows when
-`agy` is installed. The table supplies the Codex fallback when it is absent.
+On a fresh dispatch use `--role <id>` and `--normal`. Use `--fast` only
+for Codex rows when the user requests it. Use `fugato:gemini-native` for
+Gemini rows when `agy` is installed. The table supplies the Codex fallback
+when it is absent.
 Gemini requires authorization for full access. For enforced read-only work,
 use a Codex row with `--sandbox read-only`.
 
@@ -355,12 +356,21 @@ architecture, or when the user asks. It selects Codex
 `gpt-6.2-astra` / `xhigh`. Honor explicit user model or effort choices and
 omit `--high-stakes` when passing either explicit flag.
 
-After one unsuccessful rework, escalate within the same assignment's remaining
-budget. Follow up on the same Codex thread with
-`--model gpt-6.2-astra --effort xhigh`, or dispatch a fresh
-`fugato:codex-native` job with `--high-stakes` for a Gemini assignment.
-Preserve user choices and the protocol's stop rules. For the separate
-authentication-only fallback, see [Gemini dispatch](antigravity.md).
+**Gemini authentication fallback** applies only when the job shows both the
+normalized `Antigravity authentication is required.` message and a
+`notStarted` turn resolution. Dispatch the same brief as a fresh Codex job
+with the role's fallback as explicit `--model` and `--effort` flags and no
+role flag. Blocked jobs, permission denials and submitted turns do not
+qualify. See [Gemini dispatch](antigravity.md).
+
+**Escalation after rework** applies when a resolved turn still fails after
+one rework and the assignment has budget remaining. Apply explicit user
+model and effort choices first. On a Codex job, follow up on the same thread
+using `--model gpt-6.2-astra --effort xhigh` for settings the user did not
+choose. For a Gemini job, start a separate fresh Codex dispatch with
+`--high-stakes`, or omit it and use the user's explicit model or effort
+flags. A continuation stays on its original backend. Keep the protocol's
+status gate and stop rules in force.
 
 Use `fugato setup --role-model id=model[:effort]` to change a role. See
 [worker model configuration](configuration.md#default-worker-models).

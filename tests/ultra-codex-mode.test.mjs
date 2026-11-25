@@ -74,6 +74,7 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
   const context = result => f.json(result).hookSpecificOutput.additionalContext;
   const baseline = context(f.lifecycle("SessionStart", { source: "compact" }));
   assert.match(baseline, /DUET: --role <id> --normal/);
+  assert.match(baseline, /fugato:gemini-native for Gemini rows/);
   assert.match(baseline, /Use `--high-stakes` when the rule/);
   assert.match(baseline, /Set explicit `--model` or `--effort` for user choices only/);
   for (const mode of MODES) {
@@ -225,6 +226,7 @@ test("dispatch setup previews, persists across plugin data paths and resets star
   const context = () => f.json(f.lifecycle("SessionStart", { source: "startup" })).hookSpecificOutput.additionalContext;
   assert.match(context(), /background Bash.*fugato task/);
   assert.match(context(), /fugato task --role <id> --normal/);
+  assert.match(context(), /fugato task --backend antigravity --role <id> --normal/);
   assert.doesNotMatch(context(), /Agent\(subagent_type:/);
   const before = fs.readFileSync(file, "utf8");
   assert.equal(f.call("setup", "--dispatch", "invalid").status, 1);

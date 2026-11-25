@@ -34,7 +34,11 @@ async function sessionStartContext() {
   ];
   return [
     ...routeContext,
-    `When delegating outside an orchestration mode, choose a role for each fresh dispatch: \`${bash ? "fugato task" : "DUET:"} --role <id> --normal\`. Use \`--high-stakes\` when the rule in the fugato:models skill applies. Set explicit \`--model\` or \`--effort\` for user choices only and omit \`--high-stakes\` in that case. Preserve explicit speed choices. For enforced read-only work, use a Codex row and \`--sandbox read-only\`. Active mode reminders and protocols take precedence.`,
+    "When delegating outside an orchestration mode, choose a role for each fresh dispatch.",
+    bash
+      ? "Use `fugato task --role <id> --normal` for a Codex row or `fugato task --backend antigravity --role <id> --normal` for a Gemini row."
+      : "Start the agent prompt with `DUET: --role <id> --normal`.",
+    "Use `--high-stakes` when the rule in the fugato:models skill applies. Set explicit `--model` or `--effort` for user choices only and omit `--high-stakes` in that case. Use `--fast` only for Codex rows and only when requested. For enforced read-only work, use a Codex row and `--sandbox read-only`. Active mode reminders and protocols take precedence.",
     `Use a fresh ${bash ? "worker" : "native agent"} per independent job; never run two jobs on one thread at once. Concurrent edits need disjoint owned paths or separate worktrees.`,
     "Briefs state the objective, owned paths, numbered acceptance criteria and verification commands.",
     "Accept only on evidence: read the actual diff and rerun checks. A success message, launch receipt or `running` payload is not completion; never simulate a worker report or notification."
