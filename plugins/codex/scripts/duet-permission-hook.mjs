@@ -9,8 +9,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS } from "./lib/command-options.mjs";
-import { SANDBOX_MODES, isSupportedReasoningEffort, normalizeRequestedModel } from "./lib/setup-config.mjs";
+import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS, NON_FRESH_ROLE_FLAGS } from "./lib/command-options.mjs";
+import { defaultSandboxSetup, effectiveRoleTable, permissionMappingSetup, SANDBOX_MODES, isSupportedReasoningEffort, normalizeRequestedModel } from "./lib/setup-config.mjs";
+import { backendForModel, expandRole } from "./lib/roles.mjs";
+import { acpSetting, validateAntigravityTask } from "./lib/backends.mjs";
 import { PERSONA_IDS } from "./lib/roundtable-personas.mjs";
 import { budgetLimit } from "./lib/job-budget.mjs";
 import { readHookInput } from "./lib/fs.mjs";
@@ -19,6 +21,7 @@ const launchers = Object.fromEntries(["fugato", "duet"].map(name => [name, fileU
 const quote = value => `'${value.replace(/'/g, `'"'"'`)}'`;
 const safeId = value => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const target = value => /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(value);
+const threadSelectors = ["to", "thread", "continue", "resume", "resume-last"];
 // Allow the companion's options by default, except permission grants, the legacy
 // --write permission override, non-stdin briefs, and options incompatible with
 // the launcher's implicit direct mode. Session/help are handled globally by the
@@ -125,7 +128,7 @@ export function approveDuet(input, env = process.env) {
     const inlineValue = option?.[2];
     if (flags.has(name)) return {};
     if (schema.boolean.has(name)) {
-      if (inlineValue !== undefined && !["true", "false"].includes(inlineValue)) return {};
+      if (inlineValue !== undefined && (COMMAND_OPTIONS[verb].bareOptions?.includes(name) || !["true", "false"].includes(inlineValue))) return {};
       if (name === "direct" && inlineValue === "false") return {};
       flags.set(name, inlineValue !== "false");
     } else if (schema.value.has(name)) {
@@ -144,6 +147,29 @@ export function approveDuet(input, env = process.env) {
       if (["lease-sec", "question-timeout-sec"].includes(name) && (!/^\d+$/.test(value) || +value < 1 || +value > 86400)) return {};
       flags.set(name, value);
     } else return {};
+  }
+  if (verb === "task" && (flags.has("role") || flags.has("high-stakes"))) {
+    if (NON_FRESH_ROLE_FLAGS.some(key => flags.get(key))) return {};
+    try {
+      const backend = flags.get("backend") ?? "codex";
+      const cwd = path.resolve(input.cwd ?? process.cwd(), flags.get("cwd") ?? ".");
+      const { model } = expandRole(effectiveRoleTable({ env, cwd }), {
+        backend, role: flags.get("role"), highStakes: flags.has("high-stakes"), model: flags.get("model"), effort: flags.get("effort")
+      });
+      if (backendForModel(model) !== backend) return {};
+    } catch { return {}; }
+  }
+  // Fresh tasks take the configured sandbox. Follow-ups can inherit a recorded one.
+  if (verb === "task" && flags.get("backend") === "antigravity" && !threadSelectors.some(key => flags.get(key))) {
+    try {
+      if (permissionMappingSetup({ env }).permissionMapping === "claude") return {};
+      const options = Object.fromEntries(flags);
+      acpSetting(options.model, "model");
+      acpSetting(options.effort, "effort");
+      const sandbox = options.sandbox ?? defaultSandboxSetup({ env }).defaultSandbox;
+      validateAntigravityTask({ options, sandbox, permissionPolicy: null, roundtable: options.roundtable,
+        budget: { maxTokens: options["max-tokens"] } });
+    } catch { return {}; }
   }
   if (verb === "task" && (flags.has("roundtable") !== flags.has("persona") ||
       (flags.has("roundtable") && (!/^rt-[a-z0-9]+-[a-z0-9-]+$/.test(flags.get("roundtable")) || !PERSONA_IDS.includes(flags.get("persona")))))) return {};
@@ -165,7 +191,7 @@ export function approveDuet(input, env = process.env) {
   const needsTarget = ["answer", "wait"].includes(verb) || (verb === "cancel" && !cancelAll) || (verb === "result" && !flags.has("thread"));
   if ((!forumReadOnly && positionals.length > (verb === "task" ? 0 : 1)) || (needsTarget && !flags.has("help") && positionals.length !== 1)) return {};
   if ((flags.has("fast") && flags.has("normal")) || ["to", "thread", "fresh"].filter(key => flags.has(key)).length > 1) return {};
-  if (flags.get("fork") && ["to", "thread", "continue", "resume", "resume-last"].some(key => flags.has(key))) return {};
+  if (flags.get("fork") && threadSelectors.some(key => flags.has(key))) return {};
   if (flags.has("source") && !flags.get("fork")) return {};
   if (flags.has("continue") && ["backend", "to", "thread", "fresh", "resume", "resume-last", "sandbox", "model", "effort", "fast", "normal"].some(key => flags.has(key))) return {};
   if (flags.has("help") && (heredoc || [...flags.keys()].some(key => !["help", "session", "cwd"].includes(key)))) return {};

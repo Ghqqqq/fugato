@@ -1,6 +1,6 @@
 ---
 name: codex-implementer
-description: Codex implementation worker through Fugato. Use for bounded code changes within assigned paths and appropriate verification. Fixed workspace-write sandbox, clamped to read-only in plan mode. Saved worker model/effort/speed defaults apply; DUET header may override those and cwd but may not conflict with the sandbox. SendMessage preserves this role and thread. Local runtime and in-process teammates only.
+description: Codex implementation worker through Fugato. Use for bounded code changes within assigned paths and appropriate verification. Fixed workspace-write sandbox, clamped to read-only in plan mode. Use --role implement --normal in a fresh DUET header, or --high-stakes when it applies. The header may select cwd and user model/effort/speed choices within the fixed sandbox. Roleless dispatch uses saved worker defaults. SendMessage preserves this role and thread. Local runtime and in-process teammates only.
 model: haiku
 effort: low
 omitClaudeMd: true

@@ -79,27 +79,36 @@ verification, not chat volume.
 
 ## Models and redefinition
 
-The built-in mapping at standard intensity is:
+Each persona takes its model from its worker role and uses its own effort.
+These are the standard-intensity settings with the built-in role table.
 
-| Persona | Model | Effort |
-| --- | --- | --- |
-| conjecturer | `gpt-6.1-terra` | `medium` |
-| critic | `gpt-6-astra` | `high` |
-| steward | `gpt-6.1-sol` | `xhigh` |
-| improver | `gpt-6.1-sol` | `high` |
-| integrator | `gpt-6-astra` | `high` |
-| calibrator | `gpt-6-astra` | `medium` |
+| Persona | Worker role | Model | Effort |
+| --- | --- | --- | --- |
+| conjecturer | `investigate` | `gpt-6.2-sol` | `medium` |
+| critic | `verify` | `gpt-6.2-astra` | `high` |
+| steward | `investigate` | `gpt-6.2-sol` | `xhigh` |
+| improver | `implement` | `gpt-6.2-sol` | `high` |
+| integrator | `architect` | `gpt-6.2-astra` | `high` |
+| calibrator | `judge` | `gpt-6.2-astra` | `medium` |
+
+The per-room persona model takes precedence over the saved persona model,
+then the effective role's Codex model. Gemini rows supply their Codex
+fallback. Persona model overrides must be Codex models. The worker role
+supplies only the model.
 
 With built-in efforts, light lowers each by one step, deep raises by one,
-and full raises by one with critic and integrator at `max`. The shift ladder is
-`low → medium → high → xhigh → max`, clamped at its ends. Saved or per-run
-explicit efforts are used unchanged. A model-only override keeps the built-in
-intensity-adjusted effort. Ordinary `--default-model`/`--default-effort` worker
-settings do not redefine persona models.
+and full raises by one with critic and integrator at `max`. The shift ladder
+is `low → medium → high → xhigh → max`, clamped at its ends. Saved and per-room
+explicit efforts take precedence over intensity adjustments.
+
+Use `fugato roundtable start --high-stakes` for [high-stakes work](ultra-codex.md#worker-roles).
+It sets every seat's model to `gpt-6.2-astra` except seats with an explicit
+per-room model. Efforts follow the usual room rules. The room snapshots the
+resolved settings and the seat headers refuse `--role` and `--high-stakes`.
 
 ```bash
-fugato setup --persona-model critic=gpt-6-astra:xhigh --persona-model improver=gpt-6.1-sol:high --dry-run --json
-fugato setup --persona-model critic=gpt-6-astra:xhigh --persona-model improver=gpt-6.1-sol:high --json
+fugato setup --persona-model critic=gpt-6.2-astra:xhigh --persona-model improver=gpt-6.2-sol:high --dry-run --json
+fugato setup --persona-model critic=gpt-6.2-astra:xhigh --persona-model improver=gpt-6.2-sol:high --json
 fugato setup --persona-model critic=default --json
 fugato setup --json
 ```
@@ -115,7 +124,7 @@ Values live in `<isolated-home>/duet/config.toml`:
 
 ```toml
 [roundtable.personas.critic]
-model = "gpt-6-astra"
+model = "gpt-6.2-astra"
 effort = "xhigh"
 ```
 

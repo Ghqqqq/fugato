@@ -85,15 +85,20 @@ launches the exact absolute path it checked for the turn and records that path
 for recovery. [Executable resolution](../plugins/codex/scripts/lib/antigravity.mjs) ·
 [Worker launch](../plugins/codex/scripts/codex-companion.mjs)
 
-## Default model and thinking level
+## Roles and thinking levels
 
-Fresh Gemini workers request `gemini-4-neon` with `xhigh` thinking. If Neon
-is unavailable, Fugato keeps agy's current Gemini model or selects the first
-advertised Gemini model. It then checks the selected model's thinking options
-and keeps its current level if `xhigh` is unavailable. Explicit `--model` and
-`--effort` values must be supported. A continuation inherits the settings
-actually used on its thread. The native agent header and `fugato-live` show
-the requested settings at dispatch and update when agy selects a fallback.
+When `agy` is installed, the built-in `read`, `media` and `research` roles
+request `gemini-4-neon` / `high`. The `alt-design` role requests
+`gemini-4-neon` / `xhigh`. Saved role settings can change these rows.
+Without `agy`, the [effective role table](ultra-codex.md#worker-roles) uses their
+Codex fallbacks. Executable discovery does not check sign-in.
+
+A roleless fresh Gemini worker requests `gemini-4-neon` / `xhigh`. If that
+default model or thinking level is unavailable, Fugato selects from the
+advertised models or keeps the model's current thinking level. Explicit model
+and effort values must be supported. A continuation inherits the settings
+used on its thread. The native agent header and `fugato-live` show the
+dispatch settings and update when agy selects a fallback.
 
 `fugato models --backend antigravity` lists the account's advertised
 `gemini-*` IDs and labels Neon as the Fugato default when available. Thinking
@@ -107,18 +112,27 @@ identifies that current model and `isFugatoDefault` identifies Neon.
 Agent(subagent_type: "fugato:gemini-native", prompt: "Investigate the parser failure, implement the agreed fix and run the relevant tests.")
 ```
 
-To select a model or thinking level for this assignment, put an optional
-`DUET:` header on the first line of the prompt. Either flag can be supplied
-on its own.
+For a fresh assignment with a Gemini-backed role, put a DUET header first.
 
 ```text
-DUET: --model <gemini-model-id> --effort <thinking-value> --max-minutes 10
-Investigate the parser failure, implement the agreed fix and run the tests.
+DUET: --role research --normal --max-minutes 10
+Compare the official sources and summarize the evidence.
 ```
 
-The native preset fixes the backend to `antigravity` and rejects a conflicting
-backend. The Claude shell's effort and saved Codex model and effort defaults
-do not select Gemini settings.
+Use explicit `--model <gemini-model-id>` or `--effort <thinking-value>`
+for a user choice. The native preset fixes the backend to `antigravity`.
+A mismatched role fails before launch and names the agent to dispatch.
+For `--high-stakes` use `fugato:codex-native`. The Claude shell's effort
+and saved Codex defaults do not select Gemini settings.
+
+The automatic Codex fallback applies only to a classified authentication
+failure before prompt submission (`notStarted` with an auth error before
+`session/prompt`). Dispatch the same brief fresh on `fugato:codex-native`
+with the fallback row's explicit `--model` and `--effort` and no role flag.
+Blocked jobs, permission denials and submitted turns never trigger this
+fallback. Escalating a resolved Gemini job that still fails after a rework is
+a separate step: a fresh `fugato:codex-native` dispatch with `--high-stakes`
+(see the protocol's Worker roles section).
 
 Wait for the worker's report before using `SendMessage`. A running turn
 refuses messages, even if a progress notice already shows a question.
@@ -147,8 +161,8 @@ invalid body. Those replies start no work.
 ## Companion CLI
 
 ```sh
-fugato task --backend antigravity --name GeminiWorker --max-minutes 10 <<'TASK'
-Investigate the parser failure, implement the agreed fix and run the tests.
+fugato task --backend antigravity --role research --normal --name GeminiWorker --max-minutes 10 <<'TASK'
+Compare the official sources and summarize the evidence.
 TASK
 ```
 

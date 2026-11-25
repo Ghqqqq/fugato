@@ -5,14 +5,15 @@
 import { readHookInput } from "./lib/fs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import { isModeCommandPrompt, readMode, reminderText } from "./lib/ultra-codex-mode.mjs";
-import { readWorkerDefaults } from "./lib/setup-config.mjs";
+import { effectiveRoleTable } from "./lib/setup-config.mjs";
 
 try {
   const raw = (await readHookInput()).trim();
   const input = raw ? JSON.parse(raw) : {};
   const sessionId = input.session_id || process.env.CODEX_COMPANION_SESSION_ID;
   if (sessionId) {
-    const mode = readMode(resolveWorkspaceRoot(input.cwd || process.cwd()), sessionId);
-    if (mode && !isModeCommandPrompt(input.prompt)) process.stdout.write(`${reminderText(mode, undefined, readWorkerDefaults())}\n`);
+    const cwd = input.cwd || process.cwd();
+    const mode = readMode(resolveWorkspaceRoot(cwd), sessionId);
+    if (mode && !isModeCommandPrompt(input.prompt)) process.stdout.write(`${reminderText(mode, undefined, effectiveRoleTable({ cwd }))}\n`);
   }
 } catch { /* silent */ }

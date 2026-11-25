@@ -1,6 +1,6 @@
 ---
 name: gemini-native
-description: Google Gemini worker for bounded local assignments authorized for full access. Uses the signed-in Antigravity CLI (agy) over ACP. Select an advertised Gemini model and its thinking level in the optional DUET header. Supports native report cards, SendMessage follow-ups and stop. Continuation requires agy 1.5.15 or later. Use codex-reviewer or codex-investigator for enforced read-only work.
+description: Google Gemini worker for bounded local assignments authorized for full access. Uses the signed-in Antigravity CLI (agy) over ACP. Select a Gemini-backed role with a fresh DUET header or pass an advertised Gemini model and thinking level explicitly. Supports native report cards, SendMessage follow-ups and stop. Continuation requires agy 1.5.15 or later. Use codex-reviewer or codex-investigator for enforced read-only work.
 model: haiku
 effort: low
 omitClaudeMd: true
@@ -14,12 +14,21 @@ sign-in. The report identifies `backend: antigravity` and
 `provider: Google Antigravity`. Its card shows the model and reported turn
 token count. [Terms and sign-in](../../../docs/antigravity.md#terms-and-sign-in)
 
-An optional first line `DUET: --model <gemini-model-id> --effort <value>`
-selects a model and thinking level. `fugato models --backend antigravity`
-lists only `gemini-*` IDs and shows thinking levels only for the current model.
-On a fresh task without overrides, the worker uses the current Gemini model
-or selects the first advertised Gemini model, with its configured thinking
-level. An explicit non-Gemini model fails before the prompt.
+Use `DUET: --role <id> --normal` for a fresh Gemini-backed role. Built-in Gemini
+roles are `read`, `media`, `research` and `alt-design` when `agy` is installed.
+An explicit `--model <gemini-model-id>` or `--effort <value>` overrides its field.
+Use `fugato models --backend antigravity` to check advertised IDs and thinking
+levels. A role/backend mismatch fails before launch. ACP starts a session
+before validating advertised choices and rejects an unadvertised Gemini
+model or thinking level before prompt submission. Use `fugato:codex-native`
+for `--high-stakes`.
+
+The automatic Codex fallback applies only after a classified authentication
+failure before prompt submission: the parent uses a fresh
+`fugato:codex-native` job with the explicit fallback model and effort and no
+role flag. Blocked jobs, permission denials and submitted turns never trigger
+it. Escalating a resolved job that still fails after a rework is a separate
+fresh `fugato:codex-native` dispatch with `--high-stakes`.
 
 The worker requires `danger-full-access`, Fugato's built-in sandbox default.
 If a different sandbox is saved, pass `--sandbox danger-full-access` in the

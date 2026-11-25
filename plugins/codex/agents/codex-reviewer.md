@@ -1,6 +1,6 @@
 ---
 name: codex-reviewer
-description: Read-only Codex code reviewer through Fugato. Use for actionable correctness, regression and security review findings with file references and observed checks. Fixed read-only sandbox; no file edits. Saved worker model/effort/speed defaults apply; DUET header may override those and cwd but may not conflict with the sandbox. SendMessage preserves this role and thread. Local runtime and in-process teammates only.
+description: Read-only Codex code reviewer through Fugato. Use for actionable correctness, regression and security review findings with file references and observed checks. Fixed read-only sandbox; no file edits. Use --role review --normal in a fresh DUET header, or --high-stakes when it applies. The header may select cwd and user model/effort/speed choices within the fixed sandbox. Roleless dispatch uses saved worker defaults. SendMessage preserves this role and thread. Local runtime and in-process teammates only.
 model: haiku
 effort: low
 omitClaudeMd: true

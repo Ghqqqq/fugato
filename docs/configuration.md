@@ -185,87 +185,76 @@ declare no skills. Fork import omissions are visible as `forkSlice` in
 
 ## Default worker models
 
-Discover the current account's model names with `fugato models` (or `--json`),
-then choose using the returned descriptions and supported efforts. Add `--all`
-to include hidden models. Agents load the model-invocable `fugato:models` skill
-when asked to check, compare or change worker models or efforts, or when a
-dispatch fails on an unknown model. Do not rely on remembered model names.
+Use the [worker role table](ultra-codex.md#worker-roles) to choose
+`--role <id>` for a fresh native DUET header or `fugato task`.
+`fugato models`, `fugato status` and setup output show the effective
+role table. The model-invocable `fugato:models` skill covers selection and
+setup. Each row supplies its model, effort and backend. Saved role fields take
+precedence over inherited model settings and built-ins. An explicit user choice
+of `--model` or `--effort` overrides the corresponding role field on that
+dispatch. The Agent tool's effort is omitted when the DUET header contains
+`--role` or `--high-stakes`.
 
-Save worker defaults in `<isolated-home>/duet/config.toml`, alongside the sandbox
-and orchestration-mode preferences:
+`--high-stakes` selects the fixed Codex tuple `gpt-6.2-astra` / `xhigh`.
+The flag conflicts with explicit model or effort flags. Follow-ups, `--to`,
+`--thread`, `--resume`, `--resume-last`, `--continue`, `--fork` and
+roundtable seats refuse both role flags. Follow-ups inherit recorded settings.
+To change the model or effort on the same thread, use a SendMessage DUET
+header, `--to` or `--thread`. The `--continue` form always inherits both
+settings and refuses their override flags.
 
-| Setting | Use and built-in default | Setup flag |
-| --- | --- | --- |
-| `defaultModel` | Configured worker model (default `gpt-6-astra`) for ordinary delegation, pair, duel and ultra's strong tier: verification, judging and hard debugging | `--default-model <model\|default>` |
-| `defaultEffort` | Worker effort (default `xhigh`) for ordinary delegation, pair and duel; ultra retains its effort by stage | `--default-effort <effort\|default>` |
-| `ultraRoutineModel` | Configured routine model (default `gpt-6.1-sol`) for ultra's scans, implementation and ordinary review | `--ultra-routine-model <model\|default>` |
+### Save role settings
 
-An explicit user choice in the conversation or an explicit `--model`/`--effort`
-on a call wins. Dispatch precedence is explicit flags, then recorded thread
-settings on follow-ups, then saved defaults, then built-ins. Changing a saved
-default does not replace an existing thread's recorded settings. Missing,
-invalid or malformed preferences fall back to the built-in value; reading them
-does not throw.
-
-```text
-fugato setup --default-model <model|default> [--default-effort <effort|default>] [--ultra-routine-model <model|default>]
-```
-
-Each flag can also be used alone. The three flags may combine with one another
-and `--dry-run`, but not with another setup change such as `--default-mode` or
-`--default-sandbox`. All supplied values are validated before any write.
-`/fugato:setup` passes the same flags:
+Preview with `--dry-run` before applying:
 
 ```bash
-fugato setup --default-model gpt-6.1-sol --default-effort high --ultra-routine-model gpt-6.1-sol --dry-run
-fugato setup --default-model gpt-6.1-sol --default-effort high --ultra-routine-model gpt-6.1-sol
-/fugato:setup --default-model gpt-6-astra --default-effort xhigh
-fugato setup --ultra-routine-model spark
+fugato setup --role-model implement=gpt-6.2-sol:high --role-model review=gpt-6.2-astra:medium --dry-run
+fugato setup --role-model implement=gpt-6.2-sol:high --role-model review=gpt-6.2-astra:medium
+fugato setup --role-model review=default
 ```
 
-Use `default` to remove the corresponding saved key and restore its built-in:
+Repeat `--role-model id=model[:effort]` for different roles, specifying each
+role only once per command. Use `id=default` to clear both saved fields.
+Omitting the effort clears its saved value. Role overrides live under
+`[roles.<id>]` in `<isolated-home>/duet/config.toml`. Setup refuses to set
+or reset `high-stakes` and reports
+`the high-stakes tuple is fixed at gpt-6.2-astra/xhigh`.
+Use `/fugato:setup` for the same flags in Claude Code.
 
-```bash
-fugato setup --default-model default --default-effort default --ultra-routine-model default
-```
+The legacy `--ultra-routine-model` shortcut supplies the model for `scan`,
+`implement`, `investigate` and `review` only when the saved value is a Codex
+model. Use `--ultra-routine-model default` to clear it. A saved Codex
+`--default-model` supplies the model for `debug`, `architect`, `verify` and
+`judge`. A saved role model takes precedence. Role efforts never inherit
+these legacy settings. Roleless Codex dispatches use `--default-model` and
+`--default-effort` (built-in `gpt-6-astra` / `xhigh`). The three legacy
+flags can be used alone or together. Use `default` to clear a saved legacy
+setting. Run model setup changes separately from other setup actions.
 
-Model names use the existing alias normalization (`spark` remains an alias for
-`gpt-5.3-codex-spark`), then must match `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/`.
-Effort accepts `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`, plus
-efforts listed by any model in Codex's isolated `models_cache.json` (including
-hidden models). Setup and hooks check the cache synchronously and never start
-a runtime. The static set applies when the cache is missing.
-The selected model/runtime must support the effort. `--default-model` and
-`--ultra-routine-model` must also appear in the isolated model cache when it is
-available; hidden models count. When the cache was fetched within the last
-24 hours, an unknown name is refused before any write, with a hint to refresh
-the cache through `fugato models` and retry. With an older cache, or without a
-usable cache, a syntactically valid name is accepted with a warning. Codex
-refreshes the cache whenever it starts a runtime, so `fugato models` also
-refreshes it; `fugato models --all` includes hidden models. Cache validation does
-not prove that a later dispatch will succeed.
+`gemini-*` model names select the Antigravity backend. When `agy` is
+unavailable, the effective row uses its built-in Codex fallback. When present,
+use `fugato:gemini-native` for Gemini rows. A role/backend mismatch fails
+before launch and names the agent to use. See [Gemini dispatch](antigravity.md).
 
-The setup change returns a JSON report with `file`, `defaultModel`,
-`defaultEffort` and `ultraRoutineModel`, showing each effective value and its
-`source` (`saved` or `built-in`). No-argument `fugato setup` status includes the
-same effective values; human output adds
-`Default models: worker <model>/<effort>, ultra routine <routineModel>.`
-Mode reminders name the effective values. `fugato ultra-codex status`,
-`fugato pair status` and `fugato duel status` show
-`models: worker <model>/<effort>, ultra routine <routineModel>`; their JSON has
-`models: { model, effort, routineModel }`.
+### Model discovery and validation
 
-`fugato models` prefers the official app-server `model/list` API and falls back to
-the isolated cache when the runtime or method is unavailable. It reports the
-source and fetch time. The JSON envelope is `{ source, fetchedAt, models, tiers }`;
-each model has `slug`, `displayName`, `description`, `efforts`, `defaultEffort`,
-`contextWindow`, `visibility` and `inUse` (`strong`, `routine`, or both).
-`tiers.strong`, `tiers.effort` and `tiers.routine` each contain `value` and
-`source` (`saved` or `built-in`). Fetch time is the retrieval time for the API
-or the cache's recorded fetch time. An unavailable context window is `null`
-(`unknown` in text); the pinned app-server schema does not expose it. Cache
-identity and account credentials are never included. If both sources are
-unavailable, the command exits nonzero with a `/fugato:setup` hint.
+`fugato models` uses the app-server `model/list` API, falling back to the
+isolated cache when necessary. Add `--all` to include hidden models. Output
+identifies the source and fetch time. Unknown context windows are `null` in
+JSON. If both sources are unavailable, the command exits nonzero with a
+`/fugato:setup` hint. The role table is added under `roles` in JSON.
+Existing catalog fields, `tiers` and model `inUse` entries are retained.
+
+Model names match `/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/` after alias
+normalization (`spark` maps to `gpt-5.3-codex-spark`). An unknown Codex
+model fails validation when the cache is fresh (within 24 hours). A stale or
+unavailable cache yields a warning. Refresh it with `fugato models`. Use
+`fugato models --backend antigravity` to check advertised Gemini models.
+For Codex models, effort accepts `none`, `minimal`, `low`, `medium`, `high`,
+`xhigh` or `max` and efforts listed in Codex's isolated model cache. For a
+Gemini model on a role, effort accepts `low`, `medium`, `high` or `xhigh`
+(any case). Confirm the selected model and runtime support the requested
+effort.
 
 ## Worker dispatch
 
@@ -293,7 +282,8 @@ rather than disable a tool: explicit native calls remain possible. See the
 `[roundtable.personas.<id>]` in `<isolated-home>/duet/config.toml`. Repeat it
 for different personas; `<id>=default` removes both saved fields. A model-only
 change clears an earlier saved effort, allowing the intensity's built-in effort
-adjustment. Ordinary worker defaults do not override this mapping.
+adjustment. With no persona override, the model comes from the persona's worker
+role. Gemini-backed roles supply their Codex fallback to a persona.
 
 Run mapping changes separately from all other setup changes. `--dry-run --json`
 validates and previews without writing. Persona ids, model syntax/catalog and
@@ -437,7 +427,7 @@ model_reasoning_effort = "high"
 ```
 
 `/fugato:review` and adversarial reviews pass the saved
-[worker defaults](#default-worker-models) or built-ins explicitly unless overridden
+[roleless worker defaults](#default-worker-models) explicitly unless overridden
 on the call; these `config.toml` model settings do not apply to them.
 
 See the [Codex configuration reference](https://developers.openai.com/codex/config-reference).

@@ -110,6 +110,8 @@ function isStructuredReviewStoredResult(storedJob) {
 function formatJobLine(job) {
   const parts = [job.id, `${job.status || "unknown"}`];
   if (job.agentName) parts.push(`worker: ${job.agentName}`);
+  if (job.role) parts.push(`role: ${job.role}`);
+  if (job.highStakes) parts.push("high-stakes");
   if (job.model || job.effort) parts.push([job.model, job.effort].filter(Boolean).join(" / "));
   if (job.kindLabel) {
     parts.push(job.kindLabel);
@@ -243,6 +245,12 @@ function browserPolicyForNewTasks({ approval, preference = approval }) {
   return `${approval} (file; preserved); preference: ${preference}`;
 }
 
+export function renderRoleTable(table) {
+  const rows = [...table.roles, { id: "high-stakes", ...table.highStakes }];
+  return ["Worker roles", "Role | Backend | Model | Effort | Source",
+    ...rows.map(row => [row.id, row.backend, row.model, row.effort, row.source].join(" | ")), ""].join("\n");
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -262,6 +270,7 @@ export function renderSetupReport(report) {
     ""
   ];
 
+  if (report.roles) lines.push(renderRoleTable(report.roles));
   if (report.actionsTaken.length > 0) {
     lines.push("Actions taken:");
     for (const action of report.actionsTaken) {
@@ -460,6 +469,7 @@ export function renderStatusReport(report, options = {}) {
     lines.push(options.all ? "No jobs recorded for this workspace." : "No jobs in this session. Run /fugato:status --all to see jobs from other sessions in this workspace.", "");
   }
 
+  if (report.roles) lines.push(renderRoleTable(report.roles));
   if (report.needsReview) {
     lines.push("The stop-time review gate is enabled.");
     lines.push("Ending the session will trigger a fresh Codex adversarial review and block if it finds issues.");

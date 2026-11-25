@@ -5,6 +5,7 @@ import path from "node:path";
 import { makeTempDir, run, writeExecutable } from "./helpers.mjs";
 import { buildEnv } from "./fake-codex-fixture.mjs";
 import { listModels, readModelCache } from "../plugins/codex/scripts/lib/models.mjs";
+import { roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 
 const plugin = new URL("../plugins/codex/", import.meta.url);
 const launcher = new URL("bin/duet", plugin).pathname;
@@ -144,4 +145,21 @@ test("models rejects invalid options and overlapping homes before runtime startu
   assert.equal(readModelCache(env), null);
   await assert.rejects(listModels({ env }), /must not overlap/);
   assert.equal(fs.existsSync(f.pidFile), false);
+});
+
+test("role setup validates Codex slugs against the isolated cache and accepts unverified Gemini slugs", () => {
+  const f = fixture();
+  const cached = { models, fetched_at: new Date().toISOString() };
+  fs.writeFileSync(f.cacheFile, JSON.stringify(cached));
+  const setup = (...models) => roleModelsSetup({ env: f.env, models, dryRun: true });
+  assert.throws(() => setup("debug=absent"), /--role-model.*not listed in Codex's isolated model cache/);
+  const preview = setup("debug=fixture-hidden:ultra", "review=gemini-custom");
+  assert.deepEqual(preview.table.roles.find(row => row.id === "debug"), {
+    id: "debug", backend: "codex", model: "fixture-hidden", effort: "ultra", source: "saved"
+  });
+  assert.equal(preview.warnings.length, 1);
+  assert.match(preview.warnings[0], /gemini-custom.*Antigravity/);
+  fs.writeFileSync(f.cacheFile, JSON.stringify({ ...cached, fetched_at: new Date(Date.now() - 48 * 3600000).toISOString() }));
+  assert.ok(setup("debug=absent").warnings.some(warning => /48 hours old/.test(warning)));
+  assert.equal(fs.existsSync(preview.file), false);
 });

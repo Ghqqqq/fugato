@@ -2,9 +2,10 @@
 
 import { spawnDetached } from "./lib/process.mjs";
 import { createRoom, readRoom, listRooms, assertChair, roundtableStatus, postEvent, readIndex, readThread, readResource, pending, ack, setStatus, updateMember, validateMember, renderForum, renderRoundtableStatus, renderAttention } from "./lib/forum.mjs";
-import { resolveRoster, personaInstructions, CHAIR_CARD, PERSONA_IDS } from "./lib/roundtable-personas.mjs";
+import { resolveRoster, personaInstructions, CHAIR_CARD, INTENSITIES, PERSONA_IDS } from "./lib/roundtable-personas.mjs";
 import { closeMemberWorkspaces } from "./lib/roundtable-workspaces.mjs";
-import { readPersonaModels } from "./lib/setup-config.mjs";
+import { effectiveRoleTable, readPersonaModels, roleModelsSetup } from "./lib/setup-config.mjs";
+import { backendForModel, expandRole } from "./lib/roles.mjs";
 import { readActiveRun } from "./lib/run-journal.mjs";
 import { handoffSteering } from "./lib/steering.mjs";
 import { codexRuntimeDiagnostic, executableOnPath, isolatedCodexCommand } from "./lib/codex-home.mjs";
@@ -29,7 +30,7 @@ import { startRun, useRun, addEntry, closeRun, showRun, listRuns, renderRun, val
 import { recordFinishedJob, recordedThreadJobs, uniqueTurnAttribution } from "./lib/job-runtime.mjs";
 import { listSessionJobs, updateJob, unresolvedTask, withoutPrivateActivity } from "./lib/state.mjs";
 import { markReportEmitted } from "./lib/report-delivery.mjs";
-import { clearMode, effectiveMaxWorkers, modeFile, PAIR_MAX_REWORK_ROUNDS, PROTOCOL_PATH, protocolVersion, readMode, setMode, validateRoundtableOptions } from "./lib/ultra-codex-mode.mjs";
+import { clearMode, effectiveMaxWorkers, formatRoleSummary, modeFile, PAIR_MAX_REWORK_ROUNDS, PROTOCOL_PATH, protocolVersion, readMode, setMode, validateRoundtableOptions } from "./lib/ultra-codex-mode.mjs";
 import { snapshotWorkspace, compareWorkspaceSnapshots, workspaceChangeAttribution } from "./lib/workspace-changes.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -38,7 +39,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { parseSessionArgs, splitRawArgumentString, splitReviewArgumentString } from "./lib/args.mjs";
-import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS } from "./lib/command-options.mjs";
+import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS, FRESH_ROLE_ERROR, NON_FRESH_ROLE_FLAGS } from "./lib/command-options.mjs";
 import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
@@ -106,6 +107,7 @@ import {
   renderStoredJobResult,
   renderCancelReport,
   renderJobStatusReport,
+  renderRoleTable,
   renderSetupReport,
   renderStatusReport,
   renderTaskResult
@@ -203,6 +205,8 @@ Read the brief only from stdin; implies --direct. Fresh unless --to/--thread/--c
     CODEX_COMPANION_FORK_BUDGET_BYTES sets the transcript slice budget (default 2 MiB).
   --no-claude-md  Disable automatic Claude instruction forwarding for a fresh thread.
     CODEX_COMPANION_CLAUDE_MD=0 also disables it. Existing threads retain their instructions.
+  --role <id>  Select a fresh worker's model and effort from the effective role table.
+  --high-stakes  Select the fixed high-stakes model and effort on a fresh dispatch.
   --model, -m <model|spark>  Built-in gpt-6-astra, overridden by fugato setup --default-model.
     Explicit spark is resolved by the runtime.
   --effort <effort>  Built-in xhigh, overridden by fugato setup --default-effort.
@@ -250,7 +254,7 @@ Compatibility: node "$CODEX_COMPANION" <subcommand> still works. Its task accept
 Usage: fugato models [--backend codex|antigravity] [--cwd <dir>] [--json] [--all]
 Antigravity reads the authenticated ACP session's model/thinking options without sending a model prompt.
 Uses app-server model/list, falling back to the isolated model cache; reports the source.
-  --json  Model descriptions, efforts, context windows and effective tiers with sources.
+  --json  Model descriptions, efforts, context windows, effective tiers and roles with sources.
   --all  Include hidden models; --help, -h  Help without starting the runtime.`,
   setup: `fugato setup reports invocation availability, selected runtime source and readiness.
   --agent-memory <on|off>  Workspace/role memory in the isolated home (default off).
@@ -267,7 +271,8 @@ Check isolated runtime readiness or change setup; --help, -h exits without chang
   --dispatch <auto|native|bash|default>  Dispatch route (default auto); default resets it.
   --default-model <model|default>  Worker model (built-in gpt-6-astra).
   --default-effort <effort|default>  Worker effort (built-in xhigh).
-  --ultra-routine-model <model|default>  Ultra routine model (built-in gpt-6.1-sol).
+  --role-model <id=model[:effort]|id=default>  Save or reset a role override (repeatable).
+  --ultra-routine-model <model|default>  Legacy shortcut that sets the model of the routine roles. Prefer --role-model.
     Model/effort defaults may combine with each other and --dry-run, but no other setup changes.
   --transport <http|websocket|status>  Runtime transport; --project-docs <claude-md|agents-only>  CLAUDE.md fallback.
   --browser-approval <never-ask|ask>  Browser policy; --list-browser-origins  List origins.
@@ -395,6 +400,7 @@ Tasks run through /fugato:duel <task>; this CLI accepts controls only.`,
 Set or inspect roundtable orchestration for this Claude session (default action: status).
   on replaces another active mode; off disables roundtable only.
   --intensity light|standard|deep|full  Default intensity for on (fresh default standard).
+  start --high-stakes  Use the high-stakes model for each seat without a per-room model.
   --roles id,id  Unique persona ids for on; otherwise the chair recommends a roster.
   --for-command  With status, print a versioned task-only protocol Read instruction.
   --cwd, -C <dir>  Workspace; --session <id>  Override the Claude session id.
@@ -587,6 +593,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     permissionMapping: permissionMappingSetup().permissionMapping,
     permissionMappingLimits: PERMISSION_LIMITS,
     ...workerDefaultsSetup(),
+    roles: effectiveRoleTable({ cwd }),
     personaModels: personaModelsSetup().personaModels,
     ...budgetDefaultsSetup(),
     browserOrigins: browserOriginSetup(),
@@ -610,46 +617,51 @@ function projectDocsSummary() {
 async function handleModels(argv) {
   const { options, positionals } = parseCommandInput(argv, { valueOptions: ["backend", "cwd"], booleanOptions: ["json", "all"] });
   if (positionals.length) throw new Error("Usage: fugato models [--backend codex|antigravity] [--cwd <dir>] [--json] [--all]");
+  const cwd = resolveCommandCwd(options);
+  const roles = effectiveRoleTable({ cwd });
   if (normalizeBackend(options.backend) === "antigravity") {
-    const catalog = await listAntigravityModels(resolveCommandCwd(options));
+    const catalog = await listAntigravityModels(cwd);
     const report = { backend: "antigravity", source: "antigravity-acp", models: catalog.data.map(model => ({
       slug: model.model ?? model.id, displayName: model.displayName, isDefault: Boolean(model.isDefault),
       isFugatoDefault: model.model === ANTIGRAVITY_DEFAULT_MODEL,
       efforts: model.supportedReasoningEfforts?.map(value => value.reasoningEffort) ?? [], defaultEffort: model.defaultReasoningEffort ?? null
-    })), configOptions: catalog.configOptions };
+    })), configOptions: catalog.configOptions, roles };
     const rows = report.models.map(model => [model.slug, model.displayName,
       [model.isDefault && "current", model.isFugatoDefault && "Fugato default"].filter(Boolean).join(", "), model.efforts.join(", ")].map(escapeDiagnosticControls).join(" | "));
     outputCommandResult(report, ["Google models from Antigravity ACP", "ID | Name | Selection | Thinking options for the current model", ...rows,
-      "Model and thinking values come from the server. Changing models can change the available thinking options.", ""].join("\n"), options.json);
+      "Model and thinking values come from the server. Changing models can change the available thinking options.", "", renderRoleTable(roles)].join("\n"), options.json);
     return;
   }
-  const catalog = await listModels({ all: Boolean(options.all), cwd: resolveCommandCwd(options) });
+  const catalog = await listModels({ all: Boolean(options.all), cwd });
   const defaults = workerDefaultsSetup();
   const tiers = { strong: defaults.defaultModel, effort: defaults.defaultEffort, routine: defaults.ultraRoutineModel };
   const models = catalog.models.map(model => ({ ...model, inUse: [
     ...(model.slug === tiers.strong.value ? ["strong"] : []),
     ...(model.slug === tiers.routine.value ? ["routine"] : [])
   ] }));
-  const report = { ...catalog, models, tiers };
-  outputCommandResult(report, renderModels(report), options.json);
+  const report = { ...catalog, models, tiers, roles };
+  outputCommandResult(report, renderModels(report) + "\n" + renderRoleTable(roles), options.json);
 }
 
 async function handleSetup(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["backend", "cwd", "cua-template", "chatgpt-resources", "transport", "profile", "default-sandbox", "default-mode", "permission-mapping", "dispatch", "default-model", "default-effort", "ultra-routine-model", "browser-approval", "computer-use-approval", "project-docs", "agent-memory", "max-concurrent", "default-max-minutes", "default-max-tokens"],
-    repeatableOptions: ["allow-browser-origin", "revoke-browser-origin", "allow-computer-app", "revoke-computer-app", "persona-model"],
+    repeatableOptions: ["allow-browser-origin", "revoke-browser-origin", "allow-computer-app", "revoke-computer-app", "persona-model", "role-model"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate", "sync-tools", "dry-run", "list-browser-origins", "list-computer-apps", "replace-cua"]
   });
   validatePositionalArity(positionals, 0, "setup");
+  const cwd = resolveCommandCwd(options);
+  const outputChange = (report, roles = effectiveRoleTable({ cwd }), text = JSON.stringify(report, null, 2)) => {
+    outputCommandResult({ ...report, roles }, `${text}\n\n${renderRoleTable(roles)}`, options.json);
+  };
   if (normalizeBackend(options.backend) === "antigravity") {
     if (Object.keys(options).some(key => !["backend", "cwd", "session", "json"].includes(key))) {
       throw new Error("Antigravity setup accepts only --backend antigravity, --cwd and --json. Authenticate with agy acp --login.");
     }
-    const cwd = resolveCommandCwd(options);
     const catalog = await listAntigravityModels(cwd);
     const report = { backend: "antigravity", ready: true, models: catalog.data.map(model => model.model ?? model.id),
       detail: "Antigravity ACP initialized and created a session with the current CLI credentials. No model prompt was submitted." };
-    outputCommandResult(report, `${report.detail}\nAvailable models: ${report.models.map(escapeDiagnosticControls).join(", ")}\n`, options.json);
+    outputChange(report, undefined, `${report.detail}\nAvailable models: ${report.models.map(escapeDiagnosticControls).join(", ")}`);
     return;
   }
   const computerUseFlags = options["computer-use-approval"] !== undefined || options["allow-computer-app"] || options["revoke-computer-app"] || options["list-computer-apps"];
@@ -658,19 +670,24 @@ async function handleSetup(argv) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const actionsTaken = [];
+  if (options["role-model"] !== undefined) {
+    if (Object.keys(options).some(key => !["role-model", "cwd", "session", "json", "dry-run"].includes(key))) throw new Error("Run --role-model separately from other setup changes.");
+    const { table, ...report } = roleModelsSetup({ models: options["role-model"], cwd, dryRun: Boolean(options["dry-run"]) });
+    outputChange(report, table);
+    return;
+  }
   if (options["persona-model"] !== undefined) {
     if (Object.keys(options).some(key => !["persona-model", "cwd", "session", "json", "dry-run"].includes(key))) throw new Error("Run --persona-model separately from other setup changes.");
     const report = personaModelsSetup({ models: options["persona-model"], dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options["default-max-minutes"] !== undefined || options["default-max-tokens"] !== undefined) {
     if (Object.keys(options).some(key => !["default-max-minutes", "default-max-tokens", "cwd", "session", "json", "dry-run"].includes(key))) throw new Error("Run budget defaults separately from other setup changes.");
     const report = budgetDefaultsSetup({ maxMinutes: options["default-max-minutes"], maxTokens: options["default-max-tokens"], dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   for (const key of ["cua-template", "chatgpt-resources", "profile", "replace-cua"]) {
@@ -679,43 +696,43 @@ async function handleSetup(argv) {
   if (options["permission-mapping"] !== undefined) {
     if (Object.keys(options).some(key => !["permission-mapping", "cwd", "session", "json", "dry-run"].includes(key))) throw new Error("Run --permission-mapping separately from other setup changes.");
     const report = { ...permissionMappingSetup({ mode: options["permission-mapping"], dryRun: Boolean(options["dry-run"]) }), permissionMappingLimits: PERMISSION_LIMITS };
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options["agent-memory"] !== undefined || options["max-concurrent"] !== undefined) {
     if (Object.keys(options).some(key => !["agent-memory", "max-concurrent", "cwd", "session", "json", "dry-run"].includes(key))) throw new Error("Run context/concurrency setup separately from other setup changes.");
     const report = contextSetup({ agentMemory: options["agent-memory"], maxConcurrent: options["max-concurrent"], dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options.dispatch !== undefined) {
     if (Object.keys(options).some(key => !["dispatch", "cwd", "session", "json", "dry-run"].includes(key))) throw new Error("Run --dispatch separately from other setup changes.");
     const report = dispatchSetup({ route: options.dispatch, dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (["default-model", "default-effort", "ultra-routine-model"].some(key => options[key] !== undefined)) {
     if (options["default-mode"] !== undefined || options["default-sandbox"] !== undefined || options["sync-tools"] || options.transport !== undefined || options["browser-approval"] !== undefined || options["allow-browser-origin"] || options["revoke-browser-origin"] || options["list-browser-origins"] || computerUseFlags || options["project-docs"] !== undefined || options["enable-review-gate"] || options["disable-review-gate"]) throw new Error("Run --default-model, --default-effort and --ultra-routine-model separately from other setup changes.");
     const report = workerDefaultsSetup({ defaultModel: options["default-model"], defaultEffort: options["default-effort"], ultraRoutineModel: options["ultra-routine-model"], dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options["default-mode"] !== undefined) {
     if (options["default-sandbox"] !== undefined || options["sync-tools"] || options.transport !== undefined || options["browser-approval"] !== undefined || options["allow-browser-origin"] || options["revoke-browser-origin"] || options["list-browser-origins"] || computerUseFlags || options["project-docs"] !== undefined || options["enable-review-gate"] || options["disable-review-gate"]) throw new Error("Run --default-mode separately from other setup changes.");
     const report = defaultModeSetup({ mode: options["default-mode"], dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options["default-sandbox"] !== undefined) {
     if (options["sync-tools"] || options.transport !== undefined || options["browser-approval"] !== undefined || options["allow-browser-origin"] || options["revoke-browser-origin"] || options["list-browser-origins"] || computerUseFlags || options["project-docs"] !== undefined || options["enable-review-gate"] || options["disable-review-gate"]) throw new Error("Run --default-sandbox separately from other setup changes.");
     const report = defaultSandboxSetup({ mode: options["default-sandbox"], dryRun: Boolean(options["dry-run"]) });
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options["project-docs"] !== undefined) {
     if (options["sync-tools"] || options.transport !== undefined || options["browser-approval"] !== undefined || options["allow-browser-origin"] || options["revoke-browser-origin"] || options["list-browser-origins"] || computerUseFlags || options["enable-review-gate"] || options["disable-review-gate"]) throw new Error("Run --project-docs separately from other setup changes.");
     const report = { projectDocs: projectDocsSetup({ mode: options["project-docs"], dryRun: Boolean(options["dry-run"]) }) };
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (computerUseFlags) {
@@ -724,7 +741,7 @@ async function handleSetup(argv) {
     const allow = normalizeBundleIds(options["allow-computer-app"] ?? []), revoke = normalizeBundleIds(options["revoke-computer-app"] ?? []);
     const listOnly = options["list-computer-apps"] && !allow.length && !revoke.length && options["computer-use-approval"] === undefined;
     const report = { computerUse: computerUseSetup({ allow, revoke, approval: options["computer-use-approval"], dryRun: Boolean(options["dry-run"]) || listOnly }) };
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options.transport !== undefined || options["browser-approval"] !== undefined || options["allow-browser-origin"] || options["revoke-browser-origin"] || options["list-browser-origins"]) {
@@ -734,7 +751,7 @@ async function handleSetup(argv) {
     if (options.transport !== undefined && (allow.length || revoke.length || options["list-browser-origins"] || options["browser-approval"] !== undefined)) throw new Error("Run transport and browser-origin setup separately.");
     const report = options.transport !== undefined ? { transport: transportSetup({ mode: options.transport, dryRun: Boolean(options["dry-run"]) }) }
       : { browserOrigins: browserOriginSetup({ allow, revoke, approval: options["browser-approval"], dryRun: Boolean(options["dry-run"]) }) };
-    outputResult(options.json ? report : `${JSON.stringify(report, null, 2)}\n`, options.json);
+    outputChange(report);
     return;
   }
   if (options["dry-run"] && !options["sync-tools"]) throw new Error("--dry-run requires --sync-tools.");
@@ -748,7 +765,7 @@ async function handleSetup(argv) {
   const toolSync = options["sync-tools"] ? syncToolConfig({ dryRun: Boolean(options["dry-run"]), cuaTemplate: options["cua-template"], chatgptResources: options["chatgpt-resources"], profile: options.profile, replaceCua: Boolean(options["replace-cua"]) }) : null;
   // An offline dry run must not start Codex, create its home or refresh auth.
   if (options["dry-run"]) {
-    outputResult(options.json ? { toolSync } : `${JSON.stringify(toolSync, null, 2)}\n`, options.json);
+    outputChange({ toolSync }, undefined, JSON.stringify(toolSync, null, 2));
     return;
   }
 
@@ -767,7 +784,7 @@ async function handleSetup(argv) {
     finalReport.actionsTaken.push(`CUA surfaces: ${toolSync.surfaces.join(", ") || "none"}; backends: ${toolSync.backends.join(", ") || "none"}.`);
     if (toolSync.changed) finalReport.nextSteps.push("Restart the Claude session/shared Codex runtime to load synced tools.");
   }
-  outputResult(options.json ? finalReport : `${renderSetupReport(finalReport)}Default mode: ${finalReport.defaultMode}.\nDispatch route: ${finalReport.dispatch}.\nDefault models: worker ${finalReport.defaultModel.value}/${finalReport.defaultEffort.value}, ultra routine ${finalReport.ultraRoutineModel.value}.\nSelected Codex: ${finalReport.codex.executable} (source: ${finalReport.codex.source}).\n`, options.json);
+  outputResult(options.json ? finalReport : `${renderSetupReport(finalReport)}Default mode: ${finalReport.defaultMode}.\nDispatch route: ${finalReport.dispatch}.\nRoleless default model: ${finalReport.defaultModel.value}/${finalReport.defaultEffort.value} (worker roles are listed above).\nSelected Codex: ${finalReport.codex.executable} (source: ${finalReport.codex.source}).\n`, options.json);
 }
 
 function buildAdversarialReviewPrompt(context, focusText) {
@@ -1405,7 +1422,10 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   });
   // Set once on creation; adoption may change sessionId, never this origin.
   // A null submission distinguishes new, never-submitted jobs from legacy ones.
-  const record = { ...job, ...(identity.backend === "antigravity" ? { backend: identity.backend, request: { backend: identity.backend, ...identity.settings } } : {}),
+  const record = { ...job,
+    ...(identity.settings.role ? { role: identity.settings.role } : {}),
+    ...(identity.settings.highStakes ? { highStakes: true } : {}),
+    ...(identity.backend === "antigravity" ? { backend: identity.backend, request: { backend: identity.backend, ...identity.settings } } : {}),
     turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
     ...(lifecycle.budget ? { budget: lifecycle.budget } : {}),
     ...(identity.dispatchNonce ? { dispatchNonce: identity.dispatchNonce } : {}),
@@ -1640,7 +1660,9 @@ function enqueueBackgroundTask(cwd, job, request) {
 }
 
 async function handleReviewCommand(argv, config) {
+  const roleError = "review commands do not take --role or --high-stakes; pass --model/--effort to choose the reviewer";
   const argumentConfig = {
+    rejectedOptions: { role: roleError, "high-stakes": roleError },
     rejectUnknown: config.reviewName !== "Adversarial Review",
     rejectOptionTypos: config.reviewName === "Adversarial Review",
     rejectSeparatorValues: true,
@@ -1805,6 +1827,8 @@ async function handleTask(argv) {
   const forkSourceEnv = { ...process.env };
   const { options, positionals } = parseCommandInput(argv, nativePermissionOptions({ ...COMMAND_OPTIONS.task,
     internalValueOptions: [...(COMMAND_OPTIONS.task.internalValueOptions ?? []), "agent-type"] }));
+  const hasRoleFlags = options.role !== undefined || options["high-stakes"] !== undefined;
+  if (hasRoleFlags && NON_FRESH_ROLE_FLAGS.some(flag => options[flag])) throw new Error(FRESH_ROLE_ERROR);
   const declaredAgentType = options["agent-type"];
   if (declaredAgentType !== undefined && !["fugato:codex-native", "fugato:codex-reviewer", "fugato:codex-implementer", "fugato:codex-investigator", "fugato:gemini-native"].includes(declaredAgentType)) {
     throw new Error("--agent-type requires a declared native agent type.");
@@ -1913,6 +1937,18 @@ async function handleTask(argv) {
   if (inheritance?.backend && backend !== inheritance.backend) {
     throw new Error("A worker session keeps its original backend. Start a fresh task to change --backend.");
   }
+  if (options.role !== undefined || options["high-stakes"]) {
+    const { model, effort } = expandRole(effectiveRoleTable({ cwd }), {
+      role: options.role, highStakes: options["high-stakes"], model: options.model, effort: options.effort, backend
+    });
+    const modelBackend = backendForModel(model);
+    if (modelBackend !== backend) {
+      const agent = modelBackend === "codex" ? "fugato:codex-native" : "fugato:gemini-native";
+      throw new Error(`Model ${model} runs on ${modelBackend}. Dispatch ${agent} or select a model for the ${backend} backend.`);
+    }
+    options.model = model;
+    options.effort = effort;
+  }
   if (backend === "antigravity" && options["max-tokens"] === undefined && budget.maxTokens !== null) {
     budget.maxTokens = null;
     process.stderr.write("Ignoring the saved default max-tokens for Antigravity: ACP reports token usage only when a turn ends, so Fugato cannot stop a turn at a token budget.\n");
@@ -1958,6 +1994,8 @@ async function handleTask(argv) {
     model: normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model,
     effort: normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort
   };
+  if (options.role !== undefined) settings.role = options.role;
+  if (options["high-stakes"]) settings.highStakes = true;
   if (options.fast && options.normal) throw new Error("Choose either --fast or --normal.");
   const serviceTier = options.fast ? "priority" : options.normal || options.fast === false ? null : recordedSettings.serviceTier ?? null;
   const prompt = readTaskPrompt(cwd, options, positionals);
@@ -2585,6 +2623,7 @@ async function handleStatus(argv) {
       ((job.sessionId === undefined ? job.ownerId : job.sessionId) || null) === session))
       .map(job => ({ ...buildSingleJobSnapshot(workspace, job.id).job, sessionLabel: label.length > 13 ? `${label.slice(0, 8)}…${label.slice(-4)}` : label }));
     const report = buildStatusSnapshot(cwd, { all: true });
+    report.roles = effectiveRoleTable({ cwd });
     report.running = jobs.filter(job => ACTIVE.has(job.status));
     const ended = jobs.filter(job => !ACTIVE.has(job.status));
     report.latestFinished = ended[0] ?? null;
@@ -2632,6 +2671,7 @@ async function handleStatus(argv) {
   }
 
   const report = buildStatusSnapshot(cwd, { all: options.all });
+  report.roles = effectiveRoleTable({ cwd });
   const rendered = renderStatusPayload(report, options.json, { all: options.all });
   outputResult(options.json || !report.historyOmitted ? rendered
     : `${rendered}\nOlder finished jobs omitted in this scope: ${report.historyOmitted}\n`, options.json);
@@ -3408,7 +3448,7 @@ async function handleOrchestrationMode(argv, modeName) {
       : "";
     const defaultLine = defaultMode === "off" ? "" : `default mode: ${defaultMode} (fugato setup --default-mode)\n`;
     const modelLine = personaModels ? `persona models: ${Object.entries(personaModels).map(([id, entry]) => `${id} ${entry.model.value}/${entry.effort.value}`).join(", ")}`
-      : `models: worker ${models.model}/${models.effort}, ultra routine ${models.routineModel}`;
+      : `models: roles ${formatRoleSummary(effectiveRoleTable({ cwd: resolveCommandCwd(options) }))}; roleless default ${models.model}/${models.effort}`;
     const roomLine = latestRoom ? `latest room: ${latestRoom.roomId} (${latestRoom.status}, ${latestRoom.intensity}); needs the chair: ${latestRoom.attention.length}; members ${latestRoom.members.map(member => `${member.name}:${member.status} workspace ${member.workspace.path} (${member.workspace.hasChanges === null ? "changes unknown" : member.workspace.hasChanges ? "changed" : "clean"})`).join(", ")}; open items ${latestRoom.counts.openItems}\n` : "";
     const text = `${latestRoom ? renderAttention(latestRoom) : ""}${renderOrchestrationMode(mode, modeName)}\n${modelLine}\n${defaultLine}${roomLine}${preamble}`;
     outputCommandResult(payload, text, options.json);
@@ -3474,7 +3514,7 @@ async function handleRoundtable(argv) {
   if (!["start", "status", "pause", "resume", "close"].includes(action) || positionals.length !== (action === "start" ? 1 : 2)) {
     throw new Error("roundtable takes start, status <roomId>, pause <roomId>, resume <roomId> or close <roomId>.");
   }
-  roundtableOptions(options, action === "start" ? ["intensity", "roles", "run", "cwd", "persona-model"]
+  roundtableOptions(options, action === "start" ? ["intensity", "roles", "run", "cwd", "persona-model", "high-stakes"]
     : action === "close" ? ["title", "label", "selects", "unreviewed"] : [], `roundtable ${action}`);
   if (action === "start") {
     const cwd = resolveCommandWorkspace(options), overrides = {};
@@ -3491,7 +3531,12 @@ async function handleRoundtable(argv) {
       overrides[persona] = { model, ...(hasEffort ? { effort: normalizeReasoningEffort(suffix) } : {}) };
     }
     const intensity = options.intensity ?? "standard";
-    const members = resolveRoster({ intensity, roles: options.roles?.split(",").map(id => id.trim()), mapping: readPersonaModels(), overrides });
+    const roles = options.roles?.split(",").map(id => id.trim()) ?? INTENSITIES[intensity]?.roster ?? [];
+    const warnings = [];
+    const mapping = readPersonaModels(process.env, { ids: roles, warnings });
+    for (const warning of warnings) process.stderr.write(`${warning}\n`);
+    const roleModels = Object.fromEntries(effectiveRoleTable({ cwd }).roles.map(row => [row.id, row.fallback?.model ?? row.model]));
+    const members = resolveRoster({ intensity, roles, mapping, overrides, roleModels, highStakes: options["high-stakes"] });
     for (const member of members) {
       member.model = normalizeRequestedModel(member.model);
       member.effort = normalizeReasoningEffort(member.effort);

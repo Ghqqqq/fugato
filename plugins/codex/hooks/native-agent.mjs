@@ -4,6 +4,7 @@ import { cleanDisplayText } from '../scripts/lib/display-text.mjs';
 import { lifecycleStoreSize, forgetLifecycle, pendingLifecycle, captureStartContext, lifecycleBrief, observeStop, prepareLifecycleStep, abandonLifecycleStop } from './lifecycle-hooks.mjs';
 import { GEMINI_BUSY, registerSteering } from './steering.mjs';
 import { registerRoundtableNotifier, startRoundtableNotifier, stopRoundtableMember, roundtableNotice, settleRoundtableNotice, isRoundtableNoticeTurn } from './roundtable-notifier.mjs';
+import { FRESH_ROLE_ERROR } from '../scripts/lib/command-options.mjs';
 import { PERSONA_IDS } from '../scripts/lib/roundtable-personas.mjs';
 import { AGENT_TYPE, GEMINI_AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
 import { PREFIX, BINDING_FAILED, keyFor, bindingFailedKey, startedTypes, knownTypes, ours } from './native-identity.mjs';
@@ -18,7 +19,7 @@ const HEARTBEAT_MS = 30000;
 const EARLY_HANDLES_MS = 1500;
 const READY = 'Native Codex workers ready: Agent(subagent_type: "fugato:codex-native", prompt) — optional first line "DUET: <flags>"; SendMessage to continue or answer; stop from /tasks; live progress shows inside the agent and in fugato-live.';
 const GUIDE_ID = 'fugato:native-dispatch';
-const NATIVE_GUIDE = 'Native Codex workers are ready. Dispatch Codex with Agent(subagent_type: "fugato:codex-native", prompt: "<brief>") (a valid caller name is kept when free; otherwise the plugin assigns a scientist name and reports it in context); use fugato:codex-reviewer for read-only review, fugato:codex-investigator for read-only investigation, or fugato:codex-implementer for workspace-write implementation. Presets inherit saved model/effort/speed defaults. An optional first prompt line DUET: --model <model> --effort <effort> --sandbox <mode> --fast|--normal --fork --cwd <dir> sets task flags; preset sandbox overrides are refused. The agent result is the Fugato report; continue a worker or answer its question with SendMessage. In-process teammates support bounded assignments, parent follow-ups and stop; team task claiming, plan approval and peer mailboxes are unsupported. Browser work and Computer Use run natively: an app not yet approved arrives as an approval question answered through SendMessage. If native dispatch returns `native_adapter_unavailable` or `native_capacity`, needs a per-call option the `DUET:` line rejects, or you must follow up a worker launched through Bash, load the `fugato:native-fallback` skill and follow it.';
+const NATIVE_GUIDE = 'Native Codex workers are ready. Dispatch Codex with Agent(subagent_type: "fugato:codex-native", prompt: "<brief>") (a valid caller name is kept when free; otherwise the plugin assigns a scientist name and reports it in context); use fugato:codex-reviewer for read-only review, fugato:codex-investigator for read-only investigation, or fugato:codex-implementer for workspace-write implementation. Presets inherit saved worker defaults. Use --role <id> or --high-stakes on a fresh dispatch to select its model and effort. An optional first prompt line DUET: --model <model> --effort <effort> --sandbox <mode> --fast|--normal --fork --cwd <dir> sets task flags; preset sandbox overrides are refused. The agent result is the Fugato report; continue a worker or answer its question with SendMessage. In-process teammates support bounded assignments, parent follow-ups and stop; team task claiming, plan approval and peer mailboxes are unsupported. Browser work and Computer Use run natively: an app not yet approved arrives as an approval question answered through SendMessage. If native dispatch returns `native_adapter_unavailable` or `native_capacity`, needs a per-call option the `DUET:` line rejects, or you must follow up a worker launched through Bash, load the `fugato:native-fallback` skill and follow it.';
 const PERSON_ORIGINS = ['composer', 'bridge', 'sdk'];
 const GUIDANCE_TTL_MS = 60000;
 let guidanceCache = null;
@@ -125,7 +126,7 @@ const agentProse = text => /^(?:Codex|Antigravity):/.test(text);
 const GEMINI_FALLBACK = 'Check fugato status before retrying. For a confirmed unstarted assignment, dispatch fugato task --backend antigravity through background Bash; use the existing worker handle for a continuation.';
 const finished = state => state?.finishedAt && !state.incoming
   && state.status !== 'needs_answer' && state.answer?.status !== 'needs_answer';
-const ALLOWED = '--backend, --model, --effort, --sandbox, --fast/--normal, --cwd, --fork, --max-minutes, --max-tokens, --roundtable, --persona';
+const ALLOWED = '--backend, --role, --high-stakes, --model, --effort, --sandbox, --fast/--normal, --cwd, --fork, --max-minutes, --max-tokens, --roundtable, --persona';
 // Display only: an entry exists only while this module owns a live flight.
 const liveProgress = new Map();
 const toolAgents = new Map(), agentDisplays = new Map();
@@ -826,15 +827,14 @@ function blocked(message, state = {}, code = 'native_adapter_error') {
 
 // A small argv tokenizer, never a shell. Quotes/backslashes allow cwd with spaces;
 // command substitution, expansions and shell operators have no special meaning.
-function parsePrompt(text) {
-  const invalid = () => { throw new Error(`Invalid DUET header. Allowed flags: ${ALLOWED}.`); };
+const invalidHeader = () => { throw new Error(`Invalid DUET header. Allowed flags: ${ALLOWED}.`); };
+function promptHeader(text) {
   const newline = text.indexOf('\n');
   const firstLine = text.slice(0, newline < 0 ? undefined : newline).replace(/\r$/, '');
   const prefix = /^[ \t]*DUET:[ \t]+/.exec(firstLine);
   if (!prefix) {
     // Header-like first lines must fail closed rather than discard settings.
-    if (/^[ \t]*duet[ \t]*:/i.test(firstLine)) invalid();
-    return { brief: text, flags: [] };
+    return /^[ \t]*duet[ \t]*:/i.test(firstLine) ? { tokens: [], newline, invalid: true } : null;
   }
   const header = firstLine.slice(prefix[0].length);
   const tokens = []; let token = '', quote = '', escaped = false, present = false;
@@ -846,28 +846,40 @@ function parsePrompt(text) {
     else if (/\s/.test(char)) { if (present) tokens.push(token); token = ''; present = false; }
     else { token += char; present = true; }
   }
-  if (quote || escaped) invalid();
   if (present) tokens.push(token);
+  return { tokens, newline, invalid: Boolean(quote || escaped) };
+}
+
+const hasRoleFlag = flags => flags.some(flag => /^(?:--role|--high-stakes)(?:=|$)/.test(flag));
+function hasSteeringRoleHeader(text) {
+  return hasRoleFlag(promptHeader(text)?.tokens ?? []);
+}
+
+function parsePrompt(text) {
+  const header = promptHeader(text);
+  if (!header) return { brief: text, flags: [] };
+  if (header.invalid) invalidHeader();
+  const { tokens, newline } = header;
   const flags = [], seen = new Set(); let cwd;
   for (let i = 0; i < tokens.length; i++) {
     const match = /^(--[a-z]+(?:-[a-z]+)*)(?:=(.*))?$/.exec(tokens[i]);
-    if (!match) invalid();
+    if (!match) invalidHeader();
     const [, flag, inline] = match;
-    if (seen.has(flag)) invalid();
+    if (seen.has(flag)) invalidHeader();
     seen.add(flag);
-    if (['--fast', '--normal', '--fork'].includes(flag)) {
-      if (inline !== undefined || (seen.has('--fast') && seen.has('--normal'))) invalid();
+    if (['--fast', '--normal', '--fork', '--high-stakes'].includes(flag)) {
+      if (inline !== undefined || (seen.has('--fast') && seen.has('--normal'))) invalidHeader();
       flags.push(flag); continue;
     }
-    if (!['--backend', '--model', '--effort', '--sandbox', '--cwd', '--max-minutes', '--max-tokens', '--roundtable', '--persona'].includes(flag)) invalid();
+    if (!['--backend', '--role', '--model', '--effort', '--sandbox', '--cwd', '--max-minutes', '--max-tokens', '--roundtable', '--persona'].includes(flag)) invalidHeader();
     const value = inline ?? tokens[++i];
-    if (!value || value.startsWith('--') || value.includes('\0')) invalid();
-    if (flag === '--backend' && !['codex', 'antigravity'].includes(value)) invalid();
-    if (flag === '--persona' && !PERSONA_IDS.includes(value)) invalid();
+    if (!value || value.startsWith('--') || value.includes('\0')) invalidHeader();
+    if (flag === '--backend' && !['codex', 'antigravity'].includes(value)) invalidHeader();
+    if (flag === '--persona' && !PERSONA_IDS.includes(value)) invalidHeader();
     if (flag === '--cwd') cwd = value;
     else flags.push(flag, value);
   }
-  if (seen.has('--roundtable') !== seen.has('--persona')) invalid();
+  if (seen.has('--roundtable') !== seen.has('--persona')) invalidHeader();
   return { brief: newline < 0 ? '' : text.slice(newline + 1), flags, cwd };
 }
 
@@ -1423,6 +1435,11 @@ async function drive($, e, state, progress) {
       if (!input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
+      const hasRole = hasRoleFlag(parsed.flags);
+      // A prior launch intent survives a failed final answer write, even when it has no job handles.
+      if (hasRole && (state.intent || state.answeredTurn || state.threadId || state.jobId || parsed.flags.includes('--roundtable') || parsed.flags.includes('--fork'))) {
+        return blocked(FRESH_ROLE_ERROR, state);
+      }
       if (parsed.flags.includes('--roundtable')) {
         const binding = { roomId: parsed.flags[parsed.flags.indexOf('--roundtable') + 1], persona: parsed.flags[parsed.flags.indexOf('--persona') + 1] };
         if (state.threadId && (state.roundtable?.roomId !== binding.roomId || state.roundtable?.persona !== binding.persona)) {
@@ -1450,7 +1467,7 @@ async function drive($, e, state, progress) {
         }
         if (sandboxAt < 0) parsed.flags.push('--sandbox', 'read-only');
       }
-      if (!state.threadId && backend === 'codex' && state.effort && !parsed.flags.includes('--effort')) parsed.flags.push('--effort', state.effort);
+      if (!state.threadId && !hasRole && backend === 'codex' && state.effort && !parsed.flags.includes('--effort')) parsed.flags.push('--effort', state.effort);
       input = parsed.brief;
       if (!input.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
       if (state.jobId && !state.threadId) return blocked(`Previous job has no ${runtimeLabel(state)} thread handle; refusing a replacement thread.`, state);
@@ -1819,7 +1836,7 @@ function progressFor($, e, state, publish, currentFlight) {
 }
 
 export function register(on) {
-  registerSteering(on);
+  registerSteering(on, hasSteeringRoleHeader);
   registerRoundtableNotifier(on);
   guidanceCache = null;
   teammateReceive(on);

@@ -106,8 +106,13 @@ For a standalone read-only review of uncommitted or branch changes, run
 
 ## Modes
 
-All four orchestration modes run Codex workers. Run a command with a task to use
-a mode once, or add `on` (as in `/fugato:pair on`) to keep it for the session.
+Fugato dispatches workers by role from a default table with Sol for routine
+work, Astra for hard and high-stakes work, and Gemini rows when `agy` is
+installed. Run `fugato models` to see the effective table and
+`fugato setup --role-model` to change a role.
+
+Run a command with a task to use a mode once, or add `on` (as in
+`/fugato:pair on`) to keep it for the session.
 
 <table>
 <tr>
@@ -171,7 +176,7 @@ Open-ended goals explored by persistent Codex personas in a shared forum, chaire
   <img src="docs/assets/fugato-score-ultra-light.svg" alt="Ultra drawn as a score: Claude's stave above five Codex voices in flight; each short phrase is accepted as it arrives while the next starts, across understand, design, implement, review and verify" width="100%">
 </picture>
 
-Claude splits the work-list across parallel Codex readers, independent designs
+Claude splits the work-list across parallel readers, independent designs
 with judges, one implementer per disjoint area, area × lens reviews and
 adversarial verification. Accepted items advance as slots open. After one failed
 live fix, competing hypotheses and a separate live diagnostic come before

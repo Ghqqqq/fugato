@@ -67,6 +67,48 @@ test("fugato uses the legacy launcher's permission grammar and trust boundary", 
   assert.deepEqual(approveDuet(input("fugato status"), { ...f.env, "BASH_FUNC_fugato%%": "() { :; }" }), {});
 });
 
+test("fresh Gemini role and explicit-model dispatches receive the same delivery binding", () => {
+  const f = fixture(), agy = path.join(f.root, "agy.exe");
+  fs.writeFileSync(agy, "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+  const env = { ...f.env, FUGATO_ANTIGRAVITY_BIN: agy };
+  const task = "fugato task --backend antigravity";
+  const invoke = flags => approveDuet(input(heredoc(`${task} ${flags}`)), env);
+  const explicit = invoke("--model gemini-4-neon --effort high").hookSpecificOutput;
+  assert.equal(explicit.permissionDecision, "allow");
+  assert.ok(explicit.updatedInput.command.includes("'--session' 'session-a' '--tool-use-id' 'tool-a' <<'DUET_TASK'"));
+  assert.deepEqual(invoke("--role read").hookSpecificOutput, { ...explicit, updatedInput: {
+    ...explicit.updatedInput, command: explicit.updatedInput.command.replace("'--model' 'gemini-4-neon' '--effort' 'high'", "'--role' 'read'")
+  } });
+
+  for (const flags of ["--high-stakes", "--role debug", "--role read --model gpt-6.2-sol", "--role read --to Ada",
+    "--role read --model ' gemini-4-neon'", "--model ' gemini-4-neon' --effort high"]) {
+    assert.deepEqual(invoke(flags), {}, flags);
+  }
+  fs.unlinkSync(agy);
+  assert.deepEqual(invoke("--role read"), {});
+});
+
+test("fresh Gemini dispatches respect Antigravity options and saved permission settings", () => {
+  const f = fixture(), env = { ...f.env, FUGATO_ANTIGRAVITY_BIN: process.execPath };
+  const config = path.join(f.home, "duet", "config.toml");
+  fs.mkdirSync(path.dirname(config));
+  for (const selection of ["--role read", "--model gemini-4-neon --effort high"]) {
+    const invoke = flags => approveDuet(input(heredoc(["fugato task --backend antigravity", selection, flags].filter(Boolean).join(" "))), env);
+    fs.writeFileSync(config, 'default_max_tokens = 100\n');
+    for (const flags of ["--sandbox read-only", "--sandbox workspace-write", "--fast", "--max-tokens 10",
+      "--fork", "--roundtable rt-test-room --persona critic"]) {
+      assert.deepEqual(invoke(flags), {}, flags);
+    }
+    assert.equal(invoke("--normal --max-minutes 2").hookSpecificOutput.permissionDecision, "allow");
+    assert.equal(invoke("--fast=false").hookSpecificOutput.permissionDecision, "allow");
+    fs.writeFileSync(config, 'default_sandbox = "read-only"\n');
+    assert.deepEqual(invoke(), {});
+    assert.equal(invoke("--sandbox danger-full-access").hookSpecificOutput.permissionDecision, "allow");
+    fs.writeFileSync(config, 'permission_mapping = "claude"\n');
+    assert.deepEqual(invoke("--sandbox danger-full-access"), {});
+  }
+});
+
 test("permission grammar rejects unsafe commands and untrusted bindings while quoting approved commands literally", () => {
   const f = fixture(), invoke = (command, overrides = {}, env = f.env) => approveDuet({ ...input(command), ...overrides }, env);
   const unsafe = [

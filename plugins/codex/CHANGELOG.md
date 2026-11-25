@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.9.0
+
+- Replace the routine and strong worker models with a role table. Routine
+  roles (scan, implement, investigate, review) default to `gpt-6.2-sol`, hard
+  roles (debug, architect, verify, judge) to `gpt-6.2-astra`, visual work to
+  `gpt-6.1-terra`, and the read, media, research and alt-design roles to
+  `gemini-4-neon` when `agy` is installed, with Codex fallbacks otherwise.
+- Select worker settings by role on fresh dispatches with `--role <id>`.
+  Use `--high-stakes` to fix the worker at `gpt-6.2-astra` / `xhigh`.
+  Follow-ups, resumes, forks, roundtable seats and review commands refuse
+  both flags; change a thread's model with `--model` and `--effort`.
+- Save individual role settings with repeatable `fugato setup --role-model`.
+  A saved Codex `--ultra-routine-model` or `--default-model` still sets the
+  routine or hard roles' model until a role override replaces it.
+  Session start, mode status, reminders and model listings show the effective
+  role table. Roundtable personas derive Codex models from their roles. Use
+  `roundtable start --high-stakes` for room-wide selection.
+- The Bash permission hook approves a fresh role dispatch only when it
+  resolves to the selected backend, and no longer approves Gemini tasks that
+  the companion would refuse.
+- Known limitation: if a native agent's first turn is refused before launch
+  and the adapter then fails to record that turn, a later `--role` message to
+  the same agent can start a fresh job instead of being refused.
+
 ## 1.8.0
 
 - Add full-access Gemini workers through Google's official `agy acp` runtime

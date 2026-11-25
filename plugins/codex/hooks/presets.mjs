@@ -33,8 +33,8 @@ export function nativeIdentity({ declaredType, spawnType, bindingType, classicTy
   return null;
 }
 
-// Null model/effort/speed values leave the saved worker defaults or the thread
-// settings alone. Presets constrain task flags, not the Claude shell model.
+// On a fresh dispatch --role or --high-stakes supplies model and effort in
+// the companion. Otherwise null values preserve worker defaults or thread settings.
 export function applyPreset(parsed, preset, permissionMode) {
   if (!preset) return parsed;
   const flags = [...parsed.flags], sandboxAt = flags.indexOf('--sandbox'), backendAt = flags.indexOf('--backend');
@@ -50,8 +50,10 @@ export function applyPreset(parsed, preset, permissionMode) {
     throw error;
   }
   if (sandboxAt < 0 && preset.sandbox) flags.push('--sandbox', permissionMode === 'plan' ? 'read-only' : preset.sandbox);
-  for (const flag of ['model', 'effort']) {
-    if (preset[flag] && !flags.includes(`--${flag}`)) flags.push(`--${flag}`, preset[flag]);
+  if (!flags.includes('--role') && !flags.includes('--high-stakes')) {
+    for (const flag of ['model', 'effort']) {
+      if (preset[flag] && !flags.includes(`--${flag}`)) flags.push(`--${flag}`, preset[flag]);
+    }
   }
   if (preset.speed && !flags.includes('--fast') && !flags.includes('--normal')) flags.push(`--${preset.speed}`);
   return { ...parsed, flags, brief: preset.rolePrompt ? `${preset.rolePrompt}\n\n${parsed.brief}` : parsed.brief };

@@ -30,12 +30,21 @@ export function parseArgs(argv, config = {}) {
   const aliasMap = config.aliasMap ?? {};
   // Opt in: other callers may intentionally forward option-like positionals.
   // Check before consuming values so a misspelled flag cannot become a value.
-  if (config.rejectUnknown || config.rejectOptionTypos) {
+  if (config.rejectUnknown || config.rejectOptionTypos || config.uniqueOptions || config.bareOptions) {
+    const seenUnique = new Set();
     for (const token of argv) {
       if (token === "--") break;
       if (!token.startsWith("-") || token === "-") continue;
       const rawKey = token.startsWith("--") ? token.slice(2).split("=", 1)[0] : token.slice(1);
       const key = aliasMap[rawKey] ?? rawKey;
+      if (config.uniqueOptions?.includes(key)) {
+        if (seenUnique.has(key)) throw new Error(`Pass --${key} only once.`);
+        seenUnique.add(key);
+      }
+      if (config.bareOptions?.includes(key) && token !== `--${key}`) throw new Error(`Pass --${key} as a bare flag.`);
+      if (config.rejectedOptions && Object.hasOwn(config.rejectedOptions, key)) {
+        throw new Error(config.rejectedOptions[key]);
+      }
       if (!booleanOptions.has(key) && !valueOptions.has(key)) {
         const suggestion = config.rejectOptionTypos
           ? [...valueOptions, ...booleanOptions]

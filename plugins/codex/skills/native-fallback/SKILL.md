@@ -14,7 +14,7 @@ The saved `fugato setup --dispatch bash` preference also selects this background
 Use background `fugato task` when selected by saved dispatch guidance, the native agent returns `native_adapter_unavailable` or `native_capacity`, a per-call option is rejected by the `DUET:` line (`--run`, `--approve-browser-origin`, `--approve-computer-app`, `--lease-sec`, `--question-timeout-sec`), or following up a worker launched through Bash. For that route, use one Bash call per job with `run_in_background: true` and `description: "Codex: <label>"`. When Claude's Bash sandbox is on, set `dangerouslyDisableSandbox: true` on the tool call: the runtime needs network and local sockets. Use the installed `fugato` launcher; if PATH is stale, reload/start a new session or use the absolute `bin/fugato` path two directories above this skill's base directory.
 
 ```bash
-fugato task --model '<routine model>' --effort '<effort>' --normal <<'DUET_TASK'
+fugato task --role implement --normal <<'DUET_TASK'
 <brief>
 DUET_TASK
 ```
@@ -33,7 +33,22 @@ DUET_TASK
 `--to`, `--thread` and `--resume`/`--resume-last` inherit recorded model, effort, sandbox and speed from a started attempt; explicit flags override them. An explicit `--thread` can inherit these settings across sessions. Request grants are inherited only from the original dispatch in the same Claude session, excluding runtime-only approvals and foreign dispatches after adoption. `--continue` inherits the selected job's settings and eligible request grants; when its sandbox is missing, pass `--sandbox` explicitly to resolve `thread_settings_unknown` (a recorded sandbox cannot be overridden with `--continue`). State `--sandbox read-only` again for a read-only follow-up and `--normal` when resetting fast mode. `--fork` imports the current Claude transcript into a new Codex thread for a fresh assignment, then runs the stdin brief; use it under the protocol's **Forking context** rules. It is labelled “imported Claude conversation (fidelity not verified)”; do not assume lossless context. It cannot combine with `--to`, `--thread`, `--continue` or resume flags; follow up afterwards with `--to`.
 
 
-Run `fugato task --help` for flags. Choose model and effort for the assignment and selected mode; replace the example's placeholders with the selected tier's model and effort. Use the effective models named by the mode reminder or status (saved with `fugato setup --default-model`); explicit user settings take precedence.
+Run `fugato task --help` for flags. Choose `--role <id>` from the effective
+table in `fugato models`. Use `--backend antigravity` if the Bash assignment
+uses a Gemini-backed row. Add `--high-stakes` on a fresh Codex dispatch when
+the rule in `fugato:models` applies. Explicit user model and effort choices
+take precedence. Omit `--high-stakes` when passing either explicit setting.
+Both role flags are refused on follow-ups, `--to`, `--thread`, `--resume`,
+`--resume-last`, `--continue`, `--fork` and roundtable seat dispatch. With
+`--fork`, pass the selected Codex model and effort explicitly.
+
+For Gemini authentication fallback, confirm both the normalized
+`Antigravity authentication is required.` message and a `notStarted` turn
+resolution. If native dispatch is unavailable or Bash is selected, use
+background `fugato task --model '<m>' --effort '<e>' --normal` with the same
+brief on stdin. Substitute the row's Codex fallback model and effort. This
+is a fresh Codex dispatch with no role flag. Blocked jobs, permission denials
+and submitted turns do not qualify.
 
 Task text belongs in briefs, never control-CLI arguments or a generated shell command. For a permitted Bash fallback, send the brief on stdin through a single-quoted `DUET_TASK` heredoc; never interpolate raw slash arguments into executable shell source.
 

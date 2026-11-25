@@ -54,8 +54,9 @@ then remote). An explicit or detected base that does not resolve to a commit
 fails before a review starts.
 
 Both review commands accept `--model <model>` and `--effort <effort>` overrides.
-Omitted values use the saved worker defaults, built-in `gpt-6-astra` / `xhigh`,
-just like fresh tasks. See [worker models](configuration.md#default-worker-models).
+Both commands use the roleless worker defaults for omitted values
+(built-in `gpt-6-astra` / `xhigh`). Use a fresh worker dispatch to select a
+role. See [worker models](configuration.md#default-worker-models).
 
 ```bash
 /fugato:review
@@ -152,9 +153,9 @@ flags or the saved worker defaults (recorded settings on follow-ups).
 /fugato:rescue --model spark fix the issue quickly
 ```
 
-Fresh delegated tasks use the configured worker model (default `gpt-6-astra`)
-and worker effort (default `xhigh`) when no explicit user choice or flag
-overrides them; follow-ups retain recorded thread settings. See
+Fresh rescue jobs use the roleless worker defaults (built-in
+`gpt-6-astra` / `xhigh`) unless explicitly overridden. Follow-ups retain
+recorded thread settings. See
 [Default worker models](configuration.md#default-worker-models).
 If you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`. For planned,
 parallel work Claude honors the saved [worker dispatch](configuration.md#worker-dispatch)
@@ -194,21 +195,18 @@ existing saved caps are retained. It is advisory, not a runtime scheduler.
 Sixteen native read-only workers were measured in flight together; larger or
 heavy mutating fan-out is not a measured guarantee.
 
-Ultra uses the configured routine model (default `gpt-6.1-sol`) at `medium` for
-scanning/triage and `xhigh` for implementation, investigation and ordinary
-review; the configured worker model (default `gpt-6-astra`) at `xhigh` or
-supported `max` is for adversarial verification, judging, hard debugging and deep
-architecture. Speed is normal unless requested. The mode reminder names the
-effective models. Details: [ultra-codex](ultra-codex.md).
+Choose a [worker role](ultra-codex.md#worker-roles) for each fresh assignment
+with `--role <id>`. Apply `--high-stakes` when the rule applies. Use normal
+speed by default and `--fast` only for Codex rows when the user requests it.
+The reminder shows the effective role table.
 
 ### `/fugato:pair`
 
-One worker on the configured worker model (default `gpt-6-astra`) and worker
-effort (default `xhigh`) at normal speed executes a bounded task end to end.
-Claude plans, writes a full brief and accepts every diff with its own checks.
-Rework stays on the same thread, at most two rounds after the initial
-result. An optional read-only verifier runs sequentially on a stable candidate;
-there is no fan-out. Pair has no mode options.
+One primary worker uses `--role implement` at normal speed to execute a
+bounded task end to end. Claude plans, writes a full brief and accepts every
+diff with its own checks. Rework stays on the same thread for at most two rounds
+after the initial result. An optional read-only verifier uses `--role verify`
+on a stable candidate after the executor returns. Pair has no mode options.
 
 ```text
 Usage: /fugato:pair [on [<task>] | off | status | <task>]
@@ -224,12 +222,12 @@ request. See [pair](pair.md) for acceptance, limits and escalation.
 
 ### `/fugato:duel`
 
-One Claude general-purpose subagent versus one Codex worker on the configured
-worker model (default `gpt-6-astra`) and worker effort (default `xhigh`) at
-normal speed. The Claude participant inherits the session model and consumes
-the owner's Claude quota. Claude's main loop relays every substantive exchange
-and arbitrates: builder/breaker for implementation, independent drafts followed
-by reciprocal critique for design/analysis.
+One Claude general-purpose subagent participates alongside one Codex worker
+at normal speed. The Codex party uses `--role implement` for the builder,
+`--role verify` for the breaker or `--role architect` for design and analysis.
+The Claude participant inherits the session model and consumes the owner's
+Claude quota. Claude's main loop relays every substantive exchange and
+arbitrates the builder/breaker flow or reciprocal design critiques.
 
 ```text
 Usage: /fugato:duel [on [--rounds <n>] [<task>] | off | status | [--rounds <n>] <task>]
@@ -287,8 +285,8 @@ mode; it never silently switches modes to evade a limit.
 
 While enabled, one hook adds a versioned mode reminder to normal prompts and
 suppresses it for all four mode commands. Ultra/pair/duel reminders name their
-effective worker defaults; roundtable names its intensity and roster selection
-and points to the persona mapping.
+effective role settings. Roundtable names its intensity and roster selection
+and points to role-based persona models.
 Controls do not load protocol text into Claude's context. Tasks use the shared
 [protocol](../plugins/codex/prompts/ultra-codex-protocol.md), selecting shared
 sections plus their own mode section. Its body hash is computed at runtime;
@@ -333,10 +331,9 @@ the session ID; `on`/`off` need one, while status without one reports off.
 
 JSON `mode` is `on`/`off` for the requested command; `modeName` names that
 command, and `activeMode` reports the actual saved mode/options even if it is
-different. Status shows the effective worker model/effort and ultra routine
-model; JSON includes `models: { model, effort, routineModel }`. Roundtable also
-reports `personaModels` with per-field values/sources; its text status lists
-these standard persona mappings instead of ordinary worker defaults.
+different. See `fugato models` for the effective role table. Roundtable mode
+status also reports standard persona mappings in `personaModels` with
+per-field values and sources.
 `protocolFile` and `protocolVersion` are always present. Ultra keeps
 effective `maxWorkers` (null for unlimited) plus `maxWorkersSetting`. A cross-mode
 `on` adds `replacedMode` and `runningJobs`; `off` reports `wasOn` and running jobs.
@@ -415,17 +412,15 @@ configuration actions described under [Configuration](configuration.md).
 For API-key authentication, use the [isolated login procedure](troubleshooting.md#sign-in-with-an-api-key).
 
 ```text
-fugato setup --default-model <model|default> [--default-effort <effort|default>] [--ultra-routine-model <model|default>]
-/fugato:setup --default-model <model|default> [--default-effort <effort|default>] [--ultra-routine-model <model|default>]
+fugato setup --role-model id=model[:effort] [--role-model id=model[:effort]]… [--dry-run]
+/fugato:setup --role-model id=default
 ```
 
-Each model/effort flag also works alone; they may combine with each other and
-`--dry-run`, but not another setup change. `default` removes the saved key.
-All values are validated before any write. The JSON change report and setup
-status show the effective values and each setting's `saved`/`built-in` source;
-mode reminders and status show the effective models too. For built-ins,
-precedence, examples and validation limits, see
-[Default worker models](configuration.md#default-worker-models).
+Repeat `--role-model` to set multiple roles. Use `id=default` to clear a
+role's saved settings. The high-stakes tuple is fixed. The legacy
+`--ultra-routine-model` shortcut supplies a saved Codex model for `scan`,
+`implement`, `investigate` and `review` unless a role has its own saved model.
+See [worker model configuration](configuration.md#default-worker-models).
 
 `fugato setup --default-mode off|ultra|pair|duel|roundtable` saves the orchestration mode for
 fresh Claude sessions and `/clear` (default `off`); run it separately from other
@@ -505,16 +500,23 @@ implementation and state.
 
 `fugato models [--json] [--all]` lists the current account's Codex models,
 descriptions, supported/default efforts and context windows, followed by Fugato's
-effective strong/effort/routine tiers and their sources. It prefers app-server
+effective role table. It prefers app-server
 `model/list`, falling back to the isolated model cache, and names the source.
 Hidden models require `--all`; unknown context windows are `null` in JSON.
 If neither source is available it exits nonzero and points to `/fugato:setup`.
-The model-invocable `fugato:models` skill explains tier selection, setup changes,
+The model-invocable `fugato:models` skill explains role selection, setup changes,
 one-off overrides and confirmation; see [configuration](configuration.md#default-worker-models).
 
 Use `fugato <subcommand>` in a Claude session, or `plugins/codex/bin/fugato` from the
 repository root. Run `fugato task --help` for flags and side-effect-free examples.
 SessionStart supplies the session ID; `--session <id>` overrides it.
+
+`--role` and `--high-stakes` are for fresh dispatches. Follow-ups,
+`--to`, `--thread`, `--resume`, `--resume-last`, `--continue`, `--fork`
+and roundtable seat dispatch refuse both flags. `--high-stakes` conflicts
+with explicit `--model` or `--effort`. The effective role must match the
+dispatch backend. For Gemini rows, use `fugato:gemini-native` or
+`fugato task --backend antigravity --role <id>`.
 
 ### Shared runtime
 
@@ -535,6 +537,7 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | Command | Use |
 | --- | --- |
 | `fugato task` | Fresh assignment; brief only on stdin; implies `--direct` |
+| `fugato task --role <id> [--high-stakes]` | Use the effective role tuple, or the fixed Codex high-stakes tuple. Fresh dispatch only. |
 | `fugato task --name <label>` | Request a name on a fresh thread; collisions fall back to the pool; follow-ups retain their name |
 | `fugato task --cwd <repo>/sub` | Start or resume the Codex thread in that subdirectory; broker/job state remains at the repository root |
 | `fugato task --run <id\|none>` | Override journal linkage for this dispatch only; select an open run across workspaces or skip linking with `none`; follow-ups do not inherit it |
@@ -552,12 +555,12 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | `fugato runtime restart` | Retire an idle broker; refuse while busy; start fresh on the next task |
 | `fugato setup` | Runtime readiness and configuration |
 | `fugato steer <jobId> --delivery-id <id> --owner <ownerId>` | Internal native-hook steering handoff, message on stdin; use SendMessage for native agents |
-| `fugato models [--json] [--all]` | Discover current account models and efforts, including hidden models with `--all`, and show effective tiers |
+| `fugato models [--json] [--all]` | Discover current account models and efforts, including hidden models with `--all`, and show the effective role table |
 | `fugato ultra-codex [on\|off\|status]` | Ultra session controls; task text belongs in the slash command |
 | `fugato pair [on\|off\|status]` | Pair session controls; one primary Codex thread |
 | `fugato duel [on\|off\|status]` | Duel session controls; `on --rounds <n>` sets 1–3 total rounds |
 | `fugato roundtable [on\|off\|status]` | Roundtable session mode controls; `on --intensity … --roles …` selects defaults |
-| `fugato roundtable start [--intensity …] [--roles id,id] [--persona-model id=model[:effort]]… [--run <runId>] [--json]` | Goal on stdin; returns room, member headers and chair card |
+| `fugato roundtable start [--intensity …] [--roles id,id] [--persona-model id=model[:effort]]… [--high-stakes] [--run <runId>] [--json]` | Goal on stdin; returns room, member headers and chair card |
 | `fugato roundtable status <roomId> [--json]` / `pause\|resume <roomId>` | Inspect or control the room |
 | `fugato roundtable close <roomId> [--title t] [--label l] [--selects n] [--unreviewed reason]` | Close the room; with a title, `--selects` or a body on stdin, first records the chair's closing decision under the review gate. Closing does not cancel jobs |
 | `fugato forum read <roomId> [--after n] [--thread n] [--limit n] [--json]` | Chair index/thread reads |

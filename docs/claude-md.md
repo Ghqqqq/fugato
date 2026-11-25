@@ -47,7 +47,7 @@ For orchestration in every fresh session without a CLAUDE.md, use
   acceptance criteria and verification commands.
 - Honor the dispatch route in SessionStart guidance; use native dispatch from
   the first task when that route selects it:
-  `Agent(subagent_type: "fugato:codex-native", description: "<purpose>", prompt: "DUET: --model <model> --effort <effort> --normal [--sandbox <mode>] [--cwd <dir>]\n<brief>")`.
+  `Agent(subagent_type: "fugato:codex-native", description: "<purpose>", prompt: "DUET: --role <id> --normal [--sandbox <mode>] [--cwd <dir>]\n<brief>")`.
   A valid, free caller `name` is kept; otherwise Fugato assigns a scientist pool
   name. Use the returned name for SendMessage steering, follow-ups and answers.
   Wait for the actual result; never poll or treat a launch
@@ -58,14 +58,15 @@ For orchestration in every fresh session without a CLAUDE.md, use
 - Give each independent job a fresh native agent; never run two jobs on one
   thread at once. Concurrent edits require disjoint owned paths. Serialize edits
   to shared files, indexes and generated outputs, or use separate worktrees.
-- Outside an orchestration mode, use the configured worker model
-  (default `gpt-6-astra`): `medium` for mechanical scans, the configured worker
-  effort (default `xhigh`) otherwise, and `max` only for the hardest verification,
-  judging or debugging after checking integration and runtime support. If `max` is
-  unsupported, report the limitation and use `xhigh`. In a mode, follow its model
-  tiers. Pass model, effort and speed explicitly in the `DUET:` line. Use
-  `--normal` unless the user requests `--fast`; preserve explicit user choices.
-  Add `--sandbox read-only` for investigation and review.
+- Choose a worker role from `fugato models` for each fresh job. Use
+  `fugato:gemini-native` for an effective Gemini row. Use `--high-stakes`
+  for security or permission boundaries, irreversible data or state changes
+  and migrations, public API or compatibility guarantees, concurrency or process
+  lifecycle, release or CI, publishing, core architecture, or at the user's
+  request. Honor explicit user model and effort choices and omit
+  `--high-stakes` if passing either explicit flag. Use `--normal` by default.
+  Use `--fast` only for Codex rows when the user requests it. Use a Codex
+  row and `--sandbox read-only` for enforced read-only work.
 - Read each worker's actual diff and evidence against the acceptance criteria,
   rerun checks, run integration checks and request corrections when needed. A
   success message alone is not completion. Never simulate a notification, tool
@@ -75,9 +76,7 @@ For orchestration in every fresh session without a CLAUDE.md, use
   or requested by the user.
 ```
 
-Explicit user instructions and active mode protocols take precedence. Instead
-of maintaining the snippet's model lines, take the model and effort from
-`fugato setup --default-model <model> --default-effort <effort>`;
-`--ultra-routine-model <model>` sets ultra's routine tier. SessionStart guidance,
-mode reminders and status show the effective values. See
-[Default worker models](configuration.md#default-worker-models).
+Explicit user instructions and active mode protocols take precedence. Use
+`fugato setup --role-model id=model[:effort]` to save role settings. SessionStart
+explains role dispatch and mode reminders show the roles in use. See
+[worker model configuration](configuration.md#default-worker-models).
