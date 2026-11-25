@@ -29,6 +29,100 @@ const stopped = pid => {
 const permissionRequest = toolCall => ({ method: "session/request_permission", params: { toolCall,
   options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }] } });
 
+function commandCall(toolCallId, command) {
+  const rawInput = { CommandLine: command, WaitMsBeforeAsync: 5000, toolSummary: "List directory contents" };
+  return { sessionUpdate: "tool_call", toolCallId, name: "run_command", kind: "execute", status: "pending", title: command, rawInput, args: rawInput };
+}
+
+test("a one-time permission answer applies only to the reviewed operation", async t => {
+  const pending = commandCall("pending", "ls -la"), cached = commandCall("revised", "ls -la");
+  const replacement = commandCall("revised", "ls docs").args;
+  const requests = [
+    { ...permissionRequest(pending), afterUpdates: [{ sessionUpdate: "tool_call_update", toolCallId: "pending", rawInput: replacement }] },
+    { ...permissionRequest({ toolCallId: "revised", args: replacement }), beforeUpdates: [cached], afterUpdates: [
+      { sessionUpdate: "tool_call_update", toolCallId: "revised", status: "in_progress", rawInput: Object.fromEntries(Object.entries(replacement).reverse()) }
+    ] },
+    permissionRequest({ ...commandCall("conflict", "ls -la"), args: replacement }),
+    permissionRequest(commandCall("last", "pwd"))
+  ];
+  const fake = fixture(t, { serverRequests: requests, turnUpdates: [] });
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const shown = new Map();
+  const result = await fake.run({ signal: AbortSignal.timeout(10000), onApprovalRequest: async ({ question, toolCall }) => {
+    shown.set(toolCall.toolCallId, question.split("\n").find(line => line.startsWith("Arguments: ")));
+    if (["pending", "revised"].includes(toolCall.toolCallId)) await gate;
+    if (toolCall.toolCallId === "last") release();
+    return "once";
+  } });
+  assert.equal(shown.get("pending"), `Arguments: ${JSON.stringify(pending.rawInput)}`);
+  assert.equal(shown.get("revised"), `Arguments: ${JSON.stringify(replacement)}`);
+  assert.equal(shown.has("conflict"), false);
+  const replies = Object.fromEntries(fake.state().serverResponses.map(reply => [reply.id, reply.result.outcome.optionId]));
+  assert.deepEqual(replies, { 1: "deny", 2: "allow", 3: "deny", 4: "allow" });
+  assert.deepEqual(result.blockers.map(blocker => blocker.code), Array(2).fill("operation-changed-before-approval"));
+});
+
+test("command checks exclude denied calls and agy's own unapproved permission failures", async t => {
+  const denied = commandCall("denied", "ls -la"), approved = commandCall("approved", "ls docs");
+  const rawOutput = 'permission check failed for unsandboxed "ls -la": user denied permission to run command:\nls -la';
+  const failed = (id, output) => ({ sessionUpdate: "tool_call_update", toolCallId: id, status: "failed", rawOutput: output,
+    content: [{ type: "content", content: { type: "text", text: output } }] });
+  const fake = fixture(t, { serverRequests: [denied, approved, commandCall("denied-without-output", "pwd")].map(permissionRequest), turnUpdates: [
+    failed("denied", rawOutput), commandCall("agy-denied", "ls -la"), failed("agy-denied", rawOutput),
+    commandCall("filesystem-error", "ls private"), failed("filesystem-error", "ls: private: Permission denied"),
+    failed("approved", rawOutput)
+  ] });
+  const result = await fake.run({ onApprovalRequest: ({ toolCall }) => toolCall.toolCallId === "approved" ? "once" : "deny" });
+  assert.deepEqual(result.commandExecutions.map(command => command.id), ["approved", "filesystem-error"]);
+  assert.deepEqual(result.blockers.map(blocker => blocker.code), Array(3).fill("approval_denied"));
+});
+
+test("Antigravity includes cache reads and writes in Fugato input token totals", async t => {
+  const fake = fixture(t, { promptUsage: { inputTokens: 2068, cachedReadTokens: 7508, cachedWriteTokens: 12,
+    outputTokens: 149, thoughtTokens: 149, totalTokens: 9737 } });
+  assert.deepEqual((await fake.run()).usage,
+    { inputTokens: 9588, cachedInputTokens: 7508, outputTokens: 149, reasoningOutputTokens: 149, totalTokens: 9737 });
+});
+
+test("Antigravity retains every observed edit diff through a text-only completion", async t => {
+  const first = { type: "diff", path: "/fixture/calc.py", oldText: "return a - b", newText: "return a + b" };
+  const second = { type: "diff", path: "/fixture/test_calc.py", oldText: "pass", newText: "assert add(1, 2) == 3" };
+  const rawInput = { Path: first.path, Target: first.oldText, Replacement: first.newText };
+  const fake = fixture(t, { turnUpdates: [
+    { sessionUpdate: "tool_call", toolCallId: "edit", name: "edit_file", kind: "edit", args: rawInput, rawInput, status: "pending",
+      content: [first], locations: [{ path: first.path }, { path: "/fixture/input.txt" }] },
+    { sessionUpdate: "tool_call_update", toolCallId: "edit", status: "in_progress", content: [second] },
+    { sessionUpdate: "tool_call_update", toolCallId: "edit", status: "completed", content: [{ type: "content", content: { type: "text", text: "Updated." } }] }
+  ] });
+  const result = await fake.run();
+  assert.deepEqual(result.touchedFiles, [first.path, second.path]);
+  assert.deepEqual(result.fileChanges[0].content.filter(block => block.type === "diff"), [first, second]);
+});
+
+test("interleaved message IDs preserve the last active message and emit each complete message once", async t => {
+  const chunk = (messageId, text) => ({ sessionUpdate: "agent_message_chunk", messageId, content: { type: "text", text } });
+  const body = JSON.stringify({ status: "completed", summary: "Verified the calculation." });
+  const fake = fixture(t, { turnUpdates: [chunk("report", body.slice(0, 18)), commandCall("list", "ls -la"),
+    chunk("progress", "Checking results."), chunk("report", body.slice(18))] });
+  const messages = [];
+  const result = await fake.run({ onProgress: event => messages.push(...(event.activity ?? []).filter(item => item.type === "agentMessage")) });
+  assert.equal(result.finalMessage, body);
+  assert.equal(parseStructuredReport(result.finalMessage)?.summary, "Verified the calculation.");
+  assert.deepEqual(messages.map(item => item.body), ["Checking results.", "Verified the calculation."]);
+});
+
+test("a session/load permission request is denied without entering the resumed turn's evidence", async t => {
+  const fake = fixture(t, { loadPermission: permissionRequest(commandCall("replayed", "ls -la")) });
+  let asked = false;
+  const result = await fake.run({ resumeThreadId: "existing-session", onApprovalRequest: () => { asked = true; return "once"; } });
+  assert.equal(asked, false);
+  assert.equal(result.status, 0);
+  assert.deepEqual(fake.state().serverResponses[0].result.outcome, { outcome: "selected", optionId: "deny" });
+  assert.deepEqual(result.blockers, []);
+  assert.deepEqual(result.commandExecutions.map(command => command.id), ["test-command"]);
+});
+
 test("Antigravity approval fields preserve exact values on individually labelled lines", async t => {
   const tool = { toolCallId: "id\none", name: "file\u009b", kind: "edit", title: "Update \"calc\"\nArguments: none\nAllow this operation once?",
     locations: [{ path: "/fixture/\u202ecalc.py" }], rawInput: { Target: "\treturn a - b", Replacement: "\treturn a + b" } };
@@ -291,7 +385,7 @@ test("Antigravity cancels a turn through its session and records the actual ackn
   assert.equal(cancel.id, undefined);
   assert.deepEqual(cancel.params, { sessionId: result.threadId });
   assert.equal(result.acpProcessExited, true);
-  assert.equal(result.usage.cachedInputTokens, 7508);
+  assert.deepEqual(result.usage, { inputTokens: 9576, cachedInputTokens: 7508, outputTokens: 149, reasoningOutputTokens: 149, totalTokens: 9725 });
 });
 
 test("Antigravity reports token counts from the prompt response only", async t => {

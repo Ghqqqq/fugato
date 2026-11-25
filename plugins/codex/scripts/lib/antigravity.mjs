@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { AcpClient } from "./acp-client.mjs";
 import { agentMessageActivity, itemActivity, planActivity, snippet } from "./activity.mjs";
 import { executableOnPath } from "./process.mjs";
@@ -20,6 +21,12 @@ const INSTALL_HELP = "Install Antigravity CLI, check `agy acp --help`, or set FU
 // changed text in the arguments and the diff, so they need more than Codex's 800 bytes.
 const MAX_APPROVAL_BYTES = 16 * 1024;
 const MAX_UNSUPPORTED_BLOCKERS = 8;
+const changedOperation = { code: "operation-changed-before-approval", message: "Antigravity's operation changed or its arguments disagree." };
+
+function denyPermission(options) {
+  const deny = Array.isArray(options) && options.find(value => value?.kind === "reject_once" && typeof value.optionId === "string");
+  return deny ? { outcome: { outcome: "selected", optionId: deny.optionId } } : cancelledOutcome();
+}
 
 export function ensureAntigravityAvailable(cwd) {
   const command = binary();
@@ -181,30 +188,29 @@ function inputCommand(input) {
 function permissionReview(tool) {
   if (typeof tool?.toolCallId !== "string" || !tool.toolCallId.trim()) return null;
   const input = tool.rawInput;
-  // A title can describe a command for activity display. Permission requires
-  // the executable text in the actual input.
-  if ((tool.kind === "execute" || tool.name === "run_command") && !inputCommand(input)) {
-    return { code: "missing-command-line", message: "Antigravity requested execution without a command line." };
-  }
-  const hasInput = typeof input === "string" ? Boolean(input.trim()) : input != null &&
-    (typeof input !== "object" || Object.keys(input).length > 0);
-  const hasDiff = toolDiffs(tool).some(diff => typeof diff.oldText === "string" || typeof diff.newText === "string");
-  if (!hasInput && !hasDiff) return null;
-
   const fields = [["Tool call ID", tool.toolCallId], ["Name", tool.name], ["Kind", tool.kind],
-    ["Agent description", tool.title], ["Locations", tool.locations], ["Arguments", input], ["Operation details", tool.content]];
+    ["Agent description", tool.title], ["Locations", tool.locations], ["Arguments", input], ["Operation details", tool.content]]
+    .filter(([, value]) => value != null);
   const tooLarge = { code: "operation-too-large-to-display-exactly", message: "Antigravity's operation exceeds the approval display limit." };
   try {
+    if (!isDeepStrictEqual(input, tool.args)) return changedOperation;
+    // Permission requires executable text in the input. A title is descriptive.
+    if ((tool.kind === "execute" || tool.name === "run_command") && !inputCommand(input)) {
+      return { code: "missing-command-line", message: "Antigravity requested execution without a command line." };
+    }
+    const hasInput = typeof input === "string" ? Boolean(input.trim()) : input != null &&
+      (typeof input !== "object" || Object.keys(input).length > 0);
+    const hasDiff = toolDiffs(tool).some(diff => typeof diff.oldText === "string" || typeof diff.newText === "string");
+    if (!hasInput && !hasDiff) return null;
     const lines = ["Antigravity requests permission."];
     for (const [label, value] of fields) {
-      if (value == null) continue;
       const json = JSON.stringify(value);
       if (json.length > MAX_APPROVAL_BYTES) return tooLarge;
       lines.push(`${label}: ${escapeApprovalControls(json)}`);
     }
     lines.push("Allow this operation once?");
     const question = lines.join("\n");
-    if (Buffer.byteLength(JSON.stringify(question)) <= MAX_APPROVAL_BYTES) return { question };
+    if (Buffer.byteLength(JSON.stringify(question)) <= MAX_APPROVAL_BYTES) return { question, fields: structuredClone(fields) };
   } catch (error) {
     // A deeply nested JSON value can exceed the serializer's stack limit.
     if (!(error instanceof RangeError)) throw error;
@@ -212,31 +218,46 @@ function permissionReview(tool) {
   return tooLarge;
 }
 
-async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers) {
+async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call) {
   const choices = Array.isArray(params.options) ? params.options : [];
   const allow = choices.find(value => value?.kind === "allow_once" && typeof value.optionId === "string");
-  const deny = choices.find(value => value?.kind === "reject_once" && typeof value.optionId === "string");
   const controller = new AbortController();
   const abort = () => controller.abort();
   for (const signal of [turnSignal, requestSignal]) signal?.addEventListener("abort", abort, { once: true });
   let onCancelled;
   try {
-    if (turnSignal.aborted || requestSignal.aborted) return cancelledOutcome();
+    if (turnSignal.aborted || requestSignal.aborted) {
+      if (call) call.permission = "denied";
+      return cancelledOutcome();
+    }
     let answer = "deny";
-    const review = params.sessionId === binding.threadId && binding.turnId && allow ? permissionReview(params.toolCall) : null;
+    let review = call && binding.turnId && allow ? permissionReview(call.tool) : null;
     if (review?.question && options.onApprovalRequest) {
       const request = { kind: "acp-permission", question: review.question, options: ["Allow once", "Deny"],
-        binding: { ...binding }, signal: controller.signal, toolCall: params.toolCall };
+        binding: { ...binding }, signal: controller.signal, toolCall: call.tool };
       answer = await Promise.race([
         Promise.resolve().then(() => options.onApprovalRequest(request)).catch(() => "deny"),
         new Promise(resolve => { onCancelled = () => resolve("deny"); controller.signal.addEventListener("abort", onCancelled, { once: true }); })
       ]);
+      // Bind the answer to the displayed values. Status updates and JSON
+      // object key order do not change the operation.
+      if (!controller.signal.aborted && !isDeepStrictEqual(permissionReview(call.tool)?.fields, review.fields)) {
+        review = changedOperation;
+        answer = "deny";
+      }
     }
-    if (controller.signal.aborted) return cancelledOutcome();
-    if (answer === "once" && allow) return { outcome: { outcome: "selected", optionId: allow.optionId } };
+    if (controller.signal.aborted) {
+      if (call) call.permission = "denied";
+      return cancelledOutcome();
+    }
+    if (answer === "once" && allow) {
+      if (call.permission !== "denied") call.permission = "approved";
+      return { outcome: { outcome: "selected", optionId: allow.optionId } };
+    }
+    if (call) call.permission = "denied";
     blockers.push({ code: review?.code ?? "approval_denied", message: review?.message ?? "Antigravity tool permission was denied or could not be forwarded.",
       method: "session/request_permission", kind: "acp-permission" });
-    return deny ? { outcome: { outcome: "selected", optionId: deny.optionId } } : cancelledOutcome();
+    return denyPermission(choices);
   } finally {
     for (const signal of [turnSignal, requestSignal]) signal?.removeEventListener("abort", abort);
     if (onCancelled) controller.signal.removeEventListener("abort", onCancelled);
@@ -244,8 +265,21 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
   }
 }
 
-function mergeTool(previous, update) {
-  return { ...previous, ...Object.fromEntries(Object.entries(update).filter(([, value]) => value != null)) };
+function observeTool(tools, update) {
+  const call = tools.get(update.toolCallId) ?? { tool: {}, diffs: [], permission: null };
+  const tool = { ...call.tool, ...update };
+  // agy sends args as a copy of rawInput. Either field in this frame takes
+  // precedence over both cached copies. Keep conflicting copies for review.
+  if (Object.hasOwn(update, "rawInput") || Object.hasOwn(update, "args")) {
+    tool.rawInput = Object.hasOwn(update, "rawInput") ? update.rawInput : update.args;
+    tool.args = Object.hasOwn(update, "args") ? update.args : update.rawInput;
+  }
+  for (const diff of toolDiffs(update)) {
+    if (!call.diffs.some(previous => isDeepStrictEqual(previous, diff))) call.diffs.push(diff);
+  }
+  call.tool = tool;
+  tools.set(update.toolCallId, call);
+  return call;
 }
 
 function commandResult(tool) {
@@ -259,10 +293,23 @@ function commandResult(tool) {
     exitCode: Number.isInteger(exitCode) ? exitCode : null, aggregatedOutput: output, durationMs: null };
 }
 
+function failedPermissionCheck(tool) {
+  if (tool.status !== "failed") return false;
+  const content = Array.isArray(tool.content) ? tool.content.map(block => block?.content?.text) : [];
+  return [tool.rawOutput, ...content].some(text => typeof text === "string" &&
+    /^(?:permission check failed\b[\s\S]*?:\s*)?user denied permission to run command\b/i.test(text));
+}
+
 function promptUsage(raw) {
   const fields = { inputTokens: raw?.inputTokens, cachedInputTokens: raw?.cachedReadTokens,
     outputTokens: raw?.outputTokens, reasoningOutputTokens: raw?.thoughtTokens, totalTokens: raw?.totalTokens };
-  const counts = Object.entries(fields).filter(([, count]) => Number.isSafeInteger(count) && count >= 0);
+  const validCount = count => Number.isSafeInteger(count) && count >= 0;
+  if (validCount(fields.inputTokens)) {
+    for (const cached of [raw.cachedReadTokens, raw.cachedWriteTokens]) {
+      if (validCount(cached)) fields.inputTokens += cached;
+    }
+  }
+  const counts = Object.entries(fields).filter(([, count]) => validCount(count));
   return counts.length ? Object.fromEntries(counts) : null;
 }
 
@@ -285,13 +332,12 @@ function changedPaths(tool, diffs = toolDiffs(tool)) {
   return [...new Set((diffs.length ? diffs : locations).map(value => value?.path).filter(value => typeof value === "string" && value))];
 }
 
-function toolActivityItem(tool) {
+function toolActivityItem(tool, diffs) {
   const status = tool.status === "in_progress" || tool.status === "pending" ? "inProgress" : tool.status;
   if (tool.kind === "execute") {
     const command = commandResult(tool);
     if (command.command !== null) return command;
   }
-  const diffs = toolDiffs(tool);
   if (fileChangeKinds.has(tool.kind) || diffs.length) {
     return { type: "fileChange", id: tool.toolCallId, status, changes: changedPaths(tool, diffs).map(file => {
       const diff = diffs.find(value => value.path === file);
@@ -336,7 +382,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
   let client, releaseAdmission, submitted = false, cleanupConfirmed = false;
   let threadId = options.resumeThreadId ?? null, turnId = null;
   const configuration = sessionConfiguration(threadId);
-  let capture = false, finalMessage = "", pendingMessage = "", messageId = null, toolSinceChunk = false, thought = "", acpUsage = null;
+  let capture = false, finalMessage = "", messageId = null, toolSinceChunk = false, thought = "", acpUsage = null;
   let model, effort, usage;
   let turnEnded = false, stopReason = null, failure = null, promptPromise = null, cancellationTimer = null;
   let cancelRequested = false, resolveCancelTimeout;
@@ -344,14 +390,19 @@ export async function runAntigravityTurn(cwd, options = {}) {
   const turnAbort = new AbortController(), tools = new Map(), blockers = [];
   let unsupportedBlockers = 0;
   const activityStarts = new Map(), activityLifecycles = new Map(), activityDescriptors = new Map();
-  // A tool call ends an anonymous message. An identified message can
-  // continue across the tool and is published when its next boundary is known.
-  const publishMessage = () => {
-    if (!pendingMessage) return;
-    finalMessage = pendingMessage;
-    pendingMessage = "";
-    const activity = agentMessageActivity(finalMessage, "antigravity");
+  // Named messages can resume until the turn ends. Keep pending messages
+  // in last-chunk order so a resumed final report follows intervening prose.
+  const messages = new Map();
+  const publishMessage = text => {
+    if (!text) return;
+    const activity = agentMessageActivity(text, "antigravity");
     report(options, "Antigravity message captured.", "working", { activity });
+  };
+  const publishAnonymous = () => {
+    if (typeof messageId === "symbol" && messages.size === 1) {
+      publishMessage(messages.get(messageId));
+      messages.delete(messageId);
+    }
   };
   const persist = patch => { if (options.jobId) updateJob(cwd, options.jobId, () => patch); };
   const abort = () => {
@@ -373,12 +424,11 @@ export async function runAntigravityTurn(cwd, options = {}) {
       onRequest: (message, signal) => {
         if (message.method === "session/request_permission") {
           const params = message.params ?? {}, partial = params.toolCall;
+          if (!capture) return denyPermission(params.options);
           // ACP permits ToolCallUpdate here, including only toolCallId. Merge
           // with this session's observed call so approval shows its real scope.
-          const toolCall = params.sessionId === threadId && typeof partial?.toolCallId === "string"
-            ? mergeTool(tools.get(partial.toolCallId), partial) : partial;
-          if (params.sessionId === threadId && typeof toolCall?.toolCallId === "string") tools.set(toolCall.toolCallId, toolCall);
-          return permissionDecision(options, { ...params, toolCall }, { threadId, turnId }, turnAbort.signal, signal, blockers);
+          const call = params.sessionId === threadId && typeof partial?.toolCallId === "string" ? observeTool(tools, partial) : null;
+          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call);
         }
         if (unsupportedBlockers < MAX_UNSUPPORTED_BLOCKERS) {
           const method = `unrecognized:${createHash("sha256").update(message.method).digest("hex").slice(0, 16)}`;
@@ -394,16 +444,18 @@ export async function runAntigravityTurn(cwd, options = {}) {
         if (!update || typeof update.sessionUpdate !== "string") return;
         if (!capture) return; // agy 1.5.15+ finishes history replay before the load reply.
         switch (update.sessionUpdate) {
-          case "agent_message_chunk":
-            if (update.content?.type !== "text" || typeof update.content.text !== "string") break;
-            if (update.messageId ? update.messageId !== messageId : toolSinceChunk) {
-              publishMessage();
-              messageId = update.messageId ?? null;
-            }
+          case "agent_message_chunk": {
+            if (update.content?.type !== "text" || typeof update.content.text !== "string" || !update.content.text) break;
+            const id = update.messageId ?? (toolSinceChunk || messageId == null ? Symbol() : messageId);
+            if (id !== messageId) publishAnonymous();
+            messageId = id;
             toolSinceChunk = false;
-            pendingMessage += update.content.text;
+            finalMessage = (messages.get(id) ?? "") + update.content.text;
+            messages.delete(id);
+            messages.set(id, finalMessage);
             report(options, "Antigravity response received.", "working", { logTitle: "Antigravity message", logBody: update.content.text });
             break;
+          }
           case "agent_thought_chunk":
             if (update.content?.type === "text" && typeof update.content.text === "string") thought += update.content.text;
             break;
@@ -411,16 +463,15 @@ export async function runAntigravityTurn(cwd, options = {}) {
           case "tool_call_update":
             if (typeof update.toolCallId !== "string") break;
             {
-            const tool = mergeTool(tools.get(update.toolCallId), update);
-            tools.set(update.toolCallId, tool);
+            const { tool, diffs } = observeTool(tools, update);
             if (update.sessionUpdate === "tool_call") {
               toolSinceChunk = true;
-              if (!messageId) publishMessage();
+              publishAnonymous();
             }
             const lifecycle = ["completed", "failed", "cancelled"].includes(tool.status) ? "completed" : "started";
             if (activityLifecycles.get(tool.toolCallId) === lifecycle || activityLifecycles.get(tool.toolCallId) === "completed") break;
             activityLifecycles.set(tool.toolCallId, lifecycle);
-            let item = toolActivityItem(tool);
+            let item = toolActivityItem(tool, diffs);
             const descriptor = activityDescriptors.get(tool.toolCallId);
             // Keep a metadata-only start paired with its completion even if
             // later updates add a command. The full result retains that data.
@@ -490,7 +541,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
     if (!submitted) throw notStarted(failure);
   } finally {
     capture = false; turnAbort.abort();
-    publishMessage();
+    for (const text of messages.values()) publishMessage(text);
     clearTimeout(cancellationTimer);
     options.signal?.removeEventListener("abort", abort);
     try {
@@ -506,11 +557,20 @@ export async function runAntigravityTurn(cwd, options = {}) {
       if (!submitted || cleanupConfirmed) reservation.release();
     }
   }
-  const entries = [...tools.values()];
+  const fileChanges = [], commandExecutions = [];
   // Proposed diffs can accompany pending or denied operations. Only completed
   // tool events confirm edits; workspace snapshots detect any partial writes
   // from failed operations independently.
-  const fileChanges = entries.filter(tool => tool.status === "completed" && (fileChangeKinds.has(tool.kind) || toolDiffs(tool).length));
+  for (const { tool, diffs, permission } of tools.values()) {
+    if (tool.status === "completed" && (fileChangeKinds.has(tool.kind) || diffs.length)) {
+      const otherContent = Array.isArray(tool.content) ? tool.content.filter(block => block?.type !== "diff") : [];
+      fileChanges.push(diffs.length ? { ...tool, content: [...diffs, ...otherContent] } : tool);
+    }
+    if (tool.kind !== "execute" || permission === "denied") continue;
+    if (permission !== "approved" && failedPermissionCheck(tool)) {
+      blockers.push({ code: "approval_denied", message: "Antigravity denied permission to run the command.", method: "session/request_permission", kind: "acp-permission" });
+    } else commandExecutions.push(commandResult(tool));
+  }
   const touchedFiles = [...new Set(fileChanges.flatMap(tool => changedPaths(tool)))];
   const status = failure || ["cancelled", "max_tokens", "max_turn_requests"].includes(stopReason) ? 1 : 0;
   const turnStatus = stopReason === "cancelled" || cancelRequested ? "interrupted" : status ? "failed" : "completed";
@@ -520,6 +580,6 @@ export async function runAntigravityTurn(cwd, options = {}) {
     interruptionConfirmed: stopReason === "cancelled", acpProcessExited: cleanupConfirmed,
     sandbox: "danger-full-access", approvalPolicy: options.onApprovalRequest ? "antigravity-rules+parent-once" : "antigravity-rules+deny",
     model, effort, ...(usage ? { usage } : {}),
-    fileChanges, touchedFiles, commandExecutions: entries.filter(tool => tool.kind === "execute").map(commandResult),
+    fileChanges, touchedFiles, commandExecutions,
     blockers, error: failure ? { message: failure.message } : null, stderr: client?.stderr ?? "", acpUsage };
 }
