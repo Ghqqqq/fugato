@@ -284,7 +284,8 @@ Codex. `agy` must be installed and Claude permission mapping must be `off`, or
 For each Gemini seat, `roundtable start` prints `backend: "antigravity"`,
 `agentType: "fugato:gemini-native"`, and a `DUET: --backend antigravity ...`
 header. The chair dispatches the printed `agentType` and `header`. Gemini seats
-require full access; read-only Gemini seats are refused.
+require full access; a seat task with any other sandbox is refused before
+launch.
 
 Gemini members receive forum notices only between turns, never mid-turn. Parked
 approvals hold that member's notices until answered. Edits and commands still

@@ -108,8 +108,8 @@ is `low → medium → high → xhigh → max`, clamped at its ends. Saved and p
 explicit efforts take precedence over intensity adjustments. Gemini seats accept
 `low`, `medium`, `high` and `xhigh`. Explicit efforts next to a Gemini model are
 validated strictly; inherited or intensity-adjusted efforts clamp to
-`low`..`xhigh`, and a per-room model change ignores a saved effort from a
-different model or backend.
+`low`..`xhigh`. A saved effort is ignored when the room's model moves the seat
+to the other backend (Codex to Gemini or back).
 
 Use `fugato roundtable start --high-stakes` for [high-stakes work](ultra-codex.md#worker-roles).
 It sets every seat's model to `gpt-6.2-astra` except seats with an explicit
@@ -232,8 +232,10 @@ session chairs are visible, and the pane cannot post or change a room.
 Mentions and chair decisions can wake an idle member. Replies to a thread it
 joined notify it without waking it; ordinary new posts stay in the index.
 Running Codex members receive notices directly through steering. Gemini members
-receive forum notices only between turns, never mid-turn; notices wait while a
-Gemini turn is active and deliver once it ends. For idle members,
+receive forum notices only between turns, never mid-turn. While a Gemini turn
+runs its notices wait; when it ends, a waking notice (a mention of the member or a
+decision) starts a follow-up turn, and other
+notices stay in the forum for its next read. For idle members,
 the timer records a ready wake and the plugin sends it after a tool call in the
 chair's main loop finishes. Delivery targets the member's bound agent id and
 continues its existing thread or ACP session. The host excludes all of a plugin's hooks
@@ -275,8 +277,9 @@ work and forum exchanges. Agent `name` equals the persona id. Codex seats print
 `DUET: --model <m> --effort <e> --normal --roundtable <roomId> --persona <id> --cwd "<workspace path>"`;
 Gemini seats print
 `DUET: --backend antigravity --model <gemini> --effort <e> --roundtable <roomId> --persona <id> --cwd "<workspace path>"`
-(no `--sandbox` or speed flag). Gemini seats cannot be read-only; requesting a
-read-only room with Gemini seats is refused naming the seats. Dispatch members without Agent `isolation: "worktree"`: Fugato creates
+(no `--sandbox` or speed flag). Gemini seats cannot be read-only: a Gemini seat
+task with a sandbox other than `danger-full-access`, explicit or saved, is
+refused before launch. Dispatch members without Agent `isolation: "worktree"`: Fugato creates
 and owns each member's detached Git worktree from the current HEAD at
 `<isolated-home>/duet/roundtables/<roomId>/worktrees/<persona>`. These workspaces
 survive completed turns and later wakes. Creation rolls back the entire room

@@ -15,12 +15,6 @@ import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const companion = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
 
-const rosterAllowsGemini = (() => {
-  try {
-    resolveRoster({ roles: ["critic"], overrides: { critic: { model: "gemini-4-neon", effort: "high" } } });
-    return true;
-  } catch { return false; }
-})();
 
 function makeFixture(acpOptions = "normal") {
   const dir = makeTempDir("rt-gemini-"), repo = path.join(dir, "repo");
@@ -66,7 +60,6 @@ test("roundtable start helpers format mixed Codex/Gemini headers and enforce agy
 });
 
 test("roundtable start CLI outputs mixed Gemini/Codex seats and refuses missing agy or claude permission mapping", t => {
-  if (!rosterAllowsGemini) return t.skip("Area A pending: resolveRoster rejects gemini");
   const f = makeFixture();
   const roomsDir = path.join(f.env.CODEX_COMPANION_HOME, "duet", "roundtables");
   const noAgy = f.invoke(["roundtable", "start", "--roles", "improver,critic", "--persona-model", "critic=gemini-4-neon:high", "--json"], "Goal", {
@@ -122,7 +115,7 @@ test("Gemini seat tasks honor settings precedence, reject mismatches and non-ful
   const roomFile = path.join(f.env.CODEX_COMPANION_HOME, "duet", "roundtables", room.roomId, "room.json");
   const disk = JSON.parse(fs.readFileSync(roomFile, "utf8"));
   const criticSeat = disk.members.find(m => m.persona === "critic");
-  criticSeat.model = "gemini-4-carbon"; criticSeat.effort = "high";
+  criticSeat.model = "gemini-4-carbon"; criticSeat.effort = "high"; criticSeat.backend = "antigravity";
   fs.writeFileSync(roomFile, `${JSON.stringify(disk)}\n`);
   const criticWs = criticSeat.workspace.path, improverWs = disk.members.find(m => m.persona === "improver").workspace.path;
 
@@ -158,7 +151,7 @@ test("Gemini seat tasks honor settings precedence, reject mismatches and non-ful
   assert.deepEqual(saved.request.roundtable, { roomId: room.roomId, persona: "critic" });
   const promptText = f.acp.requests().find(r => r.method === "session/prompt").params.prompt.map(p => p.text).join("\n");
   assert.doesNotMatch(promptText, /under the duet_parent MCP server/);
-  assert.match(promptText, /under the parent-bridge MCP server/);
+  assert.match(promptText, /under Fugato.s parent-bridge MCP server/);
   const updated = forum.readRoom(room.roomId, f.env).members.find(m => m.persona === "critic");
   assert.equal(updated.status, "active");
   assert.deepEqual(updated.jobIds, [report.jobId]);
@@ -167,9 +160,6 @@ test("Gemini seat tasks honor settings precedence, reject mismatches and non-ful
 });
 
 test("pre-enqueue throw releases a claimed roundtable seat in background and foreground paths", t => {
-  if (typeof forum.releaseMemberClaim !== "function") {
-    return t.skip("Area A pending: lib/forum.mjs does not export releaseMemberClaim yet");
-  }
   const f = makeFixture();
   const started = f.invoke(["journal", "start", "--json"], JSON.stringify({ goal: "Closed run", criteria: ["Done"] }));
   assert.equal(started.status, 0, started.stderr);
@@ -181,7 +171,7 @@ test("pre-enqueue throw releases a claimed roundtable seat in background and for
   const roomFile = path.join(f.env.CODEX_COMPANION_HOME, "duet", "roundtables", room.roomId, "room.json");
   const disk = JSON.parse(fs.readFileSync(roomFile, "utf8"));
   const critic = disk.members.find(m => m.persona === "critic");
-  critic.model = "gemini-4-neon"; critic.effort = "high";
+  critic.model = "gemini-4-neon"; critic.effort = "high"; critic.backend = "antigravity";
   fs.writeFileSync(roomFile, `${JSON.stringify(disk)}\n`);
 
   // Closing the room's run causes linkJournalJob inside buildTaskJob to throw after claim:true.

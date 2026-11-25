@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 
 import { spawnDetached } from "./lib/process.mjs";
-import { createRoom, readRoom, listRooms, assertChair, roundtableStatus, postEvent, readIndex, readThread, readResource, pending, ack, setStatus, updateMember, validateMember, renderForum, renderRoundtableStatus, renderAttention } from "./lib/forum.mjs";
-import * as forumModule from "./lib/forum.mjs";
-import { resolveRoster, personaInstructions, CHAIR_CARD, INTENSITIES, PERSONA_IDS } from "./lib/roundtable-personas.mjs";
+import { createRoom, readRoom, listRooms, assertChair, roundtableStatus, postEvent, readIndex, readThread, readResource, pending, ack, setStatus, updateMember, validateMember, renderForum, renderRoundtableStatus, renderAttention, releaseMemberClaim } from "./lib/forum.mjs";
+import { resolveRoster, personaInstructions, CHAIR_CARD, INTENSITIES, PERSONA_IDS, GEMINI_EFFORTS } from "./lib/roundtable-personas.mjs";
 import { closeMemberWorkspaces } from "./lib/roundtable-workspaces.mjs";
 import { effectiveRoleTable, readPersonaModels, roleModelsSetup } from "./lib/setup-config.mjs";
 import { backendForModel, expandRole } from "./lib/roles.mjs";
@@ -1195,7 +1194,7 @@ async function executeTaskRun(request) {
     claudeMd: request.claudeMd,
     skills: request.skills,
     resumeThreadId,
-    prompt: withGitContext(request.gitContext, request.report ? `${request.prompt || DEFAULT_CONTINUE_PROMPT}\n\n${backend === "antigravity" ? loadPromptTemplate(ROOT_DIR, "worker-task").replace("under the duet_parent MCP server", "under the parent-bridge MCP server") : loadPromptTemplate(ROOT_DIR, "worker-task")}` : request.prompt || (resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "")),
+    prompt: withGitContext(request.gitContext, request.report ? `${request.prompt || DEFAULT_CONTINUE_PROMPT}\n\n${loadPromptTemplate(ROOT_DIR, "worker-task")}` : request.prompt || (resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "")),
     outputSchema: request.report ? readOutputSchema(WORKER_REPORT_SCHEMA) : null,
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
@@ -1824,13 +1823,6 @@ export function antigravityTaskSettings(options, previous, recorded, seat = null
   return settings;
 }
 
-function releaseSeatClaim(roomId, persona, { claimedAt }) {
-  if (typeof forumModule.releaseMemberClaim === "function") {
-    return forumModule.releaseMemberClaim(roomId, persona, { claimedAt });
-  }
-  return { released: false };
-}
-
 function withMemberClaim(roundtable, threadId, action) {
   let claimedAt = roundtable && !threadId
     ? updateMember(roundtable.roomId, roundtable.persona, { claim: true })?.claimedAt ?? null
@@ -1839,7 +1831,7 @@ function withMemberClaim(roundtable, threadId, action) {
     if (!claimedAt) return;
     const at = claimedAt;
     claimedAt = null;
-    try { releaseSeatClaim(roundtable.roomId, roundtable.persona, { claimedAt: at }); } catch { /* preserve original error */ }
+    try { releaseMemberClaim(roundtable.roomId, roundtable.persona, { claimedAt: at }); } catch { /* preserve original error */ }
   };
   try {
     const result = action({ release });
@@ -3544,14 +3536,13 @@ function roundtableOptions(options, allowed, command) {
   for (const key of Object.keys(options)) if (!["json", "session", ...allowed].includes(key)) throw new Error(`${command} does not accept --${key}.`);
 }
 
-const GEMINI_SEAT_EFFORTS = ["low", "medium", "high", "xhigh"];
 function normalizeSeatEffort(effort, backend) {
   if (backend !== "antigravity") return normalizeReasoningEffort(effort);
   if (effort == null) return null;
   const normalized = String(effort).trim().toLowerCase();
   if (!normalized) return null;
-  if (!GEMINI_SEAT_EFFORTS.includes(normalized)) {
-    throw new Error(`Invalid Gemini effort "${effort}". Use ${GEMINI_SEAT_EFFORTS.join(", ")}.`);
+  if (!GEMINI_EFFORTS.includes(normalized)) {
+    throw new Error(`Invalid Gemini effort "${effort}". Use ${GEMINI_EFFORTS.join(", ")}.`);
   }
   return normalized;
 }
@@ -3600,9 +3591,9 @@ async function handleRoundtable(argv) {
       let effort;
       if (hasEffort) {
         const trimmed = suffix.trim().toLowerCase();
-        if (!trimmed || (seatBackend === "antigravity" ? !GEMINI_SEAT_EFFORTS.includes(trimmed) : !isSupportedReasoningEffort(trimmed))) {
+        if (!trimmed || (seatBackend === "antigravity" ? !GEMINI_EFFORTS.includes(trimmed) : !isSupportedReasoningEffort(trimmed))) {
           throw new Error(seatBackend === "antigravity"
-            ? `Invalid Gemini effort for ${persona}: ${suffix}. Use ${GEMINI_SEAT_EFFORTS.join(", ")}.`
+            ? `Invalid Gemini effort for ${persona}: ${suffix}. Use ${GEMINI_EFFORTS.join(", ")}.`
             : "Invalid persona effort.");
         }
         effort = trimmed;

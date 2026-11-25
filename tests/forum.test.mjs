@@ -481,24 +481,23 @@ effort = "low"
   ]);
   fs.writeFileSync(file, '[roundtable.personas.critic]\nmodel = "gemini-custom"\n');
   assert.deepEqual(seats(readRoom(room.roomId, f.env).members), seats(room.members));
-  const savedGemini = start("--persona-model", "critic=codex-room-model");
-  assert.equal(savedGemini.status, 1);
-  assert.match(savedGemini.stderr, /critic requires a Codex model.*gemini-custom/);
+  // An explicit room model overrides a saved Gemini persona model.
+  const savedGemini = json(start("--persona-model", "critic=codex-room-model"));
+  assert.deepEqual(savedGemini.members.find(member => member.persona === "critic").backend, "codex");
   fs.writeFileSync(file, "");
-  const roomGemini = start("--persona-model", "critic=gemini-room");
-  assert.equal(roomGemini.status, 1);
-  assert.match(roomGemini.stderr, /critic requires a Codex model.*gemini-room/);
+  // An explicit Gemini room model seats a Gemini member when agy resolves.
+  const roomGemini = json(start("--persona-model", "critic=gemini-room")).members.find(member => member.persona === "critic");
+  assert.deepEqual([roomGemini.model, roomGemini.backend, roomGemini.agentType], ["gemini-room", "antigravity", "fugato:gemini-native"]);
 });
 
-test("a critic-only room ignores unseated saved Gemini models and validates every explicit room model", () => {
+test("a critic-only room ignores unseated saved Gemini models and unseated room overrides", () => {
   const f = fixture(), file = path.join(f.env.CODEX_COMPANION_HOME, "duet", "config.toml");
   fs.writeFileSync(file, '[roundtable.personas.calibrator]\nmodel = "gemini-4-neon"\n');
   const start = model => f.call(["roundtable", "start", "--roles", "critic", "--persona-model", model, "--json"], "Check a claim");
   const room = json(start("improver=gpt-6.2-sol"));
   assert.deepEqual(room.members.map(({ persona }) => persona), ["critic"]);
-  const rejected = start("improver=gemini-custom");
-  assert.equal(rejected.status, 1);
-  assert.match(rejected.stderr, /improver requires a Codex model.*gemini-custom/);
+  // An override for an unseated persona is ignored, Gemini or not.
+  assert.deepEqual(json(start("improver=gemini-custom")).members.map(({ persona, backend }) => [persona, backend]), [["critic", "codex"]]);
 });
 
 test("selected persona inline tables and duplicate keys retain their TOML diagnostics", () => {
