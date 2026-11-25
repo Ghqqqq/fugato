@@ -63,10 +63,13 @@ function processIdentity(job) {
   if (!command) return pidExists(pid) ? "unknown" : "absent";
   const executable = job.acpExecutable ?? acpExecutable(job.request?.cwd ?? job.workspaceRoot ?? process.cwd());
   if (!matchesInvocation(command, executable)) return "reused";
-  const recordedAt = Date.parse(job.acpProcessRecordedAt ?? job.turnSubmission?.at);
-  if (!Number.isFinite(startedAt) || !Number.isFinite(recordedAt)) return "unknown";
+  // The worker observes its live ACP child at PID registration and again at prompt submission.
+  const proofTimes = [job.acpProcessRecordedAt, job.turnSubmission?.at]
+    .filter(value => typeof value === "string").map(Date.parse).filter(Number.isFinite);
+  if (!Number.isFinite(startedAt) || !proofTimes.length) return "unknown";
+  const recordedAt = Math.max(...proofTimes);
   // ps reports only whole seconds. A matching executable born anywhere in
-  // the recorded second could be a replacement. CreationDate retains ms.
+  // the latest proof's second could be a replacement. CreationDate retains ms.
   const cutoff = process.platform === "win32" ? recordedAt : Math.floor(recordedAt / 1000) * 1000;
   if (startedAt === cutoff) return "unknown";
   return startedAt < cutoff ? "owned" : "reused";

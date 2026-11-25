@@ -28,8 +28,8 @@ const send = message => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ..
 readline.createInterface({ input: process.stdin }).on("line", line => {
   const { id, method, params } = JSON.parse(line);
   fs.appendFileSync(file, JSON.stringify({ pid: process.pid, method, params }) + "\n");
-  if (method === "initialize") send({ id, result: { protocolVersion: 1, agentInfo: { name: "agy", version: "1.5.16" },
-    agentCapabilities: { loadSession: true } } });
+  if (method === "initialize") setTimeout(() => send({ id, result: { protocolVersion: 1, agentInfo: { name: "agy", version: "1.5.16" },
+    agentCapabilities: { loadSession: true } } }), Number(process.env.ACP_INITIALIZE_DELAY_MS) || 0);
   if (method === "session/new") send({ id, result: { sessionId, configOptions } });
   if (method === "session/load") {
     sessionId = params.sessionId;
@@ -78,16 +78,6 @@ async function killWorker(f, id) {
   await waitForCondition(() => !alive(pid), "worker exit", 5000);
 }
 
-async function recordLivePeer(f, id) {
-  // Exercise positive ownership with a PID observation distinguishable from
-  // the peer's POSIX birth second. Both ends of the original connection live.
-  const job = f.job(id);
-  const nextSecond = Math.floor(Date.parse(job.acpProcessRecordedAt) / 1000) * 1000 + 1000;
-  await waitForCondition(() => Date.now() >= nextSecond, "distinct PID observation second");
-  assert.ok(alive(job.pid) && alive(job.acpProcessPid));
-  updateJob(f.repo, id, () => ({ acpProcessRecordedAt: new Date().toISOString() }));
-}
-
 test("a follow-up killed before session/prompt is recorded as notStarted and can continue", async () => {
   const f = fixture();
   const first = f.complete("--backend", "antigravity");
@@ -130,13 +120,16 @@ test("an unacknowledged cancel records process exit and reports a usable continu
 });
 
 test("cancelling a crashed worker by name stops its ACP group including a stubborn tool", async t => {
-  const f = fixture(), { jobId } = f.launch("orphan", "--name", "OrphanWorker");
+  const f = fixture();
+  f.env.ACP_INITIALIZE_DELAY_MS = "1200";
+  const { jobId } = f.launch("orphan", "--name", "OrphanWorker");
   await waitForCondition(() => fs.existsSync(f.events + ".tool"), "tool startup", 10000);
   const tool = Number(fs.readFileSync(f.events + ".tool", "utf8")), lost = f.job(jobId);
   t.after(() => {
     for (const pid of [tool, lost.acpProcessPid]) if (alive(pid)) process.kill(pid, "SIGKILL");
   });
-  await recordLivePeer(f, jobId);
+  assert.ok(Math.floor(Date.parse(lost.turnSubmission.at) / 1000) > Math.floor(Date.parse(lost.acpProcessRecordedAt) / 1000),
+    "prompt submission supplies a later whole-second ownership proof");
   await killWorker(f, jobId);
   assert.ok(alive(lost.acpProcessPid) && alive(tool));
   const cancelled = f.command(["cancel", "OrphanWorker", "--json"], { script: fugato, status: 2 });
@@ -229,16 +222,16 @@ test("a newer detached agy acp survives cancellation of a job that recorded the 
   await killWorker(f, jobId);
   await waitForCondition(() => !alive(original.acpProcessPid), "ACP exit on EOF", 5000);
 
+  const submissionSecond = Math.floor(Date.parse(original.turnSubmission.at) / 1000);
+  await waitForCondition(() => Math.floor(Date.now() / 1000) > submissionSecond, "later replacement start second");
   const replacement = spawn(f.executable, ["acp"], { detached: true, stdio: ["pipe", "ignore", "ignore"],
     env: f.env });
   t.after(() => replacement.kill("SIGKILL"));
   replacement.stdin.write(JSON.stringify({ id: 1, method: "initialize" }) + "\n");
   await waitForCondition(() => f.requests("initialize").some(request => request.pid === replacement.pid), "replacement ACP startup");
   updateJob(f.repo, jobId, () => ({ acpProcessPid: replacement.pid }));
-  // Give the stale record an unambiguous upper bound across ps's whole-second
-  // precision. The replacement otherwise has the exact same group and argv.
-  const earlier = new Date(Date.parse(original.acpProcessRecordedAt) - 60000).toISOString();
-  updateJob(f.repo, jobId, () => ({ acpProcessRecordedAt: earlier }));
+  // Changing the fixture PID stamps a new observation. Restore the original job's proof.
+  updateJob(f.repo, jobId, () => ({ acpProcessRecordedAt: original.acpProcessRecordedAt }));
   f.command(["cancel", jobId, "--json"], { status: 2 });
   assert.ok(alive(replacement.pid));
   assert.equal(f.job(jobId).acpProcessExited, true);
@@ -256,7 +249,7 @@ test("a matching ACP process born in the recorded POSIX second stays unresolved 
     { encoding: "utf8", env: { ...process.env, LC_ALL: "C", TZ: "UTC" } });
   assert.equal(start.status, 0, start.error?.message ?? start.stderr);
   const recordedAt = new Date(Date.parse(start.stdout.trim() + " GMT") + 500).toISOString();
-  updateJob(f.repo, jobId, () => ({ acpProcessRecordedAt: recordedAt }));
+  updateJob(f.repo, jobId, job => ({ acpProcessRecordedAt: recordedAt, turnSubmission: { ...job.turnSubmission, at: recordedAt } }));
   const response = f.command(["cancel", jobId, "--json"], { status: 2 });
   assert.equal(response.confirmation, "unconfirmed");
   assert.ok(alive(acpProcessPid));
@@ -337,11 +330,11 @@ test("implicit resume and cancel apply ACP recovery to the selected worker", asy
   assert.equal(f.job(next.jobId).threadId, original.threadId);
   assert.equal(f.job(first.jobId).turnResolution, "unknown");
 
+  f.env.ACP_INITIALIZE_DELAY_MS = "1200";
   const orphan = f.launch("survive-eof");
   await waitForCondition(() => f.requests("session/prompt").length === 3, "new prompt", 10000);
   const pid = f.job(orphan.jobId).acpProcessPid;
   t.after(() => { if (alive(pid)) process.kill(pid, "SIGKILL"); });
-  await recordLivePeer(f, orphan.jobId);
   await killWorker(f, orphan.jobId);
   const cancelled = f.command(["cancel", "--json"], { status: 2 });
   assert.equal(cancelled.jobId, orphan.jobId);
