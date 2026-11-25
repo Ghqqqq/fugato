@@ -34,6 +34,10 @@
   timing before signalling a surviving agy process. Block concurrent prompts
   on the same ACP session across workspaces. Scope admission, cleanup and
   parent questions to the backend when session handles coincide.
+- Keep job records small when commands print a lot: stored command output is
+  capped at 16 KiB per command and 256 KiB per turn, keeping the start and end.
+  `fugato-live` shows a job whose details cannot be read from its workspace
+  index, so a finished job no longer appears as a stale running row.
 
 ## 1.7.2
 
