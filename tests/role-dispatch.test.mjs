@@ -181,6 +181,21 @@ test("high-stakes rooms use Astra for each persona except explicit room model ov
   assert.equal(room.members.find(seat => seat.persona === "improver").effort, "medium");
 });
 
+test("roundtable start accepts high-stakes only once and only as a bare flag", () => {
+  const f = fixture();
+  for (const [flags, message] of [
+    [["--high-stakes", "--high-stakes"], "Pass --high-stakes only once."],
+    [["--high-stakes=false"], "Pass --high-stakes as a bare flag."],
+    [["--high-stakes=true"], "Pass --high-stakes as a bare flag."],
+    [["--high-stakes="], "Pass --high-stakes as a bare flag."]
+  ]) {
+    const result = call(f, ["roundtable", "start", ...flags], "Check the fixture.");
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.trim(), message);
+  }
+  assert.equal(fs.existsSync(path.join(f.env.CODEX_COMPANION_HOME, "duet", "roundtables")), false);
+});
+
 test("permission hook accepts fresh role flags and declines invalid combinations", () => {
   const f = fixture();
   const env = { ...f.env, PATH: path.dirname(launcher) };
@@ -188,9 +203,30 @@ test("permission hook accepts fresh role flags and declines invalid combinations
     session_id: f.env.CODEX_COMPANION_SESSION_ID, tool_use_id: "tool-a", cwd: f.repo, tool_input: { command: "fugato task " + flags } }, env)
     .hookSpecificOutput?.permissionDecision === "allow";
   for (const flags of ["--role implement --effort medium", "--role=debug --high-stakes", "--high-stakes",
-    "--role implement --model spark", "--backend antigravity --role read --model gemini-4-neon"]) assert.ok(approved(flags), flags);
+    "--role implement --model spark"]) assert.ok(approved(flags), flags);
   for (const flags of ["--role unknown", "--role debug --to Ada", "--high-stakes --effort high", "--high-stakes --model spark",
+    "--backend antigravity --role read --model gemini-4-neon", "--backend antigravity --role read --sandbox read-only",
     "--backend antigravity --high-stakes", "--role implement --model gemini-4-neon", "--backend antigravity --role read --model gpt-6.2-sol",
     "--high-stakes=false", "--high-stakes=true", "--high-stakes --high-stakes", "--role debug --role implement",
     "--role review --roundtable rt-test-room --persona critic"]) assert.equal(approved(flags), false, flags);
+});
+
+test("permission hook resolves saved role backends using the task workspace and its installed executable", () => {
+  const f = fixture();
+  const withAgy = path.join(f.repo, "with-agy");
+  fs.mkdirSync(withAgy);
+  fs.writeFileSync(path.join(withAgy, "agy"), "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+  const env = { ...f.env, PATH: path.dirname(launcher), FUGATO_ANTIGRAVITY_BIN: "./agy" };
+  const hook = new URL("../plugins/codex/scripts/duet-permission-hook.mjs", import.meta.url).pathname;
+  const approved = flags => {
+    const input = { hook_event_name: "PreToolUse", tool_name: "Bash", permission_mode: "default", session_id: f.env.CODEX_COMPANION_SESSION_ID,
+      tool_use_id: "tool-a", cwd: f.repo, tool_input: { command: "fugato task " + flags } };
+    return json(run(process.execPath, [hook], { env, cwd: f.repo, input: JSON.stringify(input) })).hookSpecificOutput?.permissionDecision === "allow";
+  };
+  json(f.call("setup", "--role-model", "implement=gemini-4-neon", "--role-model", "read=gpt-6.2-sol", "--json"));
+  assert.equal(approved("--role implement --cwd with-agy"), false);
+  assert.equal(approved("--role implement --model gpt-6.2-sol --cwd with-agy"), false);
+  assert.equal(approved("--role implement"), true, "Codex fallback applies in the workspace without agy");
+  assert.equal(approved("--role read --cwd with-agy"), true, "The saved Codex model applies to a built-in Gemini role");
+  assert.equal(approved("--role read --backend antigravity --cwd with-agy"), false);
 });

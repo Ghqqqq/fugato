@@ -10,8 +10,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { COMMAND_ALIASES, COMMAND_OPTIONS, DIRECT_OPTION_CONFLICTS, NON_FRESH_ROLE_FLAGS } from "./lib/command-options.mjs";
-import { SANDBOX_MODES, isSupportedReasoningEffort, normalizeRequestedModel } from "./lib/setup-config.mjs";
-import { backendForModel, HIGH_STAKES, ROLE_IDS } from "./lib/roles.mjs";
+import { effectiveRoleTable, SANDBOX_MODES, isSupportedReasoningEffort, normalizeRequestedModel } from "./lib/setup-config.mjs";
+import { backendForModel, expandRole } from "./lib/roles.mjs";
 import { PERSONA_IDS } from "./lib/roundtable-personas.mjs";
 import { budgetLimit } from "./lib/job-budget.mjs";
 import { readHookInput } from "./lib/fs.mjs";
@@ -134,7 +134,6 @@ export function approveDuet(input, env = process.env) {
       if (!value || value.startsWith("-") || !value.trim()) return {};
       if (["to", "thread", "continue"].includes(name) && !target(value)) return {};
       if (name === "backend" && !["codex", "antigravity"].includes(value)) return {};
-      if (name === "role" && !ROLE_IDS.includes(value)) return {};
       if (name === "model" && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/.test(normalizeRequestedModel(value))) return {};
       if (name === "session" && value !== input.session_id) return {};
       if (name === "effort" && !isSupportedReasoningEffort(value, env)) return {};
@@ -147,10 +146,16 @@ export function approveDuet(input, env = process.env) {
       flags.set(name, value);
     } else return {};
   }
-  if ((flags.has("role") || flags.has("high-stakes")) && NON_FRESH_ROLE_FLAGS.some(key => flags.get(key))) return {};
-  const backend = flags.get("backend") ?? "codex";
-  if (flags.has("high-stakes") && (backend !== HIGH_STAKES.backend || flags.has("model") || flags.has("effort"))) return {};
-  if (flags.has("role") && flags.has("model") && backendForModel(flags.get("model")) !== backend) return {};
+  if (verb === "task" && (flags.has("role") || flags.has("high-stakes"))) {
+    if (flags.get("backend") === "antigravity" || NON_FRESH_ROLE_FLAGS.some(key => flags.get(key))) return {};
+    try {
+      const cwd = path.resolve(input.cwd ?? process.cwd(), flags.get("cwd") ?? ".");
+      const { model } = expandRole(effectiveRoleTable({ env, cwd }), {
+        backend: "codex", role: flags.get("role"), highStakes: flags.has("high-stakes"), model: flags.get("model"), effort: flags.get("effort")
+      });
+      if (backendForModel(model) !== "codex") return {};
+    } catch { return {}; }
+  }
   if (verb === "task" && (flags.has("roundtable") !== flags.has("persona") ||
       (flags.has("roundtable") && (!/^rt-[a-z0-9]+-[a-z0-9-]+$/.test(flags.get("roundtable")) || !PERSONA_IDS.includes(flags.get("persona")))))) return {};
   const forumReadOnly = verb === "roundtable" || verb === "forum";

@@ -868,6 +868,31 @@ test('running Codex workers refuse role headers before steering or queuing a del
   assert.deepEqual(steered, literal);
 });
 
+test('role-looking pending answers, oversized messages and unbound sends keep verbatim host delivery', async () => {
+  const f = fixture('unused', 'parked', { hostOnly: true, memoryStore: true });
+  f.$.agent.list = async () => [{ id: 'native-agent', type: AGENT_TYPE, status: 'running' }];
+  const key = 'native:v2:native-session:native-agent';
+  const binding = { session: 'native-session', jobId: 'job', ownerId: 'owner', cwd: `${f.root}/repo` };
+  const answer = 'DUET: --role debug\nKeep this answer verbatim.';
+  const oversized = answer.padEnd(65537, 'x');
+  for (const [state, text, sender] of [
+    [{ ...binding, status: 'needs_answer' }, answer, {}],
+    [{ ...binding, answer: { status: 'needs_answer' } }, answer, {}],
+    [binding, oversized, {}], [binding, answer, { agentId: 'peer' }],
+    [{ ...binding, bindingPending: true }, answer, {}], [null, answer, {}]
+  ]) {
+    f.setStore(state ? { [key]: state } : {});
+    const delivered = [];
+    const receipt = await f.invoke('session.send', { to: 'native-agent', text, origin: { kind: 'model' }, ...sender }, async e => {
+      delivered.push(e.text);
+      return { isDelivered: true };
+    });
+    assert.deepEqual(receipt, { isDelivered: true });
+    assert.deepEqual(delivered, [text]);
+  }
+  assert.deepEqual(f.capture.processes, []);
+});
+
 test('native steering applies to the running turn without a continuation', async () => {
   const f = fixture('steer-applied');
   const pending = f.turn('Work until steered.', 1);
@@ -1368,6 +1393,33 @@ test('a role header after a refused first turn is a follow-up even without a job
   assert.equal(reply.summary, 'role flags apply to a fresh dispatch; follow-ups keep the recorded model and effort (use --model/--effort to change them)');
   assert.deepEqual(f.jobs(), []);
   assert.ok(!f.capture.processes.some(p => p.request.argv[2] === 'task'));
+});
+
+test('replaying a rejected launch with only its durable intent and closure refuses a follow-up role', async () => {
+  const f = fixture('review-ok');
+  const key = 'native:v2:native-session:native-agent', set = f.$.store.set;
+  let failedWrites = 0;
+  f.$.store.set = async (name, value) => {
+    if (name === key && value.answeredTurn === 'turn-1') {
+      failedWrites++;
+      throw new Error('Final answer cache unavailable');
+    }
+    return set(name, value);
+  };
+  const first = await f.turn('DUET: --sandbox invalid\nReject before creating a job.', 1);
+  f.$.store.set = set;
+  assert.equal(first.status, 'blocked');
+  assert.ok(failedWrites > 0);
+  const store = f.readStore(), state = store[key];
+  assert.deepEqual([state.answeredTurn, state.jobId, state.threadId], [undefined, undefined, undefined]);
+  assert.equal(state.intent.turnId, 'turn-1');
+  assert.equal(store['native:closed:v1:native-session:native-agent'].turnId, state.intent.turnId);
+  f.reload();
+  const reply = await f.turn('DUET: --role debug\nReview again.', 2, false, { wake: true });
+  assert.equal(reply.status, 'blocked');
+  assert.equal(reply.summary, 'role flags apply to a fresh dispatch; follow-ups keep the recorded model and effort (use --model/--effort to change them)');
+  assert.equal(f.capture.processes.filter(p => p.request.argv[2] === 'task').length, 1);
+  assert.deepEqual(f.jobs(), []);
 });
 
 test('native role expansion checks the effective backend and installed Gemini executable', async () => {

@@ -20,6 +20,8 @@ export const COMMAND_OPTIONS = {
   roundtable: {
     valueOptions: ["intensity", "roles", "run", "cwd", "title", "label", "selects", "unreviewed"],
     repeatableOptions: ["persona-model"],
+    uniqueOptions: ["high-stakes"],
+    bareOptions: ["high-stakes"],
     booleanOptions: ["json", "high-stakes"]
   },
   forum: {
