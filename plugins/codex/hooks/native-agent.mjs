@@ -1319,7 +1319,7 @@ async function geminiMessageRefusal($, state, job, reply, oversized) {
   const reason = oversized === 'answer' || body.length > 8000 ? 'The answer exceeds the 8000-character limit.' : 'This message did not answer the pending question.';
   return { ...current, notice: reason + ' ' + geminiAnswerNext(state, question) };
 }
-async function drive($, e, state, progress) {
+async function drive($, e, state, progress, onLaunch) {
   if (state.isTeammate && state.v === undefined && !state.incoming && !state.intent && !state.jobId) {
     return blocked(`The host delivered no local loop start for this ${runtimeLabel(state)} teammate; use in-process teammate mode or a local subagent.`, state, 'native_teammate_unsupported');
   }
@@ -1345,7 +1345,10 @@ async function drive($, e, state, progress) {
   if (state.incoming?.turnId !== e.turnId && state.intent?.turnId !== e.turnId) return blocked('Native agent has no durable context for this turn, or another turn is still active.', state);
   let report;
   if (state.intent?.turnId === e.turnId) {
-    if (state.intent.kind === 'task') await reconcile($, state);
+    if (state.intent.kind === 'task') {
+      await reconcile($, state);
+      await onLaunch?.();
+    }
     // Re-entry after an answer never resubmits it. If the old question is still
     // pending, leave it parked; a new SendMessage can explicitly answer again.
     report = await companion($, state, ['wait', state.jobId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC], '', progress);
@@ -1385,7 +1388,6 @@ async function drive($, e, state, progress) {
           return companion($, state, ['result', state.jobId, '--report']);
         }
         if (ACTIVE.includes(job.status) || !ended(job, state)) return blocked('Roundtable notice is waiting for the current job to end.', state);
-        await settleRoundtableNotice($, notice, 'accepted');
       }
       const expiredAnswer = answeringDisplayedQuestion && !pending;
       if (expiredAnswer) {
@@ -1440,12 +1442,12 @@ async function drive($, e, state, progress) {
       if (hasRole && (state.intent || state.answeredTurn || state.threadId || state.jobId || parsed.flags.includes('--roundtable') || parsed.flags.includes('--fork'))) {
         return blocked(FRESH_ROLE_ERROR, state);
       }
+      let roundtable;
       if (parsed.flags.includes('--roundtable')) {
-        const binding = { roomId: parsed.flags[parsed.flags.indexOf('--roundtable') + 1], persona: parsed.flags[parsed.flags.indexOf('--persona') + 1] };
-        if (state.threadId && (state.roundtable?.roomId !== binding.roomId || state.roundtable?.persona !== binding.persona)) {
+        roundtable = { roomId: parsed.flags[parsed.flags.indexOf('--roundtable') + 1], persona: parsed.flags[parsed.flags.indexOf('--persona') + 1] };
+        if (state.threadId && (state.roundtable?.roomId !== roundtable.roomId || state.roundtable?.persona !== roundtable.persona)) {
           throw new Error('A native worker continuation keeps its original roundtable/persona binding.');
         }
-        state.roundtable = binding;
         if (state.threadId) for (const flag of ['--roundtable', '--persona']) parsed.flags.splice(parsed.flags.indexOf(flag), 2);
       }
       try { parsed = applyPreset(parsed, state.preset, state.permissionMode); }
@@ -1454,6 +1456,12 @@ async function drive($, e, state, progress) {
       if (!state.jobId && !state.threadId) delete state.backend;
       const backendAt = parsed.flags.indexOf('--backend');
       const backend = backendAt < 0 ? backendFor(state) : parsed.flags[backendAt + 1];
+      if (state.type === GEMINI_AGENT_TYPE && backend !== 'antigravity') {
+        return blocked(`${GEMINI_AGENT_TYPE} requires the antigravity backend; dispatch ${AGENT_TYPE} for --backend ${backend}.`, state, 'native_preset_backend');
+      }
+      if (isNativeType(state.type) && state.type !== GEMINI_AGENT_TYPE && backend === 'antigravity') {
+        return blocked(`${state.type} requires the codex backend; dispatch ${GEMINI_AGENT_TYPE} for --backend antigravity.`, state, 'native_preset_backend');
+      }
       if (state.threadId && backend !== backendFor(state)) {
         return blocked('A native worker continuation keeps its original backend. Start a new native agent to change it.', state, 'native_backend_changed');
       }
@@ -1478,6 +1486,7 @@ async function drive($, e, state, progress) {
         if (state.threadId && directory.realPath !== state.cwd) throw new Error('A native worker continuation must keep its original cwd. Use a new native agent for another workspace.');
         state.cwd = directory.realPath;
       }
+      if (roundtable) state.roundtable = roundtable;
       const attemptId = state.incoming.attemptId;
       state.intent = { session: state.session, agentId: e.agentId, turnId: e.turnId, kind: 'task',
         ...(attemptId ? { attemptId } : {}), nonce: nonceFor(state.session, e.agentId, attemptId || e.turnId) };
@@ -1520,8 +1529,10 @@ async function drive($, e, state, progress) {
     // The task process stays attached throughout the wait. Resolve handles
     // from its durable nonce reservation, never a short dispatch response.
     // If aborted before returning, cancel() resolves that same intent.
-    if (state.intent.kind === 'task') await reconcile($, state, false, false, { report });
-    else await handles($, state, state.jobId, false, true, { report });
+    if (state.intent.kind === 'task') {
+      await reconcile($, state, false, false, { report });
+      await onLaunch?.();
+    } else await handles($, state, state.jobId, false, true, { report });
   }
   await progress.start();
   for (;;) {
@@ -1677,7 +1688,7 @@ function observer() {
     }
   };
 }
-function progressFor($, e, state, publish, currentFlight) {
+function progressFor($, e, state, publish, currentFlight, onLaunch) {
   let starting, lookup, busy = false, keepaliveInFlight = false, stopped = false, lastAt, lastStreamedAt, startedAt;
   let enrichmentDeadline, enrichmentFailed = false, selectionTimer;
   let noticing = Promise.resolve();
@@ -1736,6 +1747,8 @@ function progressFor($, e, state, publish, currentFlight) {
         : reconcile($, observed, false, false, { persist: false, deadline });
       let job;
       try { job = await lookup; } finally { lookup = null; }
+      if (!active()) return;
+      if (observed.intent?.turnId === e.turnId && observed.intent?.kind === 'task') await onLaunch?.();
       if (!active()) return;
       const fields = ['jobId', 'ownerId', 'threadId', 'worker', ...(observed.backend ? ['backend'] : [])];
       for (const field of fields) state[field] = observed[field];
@@ -2232,8 +2245,18 @@ export function register(on) {
         restoreBinding(key, state);
         await prepareLifecycleStep($, e, state, { inspect: state => handles($, state, state.jobId, false, false),
           ended, save: state => save($, state) });
+        const turnNotice = (state.incoming?.turnId === e.turnId && state.incoming.notice) || notice;
+        let accepting = null, noticeAccepted = false;
+        const acceptNotice = async () => {
+          if (!turnNotice || turnNotice.duplicate || noticeAccepted) return;
+          accepting ??= settleRoundtableNotice($, turnNotice, 'accepted')
+            .then(() => { noticeAccepted = true; })
+            .catch(() => {})
+            .finally(() => { accepting = null; });
+          await accepting;
+        };
         const progress = progressFor($, e, state, text => Promise.all([...running.listeners].map(item => item.push(text))),
-          () => !running.done && dispatching.get(key) === running);
+          () => !running.done && dispatching.get(key) === running, acceptNotice);
         await progress.begin();
         // Pending process I/O suspends the hook budget. Timer callbacks only
         // wake the generator; never poll with clock.sleep (which spends it).
@@ -2243,7 +2266,7 @@ export function register(on) {
         const early = $.clock.after(EARLY_HANDLES_MS, () => progress.start().catch(() => {}));
         let report, uncertain = false, stopping = false;
         try {
-          report = await drive($, e, state, progress);
+          report = await drive($, e, state, progress, acceptNotice);
           if (state.type === GEMINI_AGENT_TYPE && report.status === 'needs_answer') {
             report = { ...report, next: geminiAnswerNext(state, report.question) };
           }
