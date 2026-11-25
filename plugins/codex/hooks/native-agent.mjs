@@ -2,10 +2,10 @@
 // No Node globals/imports in this sandbox; all host work goes through $.
 import { cleanDisplayText } from '../scripts/lib/display-text.mjs';
 import { lifecycleStoreSize, forgetLifecycle, pendingLifecycle, captureStartContext, lifecycleBrief, observeStop, prepareLifecycleStep, abandonLifecycleStop } from './lifecycle-hooks.mjs';
-import { registerSteering, geminiDelivery, deferredWake, displayedGeminiQuestion } from './steering.mjs';
+import { registerSteering } from './steering.mjs';
 import { registerRoundtableNotifier, startRoundtableNotifier, stopRoundtableMember, roundtableNotice, settleRoundtableNotice, isRoundtableNoticeTurn } from './roundtable-notifier.mjs';
 import { PERSONA_IDS } from '../scripts/lib/roundtable-personas.mjs';
-import { AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
+import { AGENT_TYPE, GEMINI_AGENT_TYPE, PRESETS, isNativeType, applyPreset } from './presets.mjs';
 import { PREFIX, BINDING_FAILED, keyFor, bindingFailedKey, startedTypes, knownTypes, ours } from './native-identity.mjs';
 import { register as teammateReceive, teammateUnsupported, paneTeammate } from './native-teams.mjs';
 import { cleanCommand, displayPath, quoteWord } from './command-display.mjs';
@@ -761,11 +761,21 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   if (count(report.blockersOmitted)) blockers.push(`+${report.blockersOmitted} more`);
   add('blocker', blockers.map(value => [span(value, 'warning')]), 'warning');
   const question = typeof report.question === 'string' ? { text: report.question } : report.question;
-  const questionLines = plain(question?.text) ? [[span(plain(question.text), 'warning')]] : [];
   const options = strings(question?.options).map((option, index) => `${index + 1}. ${option}`);
   if (count(question?.optionsOmitted)) options.push(`+${question.optionsOmitted} more`);
-  if (options.length) questionLines.push([span(options.join('  '), 'warning')]);
-  add('question', questionLines, 'warning');
+  if (report.backend === 'antigravity' && report.notice) add('notice', [[span(plain(report.notice), 'warning')]], 'warning');
+  if (question?.kind === 'action-approval' && typeof question.text === 'string') {
+    // Keep the operation and its choices together. Let the host wrap literal
+    // text so fact clipping cannot change a path or hide the end of an edit.
+    groups.push({ label: 'question', rows: [{ type: 'Box', props: { flexDirection: 'column' }, children: [
+      span('  question', 'warning'), span(question.text, 'warning', { wrap: 'wrap' }),
+      ...(options.length ? [span(options.join('  '), 'warning', { wrap: 'wrap' })] : [])
+    ] }] });
+  } else {
+    const questionLines = plain(question?.text) ? [[span(plain(question.text), 'warning')]] : [];
+    if (options.length) questionLines.push([span(options.join('  '), 'warning')]);
+    add('question', questionLines, 'warning');
+  }
   if (report.backend === 'antigravity' && report.next === GEMINI_FALLBACK) add('next', [[span(report.next)]]);
   // Reserve the last status and essential facts before allocating summary rows.
   const summary = typeof report.summary === 'string' && report.summary.trim() ? report.summary : '';
@@ -1022,7 +1032,6 @@ async function prune($, { reserveCount = 0, reserveSize = 0, keepKey, pending = 
     const expired = value => finished(value) && now - value.finishedAt > RETENTION_MS;
     const evictable = async value => {
       if (key === keepKey || dispatching.has(key) || pending(key)) return false;
-      if (value.deferredAssignments?.length && finished(value) && !expired(value)) return false;
       if (await pendingLifecycle($, value)) return false;
       if (unstarted(value)) {
         if (!unstartedSince.has(key)) unstartedSince.set(key, now);
@@ -1300,43 +1309,24 @@ async function drive($, e, state, progress) {
     let input = previousTurn ? coordinatorBody(state.incoming.text) : state.incoming.text, args, questionChanged = false, resumedWait = false;
     const notice = state.incoming.notice, previousAnswer = state.answer;
     if (notice?.duplicate) return previousAnswer || blocked('Roundtable notice already received; no work was repeated.', state);
-    const gemini = backendFor(state) === 'antigravity';
-    const delivery = previousTurn && gemini ? geminiDelivery(input) : null;
-    // A wake carries only the originating turn id. The retained binding owns
-    // the text, so repeated or stale wakes cannot launch the assignment twice.
-    const deferred = previousTurn && gemini && state.deferredAssignments?.find(item => input === deferredWake(item.id));
-    if (gemini && !delivery && /^\[Fugato Gemini resume [^\]\n]+\]$/.test(input) && !deferred) {
-      return previousAnswer || blocked('The deferred assignment was already handled.', state);
+    const answeringDisplayedQuestion = !notice && state.answer?.status === 'needs_answer';
+    const gemini = state.type === GEMINI_AGENT_TYPE;
+    if (!input.trim() && !(gemini && (answeringDisplayedQuestion || state.status === 'needs_answer'))) {
+      return blocked('Empty native-agent message; nothing was dispatched.', state);
     }
-    input = deferred?.text ?? delivery?.text ?? input;
-    // An unmarked Gemini follow-up is an assignment, even after a reload or
-    // if the sender could not resolve the agent while the message was queued.
-    const assignment = gemini && !delivery?.questionId;
-    const answeringDisplayedQuestion = !notice && !assignment && state.answer?.status === 'needs_answer';
-    if (!input.trim()) return blocked('Empty native-agent message; nothing was dispatched.', state);
+    let answerRefused = false;
     // Overlapping stop handlers may have saved a stale status; the job record
     // decides before a new message is routed as a dispatch or an answer.
-    if (state.jobId && (notice || previousAnswer?.status === 'needs_answer' || ACTIVE.includes(state.status) || state.status === 'needs_answer')) {
+    if (state.jobId && (notice || answeringDisplayedQuestion || ACTIVE.includes(state.status) || state.status === 'needs_answer')) {
       // Read only: the save below persists it together with the new intent.
       const job = await handles($, state, state.jobId, false, false);
       // questionId is the question last returned to Claude, never merely the
       // latest one read by a heartbeat, recovery or this pre-answer refresh.
       const pending = ACTIVE.includes(job.status) && job.pendingQuestion?.answer === undefined ? job.pendingQuestion : null;
-      questionChanged = pending?.id !== state.questionId || (delivery?.questionId && delivery.questionId !== pending?.id);
-      if (assignment && ACTIVE.includes(job.status)) {
-        if (!deferred) (state.deferredAssignments ??= []).push({ id: e.turnId, text: input });
-        state.intent = { kind: 'wait', turnId: e.turnId };
-        if (!pending) {
-          // An external answer may have resumed the old turn while this
-          // assignment was queued. Reattach until its actual result arrives.
-          resumedWait = true;
-        }
-      }
-      if (assignment && pending) {
-        state.status = 'needs_answer';
-        if (previousAnswer?.status === 'needs_answer' && previousAnswer.question?.id === pending.id) return previousAnswer;
-        const current = await companion($, state, ['result', state.jobId, '--report']);
-        return { ...current, next: nativeNext(state, current.status, current.blockers) };
+      questionChanged = pending?.id !== state.questionId;
+      if (gemini && pending && !notice) {
+        answerRefused = !answeringDisplayedQuestion || questionChanged || previousAnswer.question?.id !== pending.id
+          || (input !== 'Allow once' && input !== 'Deny');
       }
       // A pending question keeps the job running; its report says needs_answer.
       if (pending) state.status = 'needs_answer';
@@ -1386,16 +1376,11 @@ async function drive($, e, state, progress) {
     else if (state.status === 'needs_answer') {
       // Headers are task settings only. A question answer's body is verbatim.
       state.intent = { session: state.session, agentId: e.agentId, turnId: e.turnId, kind: 'answer', nonce: nonceFor(state.session, e.agentId, e.turnId) };
-      args = questionChanged
+      args = questionChanged || answerRefused
         ? ['wait', state.jobId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC]
         : ['answer', state.jobId, '--question', state.questionId, '--owner', state.ownerId, '--timeout-sec', WAIT_TIMEOUT_SEC];
-      if (questionChanged) input = '';
+      if (questionChanged || answerRefused) input = '';
     } else {
-      if (delivery?.questionId) return previousAnswer || blocked('The addressed Gemini question has already ended.', state);
-      if (deferred) {
-        state.deferredAssignments = state.deferredAssignments.filter(item => item.id !== deferred.id);
-        if (!state.deferredAssignments.length) delete state.deferredAssignments;
-      }
       let parsed = parsePrompt(input);
       if (!parsed.brief.trim()) return blocked('Empty native-agent brief after DUET header; nothing was dispatched.', state);
       if (parsed.flags.includes('--roundtable')) {
@@ -1451,7 +1436,9 @@ async function drive($, e, state, progress) {
       catch (error) { error.launchNotStarted = true; throw error; }
       if (state.intent.kind === 'task') input = await lifecycleBrief($, state, input);
       report = await companion($, state, args, input, progress);
-      if (resumedWait && state.intent.kind === 'answer' && report && typeof report === 'object') report = { ...report,
+      if (answerRefused) report = { ...report,
+        notice: 'Your message was not delivered as an assignment. Answer the displayed permission question with exactly Allow once or Deny.' };
+      if (resumedWait && report && typeof report === 'object') report = { ...report,
         notice: `The earlier question had already expired or been answered; this message was not delivered to ${runtimeLabel(state)}. Waited for the running job instead.` };
     }
     catch (error) {
@@ -1769,7 +1756,7 @@ function progressFor($, e, state, publish, currentFlight) {
 }
 
 export function register(on) {
-  registerSteering(on);
+  registerSteering(on, dispatching);
   registerRoundtableNotifier(on);
   guidanceCache = null;
   teammateReceive(on);
@@ -2030,10 +2017,12 @@ export function register(on) {
           await Promise.all(own.map(binding => binding.pending));
           state = await $.store.get(key);
         }
-        // Reject oversized input before recheck, pruning or any binding write.
-        if (e.text.length > 65536) {
-          const delivery = backendFor(state || agent) === 'antigravity' && geminiDelivery(coordinatorBody(e.text));
-          if (!delivery || delivery.text.length > 65536) return await refuse('native_message_too_large');
+        let incomingText = e.text;
+        if (incomingText.length > 65536) {
+          // Neither permission choice can be oversized. Re-show the question
+          // through the ordinary invalid-answer path without retaining the text.
+          if (agent.type !== GEMINI_AGENT_TYPE || state?.answer?.status !== 'needs_answer') return await refuse('native_message_too_large');
+          incomingText = '';
         }
         rememberPrompt($, e);
         if (state) restoreBinding(key, state);
@@ -2052,7 +2041,7 @@ export function register(on) {
         if (refusals.get(key)?.report.blockers[0].code === 'native_binding_gone') return await refuse('native_binding_gone');
         refusals.delete(key);
         candidate = { ...(state || { type: agent.type || AGENT_TYPE, session, agentId: e.agentId, name: (agent.name !== e.agentId && agent.name) || observedBindings.get(key)?.name,
-          bindingPending: !observedBindings.has(key) }), turnId: e.turnId, incoming: { turnId: e.turnId, text: e.text, ...(notice ? { notice } : {}) } };
+          bindingPending: !observedBindings.has(key) }), turnId: e.turnId, incoming: { turnId: e.turnId, text: incomingText, ...(notice ? { notice } : {}) } };
         bindingFailed = await $.store.get(bindingFailedKey(session, e.agentId));
         if (bindingFailed) candidate.bindingPending = true;
         restoreBinding(key, candidate);
@@ -2198,11 +2187,7 @@ export function register(on) {
           // questionId means shown to Claude, not observed in the job. Earlier
           // saves can fail and turn the response into blocked; only this path
           // commits the question whose needs_answer report we actually return.
-          if (report.status === 'needs_answer') {
-            const id = report.question?.id ?? null;
-            if (id && id !== state.questionId && backendFor(state) === 'antigravity') displayedGeminiQuestion(id);
-            state.questionId = id;
-          }
+          if (report.status === 'needs_answer') state.questionId = report.question?.id ?? null;
           try { await save($, state); }
           catch (error) {
             // The companion may already have marked a terminal report as
@@ -2278,27 +2263,7 @@ export function register(on) {
         await stopJob($, state, deadline);
       }
     }
-    const result = await next(e);
-    if (!e.isAborted && e.agentId && typeof e.answer === 'string' && e.answer.includes('"backend":"antigravity"')) {
-      const state = await $.store.get(keyFor(await $.session.id(), e.agentId));
-      if (state?.turnId === e.turnId && backendFor(state) === 'antigravity' && state.deferredAssignments?.length
-        && ['answer', 'wait'].includes(state.intent?.kind) && state.answeredTurn === e.turnId && state.answer?.jobId === state.jobId
-        && !state.answer?.blockers?.some(blocker => blocker.code === 'thread_busy')
-        && ENDED.includes(state.status) && state.answer.status === state.status) {
-        // Hand the queued turns back to the host in arrival order. Keep each
-        // brief until the receiving turn consumes it with its dispatch intent.
-        for (const item of state.deferredAssignments) {
-          const sent = await $.session.send({ to: state.agentId, text: deferredWake(item.id) })
-            .catch(() => ({ isDelivered: false, reason: 'host delivery unconfirmed' }));
-          if (!sent.isDelivered) {
-            await $.session.append({ agentId: e.agentId, message: { type: 'system',
-              content: [{ type: 'text', text: `Gemini follow-up remains queued: ${sent.reason}` }] } });
-            break;
-          }
-        }
-      }
-    }
-    return result;
+    return next(e);
   }).catch(passthrough);
   // Register last: a partial native registration never advertises readiness.
   // Announce on the first prompt a person sends that reaches the model; a slash
