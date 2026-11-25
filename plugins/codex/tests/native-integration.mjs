@@ -543,6 +543,50 @@ test('roundtable notifier never wakes stopped, closed, paused, ambiguous or unre
   assert.deepEqual(roundtableWakes(f), []);
 });
 
+test('roundtable notifier rebinds after an abandoned unstarted job and ignores the old agent', async () => {
+  const f = fixture('review-ok', 'critic'), rt = nativeRoom(f);
+  const roundtable = { roomId: rt.room.roomId, persona: 'critic' };
+  const abandoned = { v: 2, type: AGENT_TYPE, session: 'native-session', agentId: 'abandoned-agent', name: 'critic',
+    cwd: `${f.root}/repo`, roundtable, jobId: 'task-abandoned', ownerId: 'owner-old', threadId: null, status: 'failed', finishedAt: 1800000000000 };
+  await f.$.store.set('native:v2:native-session:abandoned-agent', abandoned);
+  const rtKey = `native:roundtable:v1:native-session:${rt.room.roomId}:critic`;
+  await f.$.store.set(rtKey, { attempt: { maxSeq: 1, text: 'stale', wake: true, jobId: 'task-abandoned', phase: 'ready', readyAt: 1800000000000, deliveryId: `roundtable:${rt.room.roomId}:critic:1` } });
+  const fresh = await f.turn(rt.header + 'Fresh replacement seat dispatch.', 1, false, { agentId: 'replacement-agent' });
+  assert.equal(fresh.status, 'completed', JSON.stringify(fresh));
+  const currentJob = f.jobs()[0];
+  assert.equal(f.readStore()['native:v2:native-session:replacement-agent'].jobId, currentJob.id);
+  const decision = rt.post('decision');
+  const queriedJobs = [];
+  const run = f.$.process.run;
+  f.$.process.run = async (argv, init) => {
+    if (argv[2] === 'status' && argv[3] !== '--all') queriedJobs.push(argv[3]);
+    const result = await run(argv, init);
+    if (argv[2] === 'roundtable' && argv[3] === 'status' && result.exitCode === 0) {
+      const status = JSON.parse(result.stdout);
+      status.members[0].abandonedJobIds = ['task-abandoned'];
+      return { ...result, stdout: JSON.stringify(status) };
+    }
+    return result;
+  };
+  const activeAgents = await f.$.agent.list();
+  activeAgents[0].status = 'completed';
+  f.$.agent.list = async () => [{ id: 'abandoned-agent', type: AGENT_TYPE, name: 'critic', status: 'killed' }, ...activeAgents];
+  const tick = await notifierTick(f);
+  await tick(); await wakePass(f);
+  assert.equal(queriedJobs.includes('task-abandoned'), false);
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].status, 'active');
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, 0);
+  assert.equal(roundtableWakes(f).length, 1);
+  assert.equal(roundtableWakes(f)[0].to, 'replacement-agent');
+  f.$.agent.list = async () => [{ id: 'abandoned-agent', type: AGENT_TYPE, name: 'critic', status: 'killed' }];
+  const now = await f.$.clock.now(); f.$.clock.now = async () => now + 125000;
+  await tick(); await wakePass(f);
+  assert.equal(roundtableWakes(f).length, 2);
+  assert.equal(roundtableWakes(f)[1].to, 'replacement-agent');
+  assert.equal(queriedJobs.includes('task-abandoned'), false);
+  assert.equal(decision.seq, 1);
+});
+
 test('roundtable notifier coalesces chair mentions and open requests into one notice per seq', async () => {
   const f = fixture('review-ok', 'critic'), rt = nativeRoom(f);
   postEvent(rt.room.roomId, 'critic', { kind: 'finding', title: 'Chair evidence', body: 'Observed', mentions: ['chair'] }, rt.env);
@@ -628,6 +672,34 @@ test('roundtable wake claims reconcile receipts or retry once on the same idle j
   assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, event.seq);
   await receiveNotice(f, roundtableWakes(f)[0], 3);
   assert.equal(f.jobs().length, 2, 'A duplicate host delivery cannot dispatch twice');
+});
+
+test('roundtable wake receipt stays unsettled when a pre-launch check fails and retries once', async () => {
+  const f = fixture('review-ok', 'critic'), rt = nativeRoom(f);
+  const { bindingKey, rtKey } = await geminiSeat(f, rt);
+  const decision = rt.post('decision');
+  let now = await f.$.clock.now(); f.$.clock.now = async () => now;
+  const tick = await notifierTick(f);
+  await tick(); await wakePass(f);
+  assert.equal(roundtableWakes(f).length, 1);
+  await f.$.store.set(bindingKey, { ...f.readStore()[bindingKey], permissionMode: 'plan' });
+  const refused = await receiveNotice(f, roundtableWakes(f)[0], 2);
+  assert.equal(refused.status, 'blocked');
+  assert.equal(refused.blockers[0].code, 'native_plan_mode_read_only');
+  assert.equal(f.jobs().length, 1);
+  assert.equal(f.readStore()[rtKey].receipt.status, 'received');
+  await tick();
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, 0);
+  await f.$.store.set(bindingKey, { ...f.readStore()[bindingKey], permissionMode: 'default' });
+  now += 120001; await tick(); await wakePass(f);
+  assert.equal(roundtableWakes(f).length, 2);
+  const launched = await receiveNotice(f, roundtableWakes(f)[1], 3);
+  assert.equal(launched.status, 'completed', JSON.stringify(launched));
+  assert.equal(f.jobs().length, 2);
+  assert.equal(f.readStore()[rtKey].receipt.status, 'accepted');
+  updateMember(rt.room.roomId, 'critic', { jobIds: [launched.jobId] }, rt.env);
+  await tick();
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, decision.seq);
 });
 
 test('a stalled wake send releases the chair tool result and later notifier passes', async () => {
@@ -842,6 +914,113 @@ test('roundtable wake reports a removed member workspace once to the chair', asy
   assert.equal(notices.length, 1); assert.match(notices[0].message.content[0].text, /critic cannot continue/);
   assert.equal(f.jobs().length, 1);
   assert.deepEqual(roundtableWakes(f), []);
+});
+
+async function geminiSeat(f, rt, isActive = () => false) {
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(`${f.root}/acp`, { behavior: 'worker-report' }).binary;
+  const first = await f.turn('Give an independent first result.', 1, false, { agentType: 'fugato:gemini-native' });
+  assert.equal(first.status, 'completed', JSON.stringify(first));
+  const initial = f.jobs()[0], roundtable = { roomId: rt.room.roomId, persona: 'critic' };
+  const bindingKey = 'native:v2:native-session:native-agent', rtKey = `native:roundtable:v1:native-session:${rt.room.roomId}:critic`;
+  await f.$.store.set(bindingKey, { ...f.readStore()[bindingKey], roundtable });
+  updateMember(rt.room.roomId, 'critic', { status: 'active', jobIds: [initial.id], threadId: initial.threadId }, rt.env);
+  const run = f.$.process.run;
+  f.$.process.run = async (argv, init) => {
+    const result = await run(argv, init);
+    if (argv[2] === 'status' && argv[3] !== '--all' && result.exitCode === 0) {
+      const snapshot = JSON.parse(result.stdout);
+      if (snapshot.job) {
+        snapshot.job.request = { ...snapshot.job.request, roundtable };
+        if (isActive(snapshot.job)) snapshot.job.status = 'running';
+        return { ...result, stdout: JSON.stringify(snapshot) };
+      }
+    }
+    return result;
+  };
+  return { first, initial, bindingKey, rtKey };
+}
+
+test('roundtable notifier holds Gemini notices while active, finishes non-wake and wakes after turn end', async () => {
+  const f = fixture('review-ok', 'critic'), rt = nativeRoom(f);
+  let activeJob = true;
+  const { initial, rtKey } = await geminiSeat(f, rt, job => activeJob && job.id === initial.id);
+  const idea = postEvent(rt.room.roomId, 'critic', { kind: 'idea', body: 'Independent record' }, rt.env);
+  const reply = postEvent(rt.room.roomId, 'chair', { kind: 'finding', body: 'Reply without mention', replyTo: idea.seq }, rt.env);
+  const log = `${f.root}/isolated/duet/roundtables/${rt.room.roomId}/events.jsonl`;
+  fs.writeFileSync(log, fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.stringify({ ...JSON.parse(line), at: '2020-01-01T00:00:00.000Z' })).join('\n') + '\n');
+  let now = await f.$.clock.now(); f.$.clock.now = async () => now;
+  const tick = await notifierTick(f);
+  await tick(); now += 125000; await tick(); await wakePass(f);
+  assert.equal(f.capture.processes.filter(call => call.request.argv[2] === 'steer').length, 0);
+  assert.equal(f.readStore()[rtKey], undefined);
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, 0);
+  assert.equal(f.capture.notices.filter(notice => notice.message.content[0].text.includes('have updates waiting')).length, 0);
+  assert.deepEqual(roundtableWakes(f), []);
+  activeJob = false; now += 5001; await tick();
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, reply.seq);
+  assert.deepEqual(roundtableWakes(f), []);
+  const decision = rt.post('decision');
+  activeJob = true; now += 5001; await tick(); now += 125000; await tick(); await wakePass(f);
+  assert.equal(f.capture.processes.filter(call => call.request.argv[2] === 'steer').length, 0);
+  assert.equal(f.readStore()[rtKey].attempt, undefined);
+  assert.equal(f.capture.notices.filter(notice => notice.message.content[0].text.includes('have updates waiting')).length, 0);
+  assert.deepEqual(roundtableWakes(f), []);
+  activeJob = false; now += 5001; await tick();
+  assert.equal(f.readStore()[rtKey].attempt.phase, 'ready');
+  await wakePass(f);
+  assert.equal(roundtableWakes(f).length, 1);
+  const followup = await receiveNotice(f, roundtableWakes(f)[0], 2);
+  assert.equal(followup.status, 'completed', JSON.stringify(followup));
+  const second = f.jobs().find(job => job.id === followup.jobId);
+  assert.equal(second.threadId, initial.threadId);
+  assert.equal(second.request.backend, 'antigravity');
+  assert.equal(f.readStore()[rtKey].receipt.status, 'accepted');
+  updateMember(rt.room.roomId, 'critic', { jobIds: [second.id] }, rt.env);
+  await tick();
+  assert.equal(readRoom(rt.room.roomId, rt.env).members[0].notifiedSeq, decision.seq);
+});
+
+test('roundtable notifier reverts undelivered wakes to ready without consuming the single retry', async () => {
+  const gf = fixture('review-ok', 'critic'), grt = nativeRoom(gf);
+  const { rtKey: gKey } = await geminiSeat(gf, grt);
+  grt.post('decision');
+  let gNow = await gf.$.clock.now(); gf.$.clock.now = async () => gNow;
+  const gTick = await notifierTick(gf);
+  gf.$.session.send = input => gf.invoke('session.send', { ...input, origin: { kind: 'plugin' } }, async e => {
+    gf.wakes.push(clone(e));
+    return { isDelivered: true };
+  });
+  const gAgent = (await gf.$.agent.list())[0];
+  gAgent.status = 'running';
+  await gTick(); await wakePass(gf);
+  assert.deepEqual(roundtableWakes(gf), []);
+  assert.equal(gf.readStore()[gKey].attempt.phase, 'ready');
+  assert.equal(gf.readStore()[gKey].attempt.sentAt, undefined);
+  assert.equal(gf.readStore()[gKey].attempt.retried, undefined);
+  gAgent.status = 'completed'; gNow += 5001;
+  await wakePass(gf);
+  assert.equal(roundtableWakes(gf).length, 1);
+  assert.equal(gf.readStore()[gKey].attempt.phase, 'wake');
+  assert.equal(gf.readStore()[gKey].attempt.retried, undefined);
+  gNow += 120001; await gTick(); await wakePass(gf);
+  assert.equal(roundtableWakes(gf).length, 2);
+  assert.equal(gf.readStore()[gKey].attempt.retried, true);
+
+  const cf = fixture('review-ok', 'critic'), crt = nativeRoom(cf);
+  await cf.turn(crt.header + 'Finish first.', 1);
+  (await cf.$.agent.list())[0].status = 'completed';
+  crt.post('decision');
+  let cNow = await cf.$.clock.now(); cf.$.clock.now = async () => cNow;
+  const cTick = await notifierTick(cf), cKey = `native:roundtable:v1:native-session:${crt.room.roomId}:critic`;
+  const deliver = cf.$.session.send; let refuse = true;
+  cf.$.session.send = async input => refuse ? { isDelivered: false, reason: 'host_busy' } : deliver(input);
+  await cTick(); await wakePass(cf);
+  assert.deepEqual(roundtableWakes(cf), []);
+  assert.equal(cf.readStore()[cKey].attempt.phase, 'ready');
+  assert.equal(cf.readStore()[cKey].attempt.retried, undefined);
+  refuse = false; cNow += 5001; await wakePass(cf);
+  assert.equal(roundtableWakes(cf).length, 1);
+  assert.equal(cf.readStore()[cKey].attempt.retried, undefined);
 });
 
 test('running Codex workers refuse role headers before steering or queuing a delivery', async () => {
@@ -1499,6 +1678,65 @@ test('native Gemini worker dispatches ACP, keeps its backend on reload and omits
   const conflict = await f.turn('DUET: --backend codex\nChange this worker backend.', 3, false, { wake: true });
   assert.equal(conflict.blockers[0].code, 'native_preset_backend');
   assert.equal(f.jobs().length, 2);
+});
+
+test('native Gemini roundtable header parses, binds state.roundtable, and rejects agent-type/backend mismatches', async () => {
+  const f = fixture('review-ok', 'critic', { hostOnly: true, memoryStore: true });
+  const ws = fs.mkdtempSync(path.join(f.root, 'seat-ws-'));
+  const realWs = fs.realpathSync(ws);
+  const roomId = 'rt-test-gemini', spawns = [], stubJobs = [];
+  let seq = 0;
+  f.$.process.spawn = request => {
+    spawns.push(clone(request));
+    const nonce = request.argv[request.argv.indexOf('--dispatch-nonce') + 1];
+    const jobId = `task-gem-${++seq}`;
+    const report = { status: 'completed', worker: 'critic', jobId, backend: 'antigravity', provider: 'Google Antigravity',
+      summary: 'Done.', next: null, details: null };
+    stubJobs.push({ id: jobId, sessionId: 'native-session', status: 'completed', dispatchNonce: nonce,
+      threadId: 'acp-thread-1', ownerId: 'owner-1', agentName: 'critic',
+      request: { backend: 'antigravity', cwd: realWs, roundtable: { roomId, persona: 'critic' } } });
+    const stream = (async function* () { yield { stream: 'stdout', text: JSON.stringify(report) + '\n' }; })();
+    return Object.assign(stream, { result: Promise.resolve({ code: 0, signal: null }) });
+  };
+  f.$.process.run = async argv => {
+    if (argv[0] === 'node') return { exitCode: 0, stdout: process.execPath + '\n', stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
+    if (argv[2] === 'status' && argv[3] === '--all') {
+      return { exitCode: 0, stdout: JSON.stringify({ running: [], latestFinished: stubJobs.at(-1) ?? null, recent: stubJobs.slice(0, -1) }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
+    }
+    if (argv[2] === 'status') {
+      return { exitCode: 0, stdout: JSON.stringify({ job: stubJobs.find(item => item.id === argv[3]) }), stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
+    }
+    return { exitCode: 0, stdout: '{}', stderr: '', isStdoutTruncated: false, isStderrTruncated: false };
+  };
+  const header = `DUET: --backend antigravity --model gemini-4-neon --effort high --roundtable ${roomId} --persona critic --cwd "${ws}"\n`;
+  const first = await f.turn(header + 'Give an independent first result.', 1, false, { agentType: 'fugato:gemini-native' });
+  assert.equal(first.status, 'completed', JSON.stringify(first));
+  const state = f.readStore()['native:v2:native-session:native-agent'];
+  assert.deepEqual(state.roundtable, { roomId, persona: 'critic' });
+  assert.equal(state.backend, 'antigravity');
+  assert.equal(state.cwd, realWs);
+  for (const [flag, value] of [['--backend', 'antigravity'], ['--model', 'gemini-4-neon'], ['--effort', 'high'],
+    ['--roundtable', roomId], ['--persona', 'critic'], ['--agent-type', 'fugato:gemini-native']]) {
+    assert.equal(spawns[0].argv[spawns[0].argv.indexOf(flag) + 1], value);
+  }
+  const second = await f.turn(header + 'Continue the same roundtable.', 2, false, { agentType: 'fugato:gemini-native' });
+  assert.equal(second.status, 'completed', JSON.stringify(second));
+  assert.equal(spawns[1].argv.includes('--roundtable'), false);
+  assert.equal(spawns[1].argv.includes('--persona'), false);
+  assert.equal(spawns[1].argv[spawns[1].argv.indexOf('--thread') + 1], 'acp-thread-1');
+
+  for (const [agentType, flags] of [
+    [AGENT_TYPE, `--backend antigravity --roundtable ${roomId} --persona critic`],
+    ['fugato:codex-reviewer', '--backend antigravity'],
+    ['fugato:gemini-native', '--backend codex']
+  ]) {
+    const mismatch = fixture('review-ok', 'critic', { hostOnly: true, memoryStore: true });
+    const refused = await mismatch.turn(`DUET: ${flags}\nWrong backend.`, 1, false, { agentType });
+    assert.equal(refused.status, 'blocked');
+    assert.equal(refused.blockers[0].code, 'native_preset_backend');
+    assert.equal(mismatch.capture.processes.length, 0);
+    assert.equal(mismatch.readStore()['native:v2:native-session:native-agent'].roundtable, undefined);
+  }
 });
 
 const geminiType = 'fugato:gemini-native';

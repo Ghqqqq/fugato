@@ -170,6 +170,7 @@ async function syncStop($, record, deadline, lease) {
 }
 
 async function resolveMember($, entry, session, lease) {
+  if (!entry.jobIds?.length) return null;
   const candidates = [];
   for (const agent of await observed($, lease, () => $.agent.list())) {
     const state = await observed($, lease, () => $.store.get(keyFor(session, agent.id)));
@@ -177,8 +178,9 @@ async function resolveMember($, entry, session, lease) {
         || await observed($, lease, () => $.store.get(bindingFailedKey(session, agent.id)))) continue;
     if (!isNativeType(agent.type) && !(isNativeType(state.type) && sameRoom(state.roundtable, entry))) continue;
     if (state.roundtable && !sameRoom(state.roundtable, entry)) continue;
-    if ((state.jobId && entry.jobIds?.includes(state.jobId)) || (state.threadId && state.threadId === entry.threadId)
-        || sameRoom(state.roundtable, entry) || agent.name === entry.name) candidates.push({ agent, state });
+    if (!state.jobId || !entry.jobIds.includes(state.jobId) || entry.abandonedJobIds?.includes(state.jobId)
+        || (entry.threadId && state.threadId && state.threadId !== entry.threadId)) continue;
+    candidates.push({ agent, state });
   }
   // The host stops listing an agent once its run ends, which is exactly when a
   // wake is needed. Fall back to this session's durable native bindings, which
@@ -191,13 +193,13 @@ async function resolveMember($, entry, session, lease) {
       const state = await observed($, lease, () => $.store.get(key));
       if (!state || state.session !== session || !state.agentId || key !== keyFor(session, state.agentId)
           || state.bindingPending || !state.cwd || !isNativeType(state.type) || !sameRoom(state.roundtable, entry)
-          || !entry.jobIds?.includes(state.jobId) || (entry.threadId && state.threadId !== entry.threadId)
+          || !state.jobId || !entry.jobIds.includes(state.jobId) || entry.abandonedJobIds?.includes(state.jobId)
+          || (entry.threadId && state.threadId !== entry.threadId)
           || await observed($, lease, () => $.store.get(bindingFailedKey(session, state.agentId)))) continue;
       candidates.push({ agent: { id: state.agentId, name: state.name, type: state.type }, state });
     }
   }
-  // An exact id/thread and a second matching name are still ambiguous. Never
-  // choose whichever entry $.agent.list happened to return first.
+  // Multiple bindings claiming the same current job remain ambiguous.
   return candidates.length === 1 ? candidates[0] : null;
 }
 
@@ -242,11 +244,12 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
   if (!sameRoom(state.roundtable, entry) && !member.jobIds?.includes(state.jobId)
       && !(state.threadId && state.threadId === member.threadId)) return;
   if (member.status === 'stopped') { await finish(maxSeq); return; }
+  if (!state.jobId || !member.jobIds?.includes(state.jobId) || member.abandonedJobIds?.includes(state.jobId)) return;
   if (agent.status === 'killed' || stopped(state) || (await read($, stopKey(state), lease)).roomId) {
     await stopRoundtableMember($, { ...state, roundtable: { roomId: entry.roomId, persona: entry.persona } }, lease);
     await finish(maxSeq); return;
   }
-  if (state.incoming || !state.jobId || !member.jobIds?.includes(state.jobId)) return;
+  if (state.incoming) return;
   if (!await workspaceAvailable($, state, entry, key, lease)) return;
   const { job, recovery } = await run($, state, ['status', state.jobId, '--json'], { deadline, lease });
   if (job?.id !== state.jobId || job.sessionId !== context.session || !sameRoom(job.request?.roundtable, entry)
@@ -261,6 +264,10 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
   if (job.pendingQuestion && job.pendingQuestion.answer === undefined) return;
   if (state.status === 'needs_answer' || state.answer?.status === 'needs_answer') return;
   let attempt = record.attempt;
+  if (attempt && member.abandonedJobIds?.includes(attempt.jobId)) {
+    record = await change($, key, current => ({ ...current, attempt: undefined, receipt: undefined }), lease);
+    attempt = undefined;
+  }
   // A newer job proves the member moved on (woken by this notice or continued
   // by hand), so an uncertain older notice is settled instead of blocking all
   // later ones. Otherwise reconcile a recipient receipt or retry the idle wake.
@@ -288,6 +295,7 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
     attempt = { ...attempt, phase: 'idle', retried: true };
   }
   if (!attempt) {
+    if (job.request?.backend === 'antigravity' && active(job)) return;
     if (!active(job) && !ended(job, state)) return;
     if (!active(job) && !entry.wake) { await finish(maxSeq); return; }
     const text = entry.text;
@@ -326,7 +334,8 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
   const latestMember = current.members?.find(member => member.name === entry.name && member.persona === entry.persona);
   if (!latest || latest.agent.id !== agent.id || latest.agent.status === 'killed' || stopped(latest.state)
       || (await read($, stopKey(state), lease)).roomId || current.sessionId !== context.session || current.status !== 'open'
-      || !latestMember || latestMember.status === 'stopped' || !latestMember.jobIds?.includes(attempt.jobId)) return;
+      || !latestMember || latestMember.status === 'stopped' || !latestMember.jobIds?.includes(attempt.jobId)
+      || latestMember.abandonedJobIds?.includes(attempt.jobId)) return;
   if (latest.state.incoming || latest.state.jobId !== attempt.jobId
       || !sameRoom(latest.state.roundtable, entry)
       || latest.state.status === 'needs_answer' || latest.state.answer?.status === 'needs_answer') return;
@@ -339,7 +348,15 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
       || active(fresh.job) || !ended({ ...fresh.job, recovery: fresh.recovery }, latest.state)) return;
   const sentAt = await observed($, lease, () => $.clock.now());
   await change($, key, current => ({ ...current, attempt: { ...attempt, phase: 'wake', sentAt } }), lease);
-  await observed($, lease, () => $.session.send({ to: latest.agent.id, text: attempt.text }));
+  const sent = await observed($, lease, () => $.session.send({ to: latest.agent.id, text: attempt.text }));
+  if (sent?.isDelivered === false || sent?.deny !== undefined) {
+    const { sentAt: _sentAt, ...ready } = attempt;
+    await change($, key, current => current.attempt?.deliveryId === attempt.deliveryId
+      && current.attempt.phase === 'wake' && current.attempt.sentAt === sentAt
+      && !(current.receipt?.deliveryId === attempt.deliveryId && current.receipt.status === 'accepted')
+      ? { ...current, attempt: ready } : current, lease);
+    return;
+  }
   // Queuing alone is insufficient: only the recipient can accept the notice.
   record = await read($, key, lease);
   if (record.receipt?.deliveryId === attempt.deliveryId && record.receipt.status === 'accepted') await finish(attempt.maxSeq);
