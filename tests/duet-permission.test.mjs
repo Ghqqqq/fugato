@@ -96,17 +96,32 @@ test("fresh Gemini dispatches respect Antigravity options and saved permission s
     const invoke = flags => approveDuet(input(heredoc(["fugato task --backend antigravity", selection, flags].filter(Boolean).join(" "))), env);
     fs.writeFileSync(config, 'default_max_tokens = 100\n');
     for (const flags of ["--sandbox read-only", "--sandbox workspace-write", "--fast", "--max-tokens 10",
-      "--fork", "--roundtable rt-test-room --persona critic"]) {
+      "--fork", ...(selection.includes("--role") ? ["--roundtable rt-test-room --persona critic"] : [])]) {
       assert.deepEqual(invoke(flags), {}, flags);
+    }
+    if (!selection.includes("--role")) {
+      assert.equal(invoke("--roundtable rt-test-room --persona critic").hookSpecificOutput.permissionDecision, "allow");
+      for (const bad of ["--roundtable rt-test-room", "--persona critic", "--roundtable bad-id --persona critic",
+        "--roundtable rt-test-room --persona outsider", "--roundtable rt-test-room --persona critic --sandbox read-only",
+        "--roundtable rt-test-room --persona critic --fast"]) {
+        assert.deepEqual(invoke(bad), {}, bad);
+      }
     }
     assert.equal(invoke("--normal --max-minutes 2").hookSpecificOutput.permissionDecision, "allow");
     assert.equal(invoke("--fast=false").hookSpecificOutput.permissionDecision, "allow");
     fs.writeFileSync(config, 'default_sandbox = "read-only"\n');
     assert.deepEqual(invoke(), {});
+    if (!selection.includes("--role")) assert.deepEqual(invoke("--roundtable rt-test-room --persona critic"), {});
     assert.equal(invoke("--sandbox danger-full-access").hookSpecificOutput.permissionDecision, "allow");
     fs.writeFileSync(config, 'permission_mapping = "claude"\n');
     assert.deepEqual(invoke("--sandbox danger-full-access"), {});
+    if (!selection.includes("--role")) assert.deepEqual(invoke("--sandbox danger-full-access --roundtable rt-test-room --persona critic"), {});
   }
+  const seatOnly = flags => approveDuet(input(heredoc(`fugato task ${flags}`)), env);
+  fs.writeFileSync(config, 'default_max_tokens = 100\n');
+  assert.equal(seatOnly("--backend antigravity --roundtable rt-test-room --persona critic").hookSpecificOutput.permissionDecision, "allow");
+  assert.deepEqual(seatOnly("--backend antigravity --model gpt-6.2-sol --roundtable rt-test-room --persona critic"), {});
+  assert.deepEqual(seatOnly("--model gemini-4-neon --roundtable rt-test-room --persona critic"), {});
 });
 
 test("permission grammar rejects unsafe commands and untrusted bindings while quoting approved commands literally", () => {

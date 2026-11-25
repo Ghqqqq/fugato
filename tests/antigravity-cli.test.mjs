@@ -243,7 +243,7 @@ test("Google dispatch refuses unsupported safety and Codex-only options before l
     ["write=false", ["--write=false"]],
     ["plan mode", ["--claude-permission-mode", "plan"]],
     ["fork", ["--fork"]],
-    ["roundtable", ["--roundtable", "rt-fixture-room", "--persona", "critic"]],
+    ["non-gemini model", ["--model", "gpt-6.2-sol"]],
     ["token budget", ["--max-tokens", "200"]],
     ["fast tier", ["--fast"]],
     ["browser grants", ["--approve-browser-origin", "https://example.com"]],
@@ -254,6 +254,14 @@ test("Google dispatch refuses unsupported safety and Codex-only options before l
     const result = f.call("task", "--backend", "antigravity", ...flags, "--json", "Complete the fixture.");
     assert.notEqual(result.status, 0);
     assert.match(result.stderr + result.stdout, /Antigravity|ACP|backend/i);
+    assert.equal(f.requests().length, 0);
+    assertNoCodex(f);
+  });
+  await t.test("roundtable is no longer refused as unsupported", () => {
+    const f = fixture(); f.env.CODEX_COMPANION_BIN = f.codexTrap;
+    const result = f.call("task", "--backend", "antigravity", "--roundtable", "rt-fixture-room", "--persona", "critic", "--json", "Complete the fixture.");
+    assert.notEqual(result.status, 0);
+    assert.doesNotMatch(result.stderr + result.stdout, /not supported yet/i);
     assert.equal(f.requests().length, 0);
     assertNoCodex(f);
   });

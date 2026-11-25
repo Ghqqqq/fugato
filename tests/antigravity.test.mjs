@@ -8,6 +8,7 @@ import { AcpClient } from "../plugins/codex/scripts/lib/acp-client.mjs";
 import { upsertJob, readJobFile, resolveJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { formatActivity } from "../plugins/codex/scripts/lib/activity.mjs";
 import { parseStructuredReport } from "../plugins/codex/scripts/lib/worker-report.mjs";
+import { parentBridgeConfig } from "../plugins/codex/scripts/lib/codex.mjs";
 import { ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "../plugins/codex/scripts/lib/antigravity.mjs";
 
 function fixture(t, options = "normal", version = "1.5.16") {
@@ -416,7 +417,8 @@ test("Antigravity continuation excludes replayed messages, thoughts and commands
   assert.equal(fake.requests().filter(value => value.method === "session/new").length, 1);
   const load = fake.requests().find(value => value.method === "session/load").params;
   assert.equal(load.mcpServers.length, 1);
-  assert.equal(load.mcpServers[0].name, "duet_parent");
+  assert.match(load.mcpServers[0].name, /^duet_parent_[0-9a-f]{12}$/);
+  assert.deepEqual(Object.keys(parentBridgeConfig({ cwd: fake.directory, jobId: "codex-job" }).mcp_servers), ["duet_parent"]);
   assert.equal(load.mcpServers[0].env.find(value => value.name === "CODEX_COMPANION_BRIDGE_THREAD").value, first.threadId);
 });
 

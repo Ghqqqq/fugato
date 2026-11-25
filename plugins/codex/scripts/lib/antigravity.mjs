@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID, createHash } from "node:crypto";
+import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AcpClient } from "./acp-client.mjs";
@@ -8,7 +8,7 @@ import { agentMessageActivity, itemActivity, planActivity, snippet } from "./act
 import { executableOnPath } from "./process.mjs";
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { acquireConcurrency } from "./concurrency.mjs";
-import { PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
+import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
@@ -171,18 +171,51 @@ async function setSelection(client, sessionId, configuration, kind, requested, i
   return selected.value;
 }
 
+function parentBridgeToolKeys(toolName) {
+  if (toolName === "ask_parent") return new Set([...Object.keys(ASK_PARENT.inputSchema.properties), "toolSummary"]);
+  if (toolName === "forum_read") return new Set(["resource", "after", "thread", "limit", "toolSummary"]);
+  if (toolName === "forum_post") return new Set(["kind", "body", "title", "thread", "reply_to", "label", "refs", "mentions", "toolSummary"]);
+  return null;
+}
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === null || proto === Object.prototype;
+}
+
+function noEntries(value) {
+  return value == null || (Array.isArray(value) && value.length === 0);
+}
+
+function autoAllowedParentBridgeTool(call, bridge) {
+  if (!bridge?.serverName || !call?.tool) return null;
+  const tool = call.tool;
+  const listed = bridge.roundtable ? ["ask_parent", "forum_read", "forum_post"] : ["ask_parent"];
+  const toolName = typeof tool.name === "string"
+    ? listed.find(name => tool.name === `mcp_${bridge.serverName}_${name}`)
+    : null;
+  if (!toolName || tool.kind !== "other") return null;
+  if (!noEntries(tool.locations) || !noEntries(tool.content) || call.diffs?.length) return null;
+  if (!isPlainObject(tool.rawInput) || !isDeepStrictEqual(tool.rawInput, tool.args)) return null;
+  const allowedKeys = parentBridgeToolKeys(toolName);
+  if (!Object.keys(tool.rawInput).every(key => allowedKeys.has(key))) return null;
+  return toolName;
+}
+
 function parentBridgeServers(cwd, options) {
   const bridge = options.parentBridge;
-  if (!bridge) return [];
+  if (!bridge) return { serverName: null, roundtable: false, servers: [] };
   const threadId = options.resumeThreadId ?? bridge.threadId;
   const jobId = options.jobId ?? bridge.jobId;
   if (!threadId && !jobId) throw new Error("Antigravity parent bridge requires a Fugato job or session handle.");
+  const serverName = `${PARENT_BRIDGE_SERVER}_${randomBytes(6).toString("hex")}`;
   const env = { [PARENT_BRIDGE_ENV.cwd]: bridge.cwd ?? cwd, CODEX_COMPANION_BRIDGE_BACKEND: "antigravity",
     ...(jobId ? { [PARENT_BRIDGE_ENV.jobId]: jobId } : { [PARENT_BRIDGE_ENV.threadId]: threadId }),
     CODEX_COMPANION_HOME: resolveIsolatedCodexHome(), ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
-  return [{ name: PARENT_BRIDGE_SERVER, command: process.execPath,
+  return { serverName, roundtable: Boolean(bridge.roundtable), servers: [{ name: serverName, command: process.execPath,
     args: [fileURLToPath(new URL("../parent-bridge-mcp.mjs", import.meta.url))],
-    env: Object.entries(env).map(([name, value]) => ({ name, value: String(value) })) }];
+    env: Object.entries(env).map(([name, value]) => ({ name, value: String(value) })) }] };
 }
 
 function promptContent(options) {
@@ -242,7 +275,7 @@ function permissionReview(tool) {
   return tooLarge;
 }
 
-async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call) {
+async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call, bridge) {
   const choices = Array.isArray(params.options) ? params.options : [];
   const allow = choices.find(value => value?.kind === "allow_once" && typeof value.optionId === "string");
   const controller = new AbortController();
@@ -253,6 +286,15 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
     if (turnSignal.aborted || requestSignal.aborted) {
       if (call) call.permission = "denied";
       return cancelledOutcome();
+    }
+    const autoAllowedTool = call && binding.turnId && allow ? autoAllowedParentBridgeTool(call, bridge) : null;
+    if (autoAllowedTool) {
+      if (call.permission !== "denied") call.permission = "approved";
+      const message = `parent bridge tool auto-allowed: ${autoAllowedTool}`;
+      report(options, message, "working", {
+        activity: [{ type: "permissionAutoAllowed", lifecycle: "completed", status: "approved", tool: autoAllowedTool, text: message }]
+      });
+      return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
     let answer = "deny";
     let review = call && binding.turnId && allow ? permissionReview(call.tool) : null;
@@ -407,7 +449,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
   const reservation = await acquireConcurrency({ jobFile: options.jobId ? resolveJobFile(cwd, options.jobId) : null, signal: options.signal,
     onQueued: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "queued", phase: "queued (concurrency limit)" })); report(options, "Queued (concurrency limit).", "queued (concurrency limit)"); },
     onAdmitted: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "running", phase: "starting" })); } });
-  let client, releaseAdmission, submitted = false, cleanupConfirmed = false;
+  let client, releaseAdmission, parentBridge = null, submitted = false, cleanupConfirmed = false;
   let threadId = options.resumeThreadId ?? null, turnId = null;
   const configuration = sessionConfiguration(threadId);
   let capture = false, finalMessage = "", messageId = null, toolSinceChunk = false, thought = "", acpUsage = null;
@@ -456,7 +498,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
           // ACP permits ToolCallUpdate here, including only toolCallId. Merge
           // with this session's observed call so approval shows its real scope.
           const call = params.sessionId === threadId && typeof partial?.toolCallId === "string" ? observeTool(tools, partial) : null;
-          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call);
+          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call, parentBridge);
         }
         if (unsupportedBlockers < MAX_UNSUPPORTED_BLOCKERS) {
           const method = `unrecognized:${createHash("sha256").update(message.method).digest("hex").slice(0, 16)}`;
@@ -518,7 +560,8 @@ export async function runAntigravityTurn(cwd, options = {}) {
     persist({ acpProcessPid: client.pid, acpProcessGroup: true, acpProcessExited: false });
     options.signal?.addEventListener("abort", abort, { once: true });
     const initialized = await initialize(client, options.signal);
-    const params = { cwd: executionCwd, mcpServers: parentBridgeServers(cwd, options) };
+    parentBridge = parentBridgeServers(cwd, options);
+    const params = { cwd: executionCwd, mcpServers: parentBridge.servers };
     if (threadId) {
       if (initialized.agentCapabilities?.loadSession !== true) throw new Error("This Antigravity runtime does not support loading sessions; start a new task instead of continuing this one.");
       const version = initialized.agentInfo?.version;
