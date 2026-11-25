@@ -1,66 +1,86 @@
 ---
 name: models
-description: Check, compare or change Codex worker models and reasoning efforts in Fugato. Load when the user asks to change, compare or check worker models or efforts, or when a dispatch fails on an unknown model.
+description: Choose worker roles in Fugato and check, compare or change models and reasoning efforts. Load for role selection, user model requests or an unknown-model error.
 ---
 
-# Codex worker models
+# Worker roles and models
 
-## Tiers and modes
+Run `fugato models` or `fugato models --json` for the effective role table
+and the account's Codex model catalog. Use `--all` to include hidden models.
+Run `fugato models --backend antigravity` for the Gemini catalog. Check
+advertised settings before choosing an explicit model and effort. If neither
+the Codex runtime nor its cache can supply the catalog, run `/fugato:setup`.
 
-| Setting | Modes and stages |
-| --- | --- |
-| `defaultModel` (strong tier) | Ordinary delegation, pair, duel, and ultra's adversarial verification, judging and hard debugging |
-| `defaultEffort` | Ordinary delegation, pair and duel |
-| `ultraRoutineModel` (routine tier) | Ultra's scans, implementation and ordinary review |
+## Built-in roles
 
-Ultra keeps stage efforts: `medium` for mechanical scans, `xhigh` for implementation
-and ordinary review, and `xhigh` or supported `max` for strong-tier work.
-These settings are shared tiers, not per-mode preferences. For example, changing
-pair's model also changes ordinary delegation, duel and ultra's strong tier.
+| Role | Assignment | Model / effort | Codex fallback |
+| --- | --- | --- | --- |
+| `scan` | Scans, inventory and triage | `gpt-6.2-sol` / `low` | |
+| `implement` | Implementation and fixes | `gpt-6.2-sol` / `high` | |
+| `investigate` | Code tracing and evidence gathering | `gpt-6.2-sol` / `high` | |
+| `review` | Code and regression review | `gpt-6.2-sol` / `medium` | |
+| `debug` | Hard debugging | `gpt-6.2-astra` / `xhigh` | |
+| `architect` | Deep architectural reasoning | `gpt-6.2-astra` / `xhigh` | |
+| `verify` | Independent adversarial verification | `gpt-6.2-astra` / `xhigh` | |
+| `judge` | Judging alternatives | `gpt-6.2-astra` / `xhigh` | |
+| `visual` | Visual inspection | `gpt-6.1-terra` / `medium` | |
+| `read` | Reading and synthesizing long inputs | `gemini-4-neon` / `high` | `gpt-6.2-sol` / `high` |
+| `media` | Image and media analysis | `gemini-4-neon` / `high` | `gpt-6.1-terra` / `medium` |
+| `research` | Source research and synthesis | `gemini-4-neon` / `high` | `gpt-6.2-sol` / `high` |
+| `alt-design` | Independent alternative designs | `gemini-4-neon` / `xhigh` | `gpt-6.2-astra` / `xhigh` |
 
-## Discover before choosing
+## Dispatch
 
-Run `fugato models` or `fugato models --json` and read the returned descriptions.
-Choose the most capable available model for the strong tier and a fast workhorse
-for the routine tier, respecting the user's cost and speed preferences. Never
-assume current model names from memory. Use `--all` to include hidden models.
-The output identifies its source (`app-server` or the isolated Codex cache), the
-supported efforts, default efforts and the effective tiers with their sources.
-An unknown context window is shown as `unknown` (JSON `null`); the app-server
-does not currently expose that field. If neither source is available, run
-`/fugato:setup` to check runtime readiness and sign-in.
+Start a fresh native prompt with `DUET: --role <id> --normal`, or use
+`fugato task --role <id> --normal` in background Bash when the dispatch
+route selects it. Match the agent to the effective row. Use
+`fugato:gemini-native` for Gemini rows when `agy` is installed and the
+work is authorized for full access. Use `--backend antigravity` on the Bash
+route for those rows. Without `agy`, use the effective Codex rows. A
+backend mismatch fails before launch and names the agent to use.
 
-## Change defaults
+Use `--high-stakes` on `fugato:codex-native` for security or permission
+boundaries, irreversible data or state changes and migrations, public API
+or compatibility guarantees, concurrency and process lifecycle, release,
+CI and publishing, core architecture, or when the user asks. It fixes model
+and effort to `gpt-6.2-astra` / `xhigh`. For a roundtable use
+`roundtable start --high-stakes` to apply that model to all seats without an
+explicit per-room model.
 
-Substitute discovered slugs and supported efforts, preview the requested change,
-then apply it without `--dry-run`:
+Explicit user model or effort choices override the corresponding role
+fields. Honor those choices and omit `--high-stakes` when passing either
+explicit flag. The combination is an error. The Agent tool's effort is not
+forwarded when either role flag is in the DUET header. Preserve explicit
+user speed choices.
+
+Both role flags apply only to fresh dispatches. Follow-ups, `--to`,
+`--thread`, `--resume`, `--resume-last`, `--continue`, `--fork` and
+roundtable seat dispatch refuse them. Follow-ups inherit recorded settings.
+Use explicit `--model` or `--effort` to change them on the same thread.
+
+Retry a Gemini assignment on Codex only after a classified authentication
+failure before prompt submission. Start a fresh `fugato:codex-native` job
+with the same brief, the row's explicit fallback `--model` and `--effort`,
+and no role flag. Blocked jobs, permission denials and submitted turns never
+trigger an automatic fallback.
+
+## Save role settings
+
+Preview requested changes with `--dry-run` and apply without it:
 
 ```text
-fugato setup --default-model <slug> --default-effort <effort> --ultra-routine-model <slug> --dry-run
-fugato setup --default-model <slug> --default-effort <effort> --ultra-routine-model <slug>
+fugato setup --role-model id=model[:effort] --dry-run
+fugato setup --role-model id=model[:effort]
+fugato setup --role-model id=default
 ```
 
-Use only the flags needed for the user's change. Pass `default` for any setting
-to reset it to its built-in value. Precedence is explicit user choice > recorded
-thread settings on follow-ups > saved defaults > built-ins. A saved change does
-not override an existing thread's recorded settings.
+Repeat `--role-model` for different roles. `id=default` clears the saved
+model and effort. The high-stakes tuple is fixed and cannot be saved as a role.
+The legacy `--ultra-routine-model` shortcut sets the model of `scan`,
+`implement`, `investigate` and `review`. A saved `--default-model`
+supplies the model for `debug`, `architect`, `verify` and `judge`.
+Saved role fields take precedence. Roleless Codex dispatches still use
+`--default-model` and `--default-effort`.
 
-Setup and hooks never start a runtime to validate efforts. They accept the static
-set (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) plus efforts in any
-model in Codex's cached list. The static set applies when the cache is missing.
-Check that the chosen model supports the chosen effort.
-
-## Override one dispatch
-
-Put `DUET: --model <slug> --effort <effort>` on the first line of that native
-dispatch's prompt. This overrides that dispatch only; it does not save defaults.
-For the Bash fallback, use `fugato task --model <slug> --effort <effort> ...`
-in background Bash as described in the `fugato:native-fallback` skill.
-Follow-ups retain recorded settings unless explicitly overridden.
-
-## Confirm
-
-Read the effective values in the mode reminder or `fugato pair status`,
-`fugato duel status` or `fugato ultra-codex status`. `fugato models` also reports both
-tiers, their sources and each listed model's `inUse` markers. Confirm the result
-against the user's requested tier and explain any shared-mode effect.
+Check the effective table after applying changes. The mode reminders also
+show the roles in use. Saved changes apply to new dispatches.

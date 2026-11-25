@@ -1,13 +1,14 @@
 # /fugato:pair — one executor, Claude acceptance
 
 Pair is for a bounded task that one Codex worker can complete end to end.
-Claude plans, writes the full brief and accepts every diff. The primary worker
-uses the configured worker model (default `gpt-6-astra`) and worker effort
-(default `xhigh`) at normal speed, independently of ultra's stage-based tiers.
-User model, effort and speed choices take precedence. Change the saved model
-and effort with `fugato setup --default-model <model> --default-effort <effort>`;
-see [Default worker models](configuration.md#default-worker-models). The mode
-reminder and status name the effective values.
+Claude plans, writes the full brief and accepts every diff. Dispatch the
+primary Codex worker with `--role implement`. It defaults to
+`gpt-6.2-sol` / `high`. An optional Codex verifier uses `--role verify`
+(default `gpt-6.2-astra` / `xhigh`). Use `--normal` unless the user
+asks for fast speed. Apply the [high-stakes rule](ultra-codex.md#worker-roles)
+and honor explicit user model and effort choices. Change the rows with
+`fugato setup --role-model id=model[:effort]`. The mode reminder shows the
+effective executor and verifier settings.
 
 Back to the [README](../README.md). Compare [ultra](ultra-codex.md) for breadth
 and [duel](duel.md) for persistent adversarial work.
@@ -56,10 +57,9 @@ thread. Session settings do not store participant identities or task counters.
    rechecks the complete resulting diff and final inputs before accepting it.
 
 Claude may request **one optional read-only verifier per initial/rework result**,
-after the primary returns and while it is idle. The default verifier uses
-the configured worker model (default `gpt-6-astra`) and worker effort (default
-`xhigh`) at normal speed; a Claude general-purpose verifier may instead
-inherit the session model and use the owner's Claude quota. Give it a specific
+after the primary returns and while it is idle. A Codex verifier uses
+`--role verify --sandbox read-only`. A Claude general-purpose verifier
+inherits the session model and uses the owner's Claude quota. Give it a specific
 doubt, criteria and a stable candidate, then return confirmed defects to the
 primary. It never writes or accepts the primary's work. No panels or concurrent
 fan-out; at most one corrective verifier follow-up, then an incomplete result
@@ -111,7 +111,7 @@ an edit anywhere invalidates that common version.
 **Reminder template** (placeholders):
 
 ```text
-Pair mode on (one primary Codex worker on <model>/<effort>, max 2 rework rounds). Apply pair protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Pair mode on (executor role implement <tuple>, verifier role verify <tuple>, max 2 rework rounds). Apply pair protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
 ```
 
 Round limits are protocol-managed, not runtime counters. Native-first dispatch,

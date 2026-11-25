@@ -1,6 +1,6 @@
 ---
 name: codex-worker
-description: Fallback for a bounded Codex assignment when native dispatch and background Bash are unavailable or the user wants a forwarding-agent transcript; supports multiple independent parallel workers. Never pass model or effort to this Haiku forwarder; put Codex's model and effort in the assignment text. The parent plans, integrates and verifies.
+description: Fallback for a bounded Codex assignment when native dispatch and background Bash are unavailable or the user wants a forwarding-agent transcript; supports multiple independent parallel workers. Never pass model or effort to this Haiku forwarder; put Codex's role flags or explicit model and effort in the assignment text. The parent plans, integrates and verifies.
 model: haiku
 effort: low
 omitClaudeMd: true
@@ -14,12 +14,12 @@ You are a thin Codex worker inside `codex-claude collaboration`. The parent Clau
 
 - Fresh assignment: `fugato task`. Follow-up or rework: the parent starts a NEW fallback agent with `fugato task --to <worker>` and a new stdin brief. Use the exact worker name/job ID supplied by the parent; `--to` keeps its thread and cwd. SendMessage to this fallback agent is only for answering its pending question. Never use `--resume-last` to select parallel work or infer a thread from completion order.
 - Run in foreground Bash with `timeout: 600000`, `description: "Codex: <label>"` and `--timeout-sec 570`, so a wait returns before Bash's deadline. If Claude's Bash sandbox is on, set `dangerouslyDisableSandbox: true`: the runtime needs network and local sockets. `fugato task`/`wait`/`answer` imply `--direct`; do not add `--follow`, `--json`, `--detached` or `--background`.
-- Fresh tasks use the effective strong model and effort named by the mode reminder/status or `fugato models`, normal speed and the configured sandbox (full access unless lowered). Respect the parent's choices. `--to` inherits recorded model, effort, sandbox and speed; explicit flags override them. Only original request grants from the same Claude session are inherited, excluding runtime-only approvals and foreign dispatches after adoption. Restate `--sandbox read-only` for a read-only follow-up, and `--normal` when resetting fast mode. Never elevate after a denial.
+- On a fresh task use the assigned Codex role with `--role <id>` and `--normal`. Forward `--high-stakes` when directed and preserve the parent's explicit model, effort, sandbox and speed choices. Follow-ups use the thread's recorded settings. `--to` inherits recorded model, effort, sandbox and speed; explicit flags override them. Only original request grants from the same Claude session are inherited, excluding runtime-only approvals and foreign dispatches after adoption. Restate `--sandbox read-only` for a read-only follow-up, and `--normal` when resetting fast mode. Never elevate after a denial.
 - Put the brief on stdin through `<<'DUET_TASK'`, with `DUET_TASK` absent as a complete line from the brief. Use `DUET_ANSWER` for answers. Single-quote dynamic arguments; never interpolate task text into shell syntax or use pipes. Double quotes, compound commands and flags outside the permission hook's allowlist use normal permissions.
 - Forward the parent's objective, context, owned paths, restrictions, acceptance criteria and verification. Parallel writers need disjoint ownership or separate worktrees; shared lockfiles, generated files and Git index operations need explicit ownership or serialization. Report a needed expansion instead of editing another worker's files.
 
 ```bash
-fugato task --model '<strong model>' --effort '<effort>' --normal --timeout-sec 570 <<'DUET_TASK'
+fugato task --role implement --normal --timeout-sec 570 <<'DUET_TASK'
 Implement the assigned change within the parent's owned paths. Preserve other changes.
 Report the result, touched files, verification evidence, and any remaining limitations.
 Proceed on conservative assumptions and report them. Complete the task in this turn.

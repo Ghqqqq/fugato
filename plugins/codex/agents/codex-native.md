@@ -1,6 +1,6 @@
 ---
 name: codex-native
-description: General Codex worker through Fugato for bounded local assignments, with native completion, SendMessage follow-ups and stop. Valid caller names are kept when free; unnamed calls get a scientist name. Optional DUET header flags select Codex model/effort/sandbox/speed/cwd. Use codex-reviewer for read-only review, codex-investigator for read-only investigation, or codex-implementer for workspace-write implementation. Remote isolation, pane teammates and team coordination features are unsupported.
+description: General Codex worker through Fugato for bounded local assignments, with native completion, SendMessage follow-ups and stop. Valid caller names are kept when free; unnamed calls get a scientist name. Use --role <id> --normal in a fresh DUET header for a Codex role or --high-stakes for the fixed high-stakes tuple. Header flags also select model, effort, sandbox, speed and cwd. Use codex-reviewer for read-only review, codex-investigator for read-only investigation, or codex-implementer for workspace-write implementation. Remote isolation, pane teammates and team coordination features are unsupported.
 model: haiku
 effort: low
 omitClaudeMd: true

@@ -3,13 +3,12 @@
 Duel pairs one Claude `general-purpose` subagent with one Codex worker for a
 bounded contested design, high-risk claim or adversarial change. The Claude
 participant **inherits the session model and consumes the owner's Claude
-quota**, in addition to Codex usage. Codex uses the configured worker model
-(default `gpt-6-astra`) and worker effort (default `xhigh`) at normal speed.
-Explicit user settings take precedence; justified `max` needs the existing
-integration/runtime support check first. Change the saved model and effort with
-`fugato setup --default-model <model> --default-effort <effort>`; see
-[Default worker models](configuration.md#default-worker-models). The mode
-reminder and status name the effective values.
+quota**, in addition to Codex usage. The Codex party uses the role for its
+assignment: `implement` for the builder, `verify` for the breaker or
+`architect` for design and analysis. Use `--normal` unless the user asks for
+fast speed. Apply the [high-stakes rule](ultra-codex.md#worker-roles) and honor
+explicit user model and effort choices. The mode reminder shows the effective
+tuples. Change a role with `fugato setup --role-model id=model[:effort]`.
 
 Claude's main loop plans, relays every substantive exchange, verifies evidence
 and arbitrates. The two participants retain their identities across rounds;
@@ -144,7 +143,7 @@ version/path with `fugato duel status --for-command`.
 **Reminder template** (placeholders):
 
 ```text
-Duel mode on (Claude vs Codex on <model>/<effort>, max <rounds> rounds). Apply duel protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Duel mode on (Codex builder implement <tuple>, breaker verify <tuple>, analysis architect <tuple>, max <rounds> rounds). Apply duel protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
 ```
 
 Round limits are advisory protocol rules, not runtime counters. Native/Bash,

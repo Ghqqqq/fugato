@@ -46,10 +46,12 @@ The `UserPromptSubmit` hook appends one versioned reminder to normal prompts.
 **Reminder template** (placeholders, not a current version or path):
 
 ```text
-Ultra-codex mode on (<scale>, max <n> workers (auto), routine <routineModel>, strong <model>). Apply protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Ultra-codex mode on (<scale>, max <n> workers (auto); roles: <role tuples>; high-stakes astra/xhigh; Gemini <availability>). Apply protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
 ```
 
-An explicit integer renders `max <n> workers`; `unlimited` renders `no worker cap`.
+An explicit integer renders `max <n> workers`. The `unlimited` setting renders
+`no worker cap`. Roles with the same model and effort are grouped. The Gemini
+status reads `on` or `off (Codex fallbacks)`.
 Pair and duel name their own section in their reminders. Run
 `fugato ultra-codex status --for-command` for the actual path and current version,
 or add `--json` for `protocolFile`/`protocolVersion`. All three commands use the
@@ -311,29 +313,59 @@ the maximum of two rework rounds per assignment. Disclose sampled or omitted
 coverage and unresolved findings. The full policies live in the
 [Ultra mode section](../plugins/codex/prompts/ultra-codex-protocol.md#ultra-mode).
 
-## Scale, model tiers and concurrency
+## Scale and concurrency
 
 `auto` chooses task depth. `--quick` skips unnecessary design and uses focused
-finders, relevant review cells and one independent verifier per finding; its
-default is one rework round. `--thorough` widens subsystem/search coverage,
-uses independent designs/judges where useful, 3–5 adversarial verifiers for
+finders, relevant review cells and one independent verifier per finding. It
+defaults to one rework round. `--thorough` widens subsystem and search coverage,
+uses independent designs and judges where useful, 3–5 adversarial verifiers for
 consequential findings and a completeness critic, with up to two rework rounds.
-Scale to the discovered work-list rather than a fixed reviewer roster.
+Scale to the discovered work-list.
 
-| Stage | Explicit default model / effort |
-| --- | --- |
-| Mechanical scanning, inventory, triage, first-pass finders | Configured routine model (default `gpt-6.1-sol`) / `medium` |
-| Implementation, investigation, design drafts, ordinary review | Configured routine model (default `gpt-6.1-sol`) / `xhigh` |
-| Adversarial verification, judging, hard debugging, deep architecture | Configured worker model (default `gpt-6-astra`) / `xhigh`, or justified `max` after checking support |
+### Worker roles
 
-Speed is `--normal` unless the user asks for `--fast`. Explicit user choices
-take precedence. If integration/runtime support for `max` is absent, report it
-and use `xhigh`. These are ultra's stage defaults; pair and duel use the
-configured worker model and effort. Change ultra's saved models with
-`fugato setup --default-model <model> --ultra-routine-model <model>`; see
-[Default worker models](configuration.md#default-worker-models). The mode
-reminder and status name the effective values; `--default-effort` does not
-change ultra's effort by stage.
+Use the effective role table from `fugato models`. The default rows are:
+
+| Role | Use it for | Model / effort | Codex fallback |
+| --- | --- | --- | --- |
+| `scan` | Scans, inventory and triage | `gpt-6.2-sol` / `low` | |
+| `implement` | Implementation and fixes | `gpt-6.2-sol` / `high` | |
+| `investigate` | Code tracing and evidence gathering | `gpt-6.2-sol` / `high` | |
+| `review` | Code and regression review | `gpt-6.2-sol` / `medium` | |
+| `debug` | Hard debugging | `gpt-6.2-astra` / `xhigh` | |
+| `architect` | Deep architectural reasoning | `gpt-6.2-astra` / `xhigh` | |
+| `verify` | Independent adversarial verification | `gpt-6.2-astra` / `xhigh` | |
+| `judge` | Judging alternatives | `gpt-6.2-astra` / `xhigh` | |
+| `visual` | Visual inspection | `gpt-6.1-terra` / `medium` | |
+| `read` | Reading and synthesizing long inputs | `gemini-4-neon` / `high` | `gpt-6.2-sol` / `high` |
+| `media` | Image and media analysis | `gemini-4-neon` / `high` | `gpt-6.1-terra` / `medium` |
+| `research` | Source research and synthesis | `gemini-4-neon` / `high` | `gpt-6.2-sol` / `high` |
+| `alt-design` | Independent alternative designs | `gemini-4-neon` / `xhigh` | `gpt-6.2-astra` / `xhigh` |
+
+On a fresh dispatch use `--role <id>` and `--normal` unless the user
+asks for `--fast`. Use `fugato:gemini-native` for Gemini rows when
+`agy` is installed. The table supplies the Codex fallback when it is absent.
+Gemini requires authorization for full access. For enforced read-only work,
+use a Codex row with `--sandbox read-only`.
+
+Use `--high-stakes` for security or permission boundaries, irreversible
+data or state changes and migrations, public API or compatibility guarantees,
+concurrency and process lifecycle, release, CI and publishing, core
+architecture, or when the user asks. It selects Codex
+`gpt-6.2-astra` / `xhigh`. Honor explicit user model or effort choices and
+omit `--high-stakes` when passing either explicit flag.
+
+After one unsuccessful rework, escalate within the same assignment's remaining
+budget. Follow up on the same Codex thread with
+`--model gpt-6.2-astra --effort xhigh`, or dispatch a fresh
+`fugato:codex-native` job with `--high-stakes` for a Gemini assignment.
+Preserve user choices and the protocol's stop rules. For the separate
+authentication-only fallback, see [Gemini dispatch](antigravity.md).
+
+Use `fugato setup --role-model id=model[:effort]` to change a role. See
+[worker model configuration](configuration.md#default-worker-models).
+
+### Worker cap
 
 `--max-workers <n|auto|unlimited>` sets an advisory cap across phases,
 workspaces/worktrees, native jobs and Bash fallback jobs. The default follows
