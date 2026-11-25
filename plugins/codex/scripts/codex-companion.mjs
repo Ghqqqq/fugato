@@ -2,7 +2,7 @@
 
 import { spawnDetached } from "./lib/process.mjs";
 import { createRoom, readRoom, listRooms, assertChair, roundtableStatus, postEvent, readIndex, readThread, readResource, pending, ack, setStatus, updateMember, validateMember, renderForum, renderRoundtableStatus, renderAttention } from "./lib/forum.mjs";
-import { resolveRoster, personaInstructions, CHAIR_CARD, PERSONA_IDS } from "./lib/roundtable-personas.mjs";
+import { resolveRoster, personaInstructions, CHAIR_CARD, INTENSITIES, PERSONA_IDS } from "./lib/roundtable-personas.mjs";
 import { closeMemberWorkspaces } from "./lib/roundtable-workspaces.mjs";
 import { effectiveRoleTable, readPersonaModels, roleModelsSetup } from "./lib/setup-config.mjs";
 import { backendForModel, expandRole } from "./lib/roles.mjs";
@@ -3531,8 +3531,12 @@ async function handleRoundtable(argv) {
       overrides[persona] = { model, ...(hasEffort ? { effort: normalizeReasoningEffort(suffix) } : {}) };
     }
     const intensity = options.intensity ?? "standard";
+    const roles = options.roles?.split(",").map(id => id.trim()) ?? INTENSITIES[intensity]?.roster ?? [];
+    const warnings = [];
+    const mapping = readPersonaModels(process.env, { ids: roles, warnings });
+    for (const warning of warnings) process.stderr.write(`${warning}\n`);
     const roleModels = Object.fromEntries(effectiveRoleTable({ cwd }).roles.map(row => [row.id, row.fallback?.model ?? row.model]));
-    const members = resolveRoster({ intensity, roles: options.roles?.split(",").map(id => id.trim()), mapping: readPersonaModels(), overrides, roleModels, highStakes: options["high-stakes"] });
+    const members = resolveRoster({ intensity, roles, mapping, overrides, roleModels, highStakes: options["high-stakes"] });
     for (const member of members) {
       member.model = normalizeRequestedModel(member.model);
       member.effort = normalizeReasoningEffort(member.effort);

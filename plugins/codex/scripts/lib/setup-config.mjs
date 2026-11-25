@@ -423,18 +423,24 @@ export function defaultModeSetup({ mode, env = process.env, dryRun = false } = {
 
 const DISPATCH_ROUTES = ["auto", "native", "bash"];
 function advisoryEntries(text) {
-  try { return scan(text); } catch { return []; }
+  try { return scan(text); } catch { return null; }
 }
 function advisoryField(entries, keys) {
   try { return fieldIn(entries, keys); } catch { return undefined; }
 }
 // Saved roundtable persona defaults live in [roundtable.personas.<id>] as
 // model and effort; resolveRoster falls back to built-in values per persona.
-function savedPersonaModels(text) {
+/** @param {string} text @param {NodeJS.ProcessEnv} env @param {{ ids?: readonly string[], warnings?: string[] }} [options] */
+function savedPersonaModels(text, env, { ids = PERSONA_IDS, warnings } = {}) {
   const entries = advisoryEntries(text), mapping = {};
+  if (!entries) {
+    warnings?.push(`Warning: Could not parse ${JSON.stringify(duetConfig(env).file)}. Using built-in role and persona defaults.`);
+    return mapping;
+  }
   for (const id of PERSONA_IDS) {
-    const model = advisoryField(entries, ["roundtable", "personas", id, "model"]);
-    const effort = advisoryField(entries, ["roundtable", "personas", id, "effort"]);
+    if (!ids.includes(id)) continue;
+    const model = fieldIn(entries, ["roundtable", "personas", id, "model"]);
+    const effort = fieldIn(entries, ["roundtable", "personas", id, "effort"]);
     if (typeof model === "string" || typeof effort === "string") {
       mapping[id] = { ...(typeof model === "string" ? { model } : {}), ...(typeof effort === "string" ? { effort } : {}) };
     }
@@ -442,12 +448,12 @@ function savedPersonaModels(text) {
   return mapping;
 }
 
-export function readPersonaModels(env = process.env) {
-  return savedPersonaModels(advisoryConfigText(env));
+export function readPersonaModels(env = process.env, options = {}) {
+  return savedPersonaModels(advisoryConfigText(env), env, options);
 }
 
-function personaModelsSummary(text, env) {
-  const personas = savedPersonaModels(text), overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
+function personaModelsSummary(text, env, warnings) {
+  const personas = savedPersonaModels(text, env, { warnings }), overrides = savedRoleOverrides(text, env), legacy = savedWorkerDefaults(text, env);
   return Object.fromEntries(PERSONA_IDS.map(id => [id, Object.fromEntries(["model", "effort"].map(key => {
     const saved = personas[id]?.[key];
     if (saved !== undefined) return [key, { value: key === "model" ? normalizeRequestedModel(saved) : saved.trim().toLowerCase(), source: "saved" }];
@@ -508,7 +514,7 @@ export function personaModelsSetup({ models = [], env = process.env, dryRun = fa
   const warnings = [], changes = modelMappingChanges(models, "persona", env, warnings);
   const { root, file } = duetConfig(env), before = read(root, file);
   const after = applyModelMappings(before, ["roundtable", "personas"], changes);
-  return { file, personaModels: personaModelsSummary(after, env), warnings, ...apply(root, [{ file, before, after }], dryRun) };
+  return { file, personaModels: personaModelsSummary(after, env, warnings), warnings, ...apply(root, [{ file, before, after }], dryRun) };
 }
 
 /** @param {{ mode?: string, env?: NodeJS.ProcessEnv, dryRun?: boolean }} [options] */
@@ -619,6 +625,7 @@ function advisoryConfigText(env) {
 
 function savedRoleOverrides(text, env) {
   const entries = advisoryEntries(text), overrides = {};
+  if (!entries) return overrides;
   for (const id of ROLE_IDS) {
     const savedModel = workerPreference("defaultModel", advisoryField(entries, ["roles", id, "model"]), env);
     const model = savedModel === "default" ? null : savedModel;

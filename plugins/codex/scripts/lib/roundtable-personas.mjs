@@ -76,6 +76,10 @@ export const shiftEffort = (effort, shift) => {
   return index < 0 ? effort : EFFORTS[Math.min(EFFORTS.length - 1, Math.max(0, index + shift))];
 };
 
+function validatePersonaModel(id, model) {
+  if (backendForModel(model) === "antigravity") throw new Error(`Roundtable persona ${id} requires a Codex model. Choose a Codex model instead of ${model}.`);
+}
+
 // Resolve the seated members. `roles` (explicit persona ids) overrides the
 // intensity roster; `mapping` holds saved per-persona {model, effort}; and
 // `overrides` holds this run's per-persona {model, effort}. Explicit values
@@ -86,6 +90,7 @@ export function resolveRoster({ intensity = "standard", roles = null, mapping = 
   if (!preset) throw new Error(`Unknown roundtable intensity: ${intensity}. Use ${Object.keys(INTENSITIES).join(", ")}.`);
   const ids = roles ?? preset.roster;
   if (!Array.isArray(ids) || !ids.length) throw new Error("A roundtable needs at least one persona.");
+  for (const [id, explicit] of Object.entries(overrides)) validatePersonaModel(id, explicit?.model);
   const seen = new Set();
   return ids.map(id => {
     const persona = PERSONAS[id];
@@ -93,9 +98,7 @@ export function resolveRoster({ intensity = "standard", roles = null, mapping = 
     if (seen.has(id)) throw new Error(`Persona ${id} is seated twice; each persona sits at most once.`);
     seen.add(id);
     const explicit = overrides[id] ?? {}, saved = mapping[id] ?? {};
-    for (const model of [saved.model, explicit.model]) {
-      if (backendForModel(model) === "antigravity") throw new Error(`Roundtable persona ${id} requires a Codex model. Choose a Codex model instead of ${model}.`);
-    }
+    validatePersonaModel(id, saved.model);
     const model = explicit.model ?? (highStakes ? HIGH_STAKES.model : saved.model ?? roleModels[persona.role] ?? BUILTIN_ROLES[persona.role].model);
     const effort = explicit.effort ?? saved.effort
       ?? (preset.maxFor?.includes(id) ? "max" : shiftEffort(persona.effort, preset.effortShift));

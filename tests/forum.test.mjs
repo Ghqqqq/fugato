@@ -490,11 +490,36 @@ effort = "low"
   assert.match(roomGemini.stderr, /critic requires a Codex model.*gemini-room/);
 });
 
-test("a critic-only room ignores unseated Gemini persona mappings", () => {
+test("a critic-only room ignores unseated saved Gemini models and validates every explicit room model", () => {
   const f = fixture(), file = path.join(f.env.CODEX_COMPANION_HOME, "duet", "config.toml");
   fs.writeFileSync(file, '[roundtable.personas.calibrator]\nmodel = "gemini-4-neon"\n');
-  const room = json(f.call(["roundtable", "start", "--roles", "critic", "--persona-model", "improver=gemini-custom", "--json"], "Check a claim"));
+  const start = model => f.call(["roundtable", "start", "--roles", "critic", "--persona-model", model, "--json"], "Check a claim");
+  const room = json(start("improver=gpt-6.2-sol"));
   assert.deepEqual(room.members.map(({ persona }) => persona), ["critic"]);
+  const rejected = start("improver=gemini-custom");
+  assert.equal(rejected.status, 1);
+  assert.match(rejected.stderr, /improver requires a Codex model.*gemini-custom/);
+});
+
+test("selected persona inline tables and duplicate keys retain their TOML diagnostics", () => {
+  const f = fixture(), file = path.join(f.env.CODEX_COMPANION_HOME, "duet", "config.toml");
+  const start = () => f.call(["roundtable", "start", "--roles", "critic", "--json"], "Check a claim");
+  for (const [config, diagnostic] of [
+    ['[roundtable.personas]\ncritic = { model = "gemini-4-neon", effort = "low" }\n', /convert it to ordinary TOML tables first/],
+    ['[roundtable.personas]\ncritic = { model = "gpt-6.2-sol" }\n', /convert it to ordinary TOML tables first/],
+    ['[roundtable.personas.critic]\neffort = "low"\neffort = "high"\n', /Duplicate selected TOML setting/]
+  ]) {
+    fs.writeFileSync(file, config);
+    assert.throws(() => readPersonaModels(f.env), diagnostic);
+    assert.throws(() => personaModelsSetup({ env: f.env }), diagnostic);
+    const rejected = start();
+    assert.equal(rejected.status, 1);
+    assert.match(rejected.stderr, diagnostic);
+  }
+  fs.writeFileSync(file, '[roundtable.personas]\ncalibrator = { model = "gemini-4-neon" }\n[roundtable.personas.critic]\nmodel = "saved-critic"\n[roles.review]\nmodel = "one"\nmodel = "two"\n');
+  const valid = start();
+  assert.deepEqual(json(valid).members.map(({ model }) => model), ["saved-critic"]);
+  assert.equal(valid.stderr, "");
 });
 
 test("persona summaries report the normalized model and effort used by the seat", () => {
@@ -511,12 +536,18 @@ test("malformed unrelated configuration permits advisory reads and critic-only r
   const malformed = '[roles.review]\nmodel = "unterminated';
   fs.writeFileSync(file, malformed);
   assert.deepEqual(readPersonaModels(f.env), {});
-  assert.deepEqual(personaModelsSetup({ env: f.env }).personaModels.critic, {
+  const setup = personaModelsSetup({ env: f.env });
+  assert.deepEqual(setup.personaModels.critic, {
     model: { value: "gpt-6.2-astra", source: "built-in" }, effort: { value: "high", source: "built-in" }
   });
+  assert.equal(setup.warnings.length, 1);
+  assert.match(setup.warnings[0], /warning/i);
+  assert.ok(setup.warnings[0].includes(JSON.stringify(file)));
   assert.equal(effectiveRoleTable({ env: f.env }).roles.find(row => row.id === "review").source, "built-in");
-  const room = json(f.call(["roundtable", "start", "--roles", "critic", "--json"], "Check a claim"));
+  const started = f.call(["roundtable", "start", "--roles", "critic", "--json"], "Check a claim");
+  const room = json(started);
   assert.deepEqual(room.members.map(({ persona, model }) => [persona, model]), [["critic", "gpt-6.2-astra"]]);
+  assert.deepEqual(started.stderr.trimEnd().split(/\r?\n/), setup.warnings);
   assert.throws(() => personaModelsSetup({ env: f.env, models: ["critic=changed"] }), /Unterminated/);
   assert.equal(fs.readFileSync(file, "utf8"), malformed);
 });
