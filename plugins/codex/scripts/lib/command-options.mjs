@@ -1,22 +1,24 @@
 // Public parser definitions are also the permission hook's source of option
 // names and types. Internal values are companion-only; other policy exclusions
 // belong in the hook.
+export const FRESH_ROLE_ERROR = "role flags apply to a fresh dispatch; follow-ups keep the recorded model and effort (use --model/--effort to change them)";
+export const NON_FRESH_ROLE_FLAGS = ["to", "thread", "resume", "resume-last", "continue", "fork", "roundtable", "persona"];
 export const COMMAND_ALIASES = { C: "cwd" };
 export const COMMAND_OPTIONS = {
   // Host-hook only; the permission hook's public verb allowlist excludes it.
   "reserve-name": { valueOptions: [], internalValueOptions: ["session-cwd", "preferred"], booleanOptions: [] },
   task: {
-    valueOptions: ["backend", "model", "effort", "cwd", "name", "prompt-file", "thread", "to", "continue", "run", "source", "sandbox", "lease-sec", "question-timeout-sec", "owner", "timeout-sec", "feed-limit", "max-minutes", "max-tokens", "roundtable", "persona"],
+    valueOptions: ["backend", "model", "effort", "role", "cwd", "name", "prompt-file", "thread", "to", "continue", "run", "source", "sandbox", "lease-sec", "question-timeout-sec", "owner", "timeout-sec", "feed-limit", "max-minutes", "max-tokens", "roundtable", "persona"],
     // Companion-only values: the permission hook does not auto-approve these.
     internalValueOptions: ["session-cwd", "dispatch-nonce", "tool-use-id", "agent-name"],
     repeatableOptions: ["approve-browser-origin", "approve-computer-app"],
-    booleanOptions: ["json", "report", "write", "resume-last", "resume", "fresh", "fork", "background", "detached", "follow", "direct", "quiet", "fast", "normal", "no-claude-md"],
+    booleanOptions: ["high-stakes", "json", "report", "write", "resume-last", "resume", "fresh", "fork", "background", "detached", "follow", "direct", "quiet", "fast", "normal", "no-claude-md"],
     aliasMap: { m: "model" }
   },
   roundtable: {
     valueOptions: ["intensity", "roles", "run", "cwd", "title", "label", "selects", "unreviewed"],
     repeatableOptions: ["persona-model"],
-    booleanOptions: ["json"]
+    booleanOptions: ["json", "high-stakes"]
   },
   forum: {
     valueOptions: ["after", "thread", "limit", "resource", "kind", "reply-to", "title", "label", "member", "upto", "selects", "unreviewed"],

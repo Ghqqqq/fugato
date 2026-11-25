@@ -1304,6 +1304,75 @@ test('native role presets dispatch and persist roles, sandbox ceilings and saved
   }
 });
 
+test('fresh native headers forward roles to the companion and keep Agent effort out of role selection', async () => {
+  for (const [header, model, effort, agentType] of [
+    ['--high-stakes', 'gpt-6.2-astra', 'xhigh', AGENT_TYPE],
+    ['--role implement', 'gpt-6.2-sol', 'high', AGENT_TYPE],
+    ['--role implement --effort medium', 'gpt-6.2-sol', 'medium', 'fugato:codex-implementer']
+  ]) {
+    const f = fixture('review-ok');
+    const report = await f.turn(`DUET: ${header}\nComplete this assignment.`, 1, false, { effort: 'low', agentType });
+    assert.equal(report.status, 'completed', JSON.stringify(report));
+    const { request } = f.jobs()[0];
+    assert.deepEqual([request.model, request.effort], [model, effort]);
+    assert.equal(request.role, header.includes('--role') ? 'implement' : undefined);
+    assert.equal(request.highStakes, header.includes('--high-stakes') ? true : undefined);
+    assert.ok(!('role' in report) && !('highStakes' in report));
+    const launch = f.capture.processes.find(p => p.kind === 'spawn' && p.request.argv[2] === 'task').request.argv;
+    assert.ok(launch.includes(header.startsWith('--role') ? '--role' : '--high-stakes'));
+    assert.equal(launch.includes('--model'), false);
+    assert.equal(launch.includes('--effort'), header.includes('--effort'));
+    if (header === '--role implement') {
+      f.reload();
+      const refused = await f.turn('DUET: --role debug\nContinue the assignment.', 2, false, { wake: true });
+      assert.equal(refused.status, 'blocked');
+      assert.equal(refused.summary, 'role flags apply to a fresh dispatch; follow-ups keep the recorded model and effort (use --model/--effort to change them)');
+      assert.equal(f.jobs().length, 1);
+    }
+  }
+});
+
+test('native role expansion checks the effective backend and installed Gemini executable', async () => {
+  for (const [header, agentType, installed, expected] of [
+    ['--backend antigravity --role debug', AGENT_TYPE, true, 'fugato:codex-native'],
+    ['--role read', AGENT_TYPE, true, 'fugato:gemini-native'],
+    ['--role read', 'fugato:gemini-native', true, 'gemini-4-neon'],
+    ['--role read', AGENT_TYPE, false, 'gpt-6.2-sol']
+  ]) {
+    const f = fixture('review-ok');
+    const acp = installed ? installFakeAntigravity(`${f.root}/acp`, { behavior: 'worker-report' }) : null;
+    f.env.FUGATO_ANTIGRAVITY_BIN = acp?.binary ?? `${f.root}/missing-agy`;
+    const report = await f.turn(`DUET: ${header}\nRead the assignment.`, 1, false, { agentType });
+    if (expected.startsWith('fugato:')) {
+      assert.equal(report.status, 'blocked');
+      assert.match(report.summary, new RegExp(expected));
+      assert.deepEqual(f.jobs(), []);
+      assert.equal(fs.existsSync(f.env.CODEX_FIXTURE_STATE_PATH), false);
+    } else {
+      assert.equal(report.status, 'completed', JSON.stringify(report));
+      const { request } = f.jobs()[0];
+      assert.deepEqual([request.role, request.model, request.effort], ['read', expected, 'high']);
+    }
+  }
+});
+
+test('roleless native agents and presets retain built-in and saved settings', async () => {
+  for (const [agentType, saved] of [[AGENT_TYPE, false], [AGENT_TYPE, true], ['fugato:codex-reviewer', true]]) {
+    const f = fixture('review-ok');
+    if (saved) {
+      const result = spawnSync(process.execPath, [path.join(plugin, 'scripts/codex-companion.mjs'), 'setup',
+        '--default-model', 'saved-native', '--default-effort', 'low', '--json'], { cwd: `${f.root}/repo`, env: f.env, encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+    }
+    const report = await f.turn('Use this worker’s defaults.', 1, false, { agentType });
+    assert.equal(report.status, 'completed', JSON.stringify(report));
+    const { request } = f.jobs()[0];
+    assert.deepEqual([request.model, request.effort], saved ? ['saved-native', 'low'] : ['gpt-6-astra', 'xhigh']);
+    assert.ok(!('role' in request) && !('highStakes' in request));
+    if (agentType !== AGENT_TYPE) assert.equal(request.sandbox, 'read-only');
+  }
+});
+
 test('native Gemini worker dispatches ACP, keeps its backend on reload and omits Codex defaults', async () => {
   const f = fixture('review-ok', 'gemini-worker');
   const acp = installFakeAntigravity(`${f.root}/antigravity`, { behavior: 'worker-report' });
@@ -4287,9 +4356,9 @@ function replayCaptures() {
       fs.cpSync(`${plugin}/types`, `${copy}/types`, { recursive: true });
       fs.cpSync(`${plugin}/hooks`, `${copy}/hooks`, { recursive: true });
       fs.mkdirSync(`${copy}/scripts/lib`, { recursive: true });
-      fs.copyFileSync(`${plugin}/scripts/lib/agent-name-pool.mjs`, `${copy}/scripts/lib/agent-name-pool.mjs`);
-      fs.copyFileSync(`${plugin}/scripts/lib/display-text.mjs`, `${copy}/scripts/lib/display-text.mjs`);
-      fs.copyFileSync(`${plugin}/scripts/lib/roundtable-personas.mjs`, `${copy}/scripts/lib/roundtable-personas.mjs`);
+      for (const name of ['agent-name-pool', 'command-options', 'display-text', 'roles', 'roundtable-personas']) {
+        fs.copyFileSync(`${plugin}/scripts/lib/${name}.mjs`, `${copy}/scripts/lib/${name}.mjs`);
+      }
       fs.copyFileSync(`${plugin}/tests/native-agent.test.ts`, `${copy}/tests/native-agent.test.ts`);
       fs.writeFileSync(`${copy}/tests/native-captures.mjs`, source);
       // Captures contain varying job ids, timings and process chunk boundaries.

@@ -117,6 +117,31 @@ test("Google model discovery uses the ACP catalog without a Codex default or a m
   assertNoCodex(f);
 });
 
+test("installed Gemini roles require the right backend and resolve to explicit ACP selections", () => {
+  const f = fixture({ currentModel: "gemini-3.8-flash", currentEffort: "medium" });
+  f.env.CODEX_COMPANION_BIN = f.codexTrap;
+  for (const [flags, message] of [
+    [["--role", "read"], /dispatch fugato:gemini-native/],
+    [["--backend", "antigravity", "--role", "debug"], /dispatch fugato:codex-native/],
+    [["--backend", "antigravity", "--high-stakes"], /dispatch fugato:codex-native/],
+    [["--backend", "antigravity", "--role", "read", "--model", "gpt-6.2-sol"], /gpt-6.2-sol.*fugato:codex-native/]
+  ]) {
+    const refused = f.call("task", "--direct", ...flags, "Read the fixture.");
+    assert.equal(refused.status, 1);
+    assert.match(refused.stderr, message);
+  }
+  assert.deepEqual(f.requests(), []);
+  assertNoCodex(f);
+  const done = direct(f.call("task", "--backend", "antigravity", "--role", "read", "--direct", "Read the fixture."));
+  assert.equal(done.status, "completed");
+  const { request, selectedModel, selectedEffort } = f.stored(done.jobId);
+  assert.deepEqual([request.role, request.model, request.effort, selectedModel, selectedEffort],
+    ["read", "gemini-4-neon", "high", "gemini-4-neon", "high"]);
+  assert.ok(!("modelDefault" in request) && !("effortDefault" in request) && !("highStakes" in request));
+  assert.equal(prompts(f).length, 1);
+  assertNoCodex(f);
+});
+
 test("Google dispatch records and selects Neon then xhigh when both flags are omitted", () => {
   const f = fixture({ currentModel: "gemini-3.8-flash", currentEffort: "medium" });
   const done = direct(f.call("task", "--backend", "antigravity", "--direct", "Complete a default-model assignment."));

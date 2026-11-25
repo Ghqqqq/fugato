@@ -24,6 +24,14 @@ test('Gemini preset pins the backend and leaves model, thinking and sandbox to t
   expect(logEntry('Open Antigravity activity: /fugato-live Gemini')).toBe(null);
 });
 
+test('presets preserve raw role choices, explicit effort and the preset sandbox', () => {
+  const preset = PRESETS['fugato:codex-implementer'];
+  expect(applyPreset({ flags: ['--role', 'implement', '--effort', 'medium'], brief: 'Build.' }, preset).flags)
+    .toEqual(['--role', 'implement', '--effort', 'medium', '--sandbox', 'workspace-write']);
+  expect(applyPreset({ flags: ['--high-stakes'], brief: 'Build.' }, preset).flags)
+    .toEqual(['--high-stakes', '--sandbox', 'workspace-write']);
+});
+
 test('command display follows every spec vector without changing shell words', () => {
   const vectors: [string, string, string, string?][] = [
     [String.raw`/bin/zsh -lc "rg -n --hidden -g '!native-captures.mjs' 'codex:|codex@fugato' plugins"`, 'rg', "-n --hidden -g '!native-captures.mjs' 'codex:|codex@fugato' plugins"],
@@ -228,7 +236,8 @@ const captures = recordedCaptures.map(capture => {
   const started = capture.notices.find((notice: any) => notice.message.content[0].text.includes('started · job '));
   const model = started?.message.content[0].text.match(/ · ([^ ]+) \/ /)?.[1] ?? 'unknown';
   return JSON.parse(JSON.stringify(capture)
-    .replaceAll('Invalid DUET header. Allowed flags: --model,', 'Invalid DUET header. Allowed flags: --backend, --model,')
+    .replaceAll('Invalid DUET header. Allowed flags: --model,', 'Invalid DUET header. Allowed flags: --backend, --role, --high-stakes, --model,')
+    .replaceAll('Presets inherit saved model/effort/speed defaults.', 'Presets inherit saved worker defaults. Use --role <id> or --high-stakes on a fresh dispatch to select its model and effort.')
     .replaceAll('Codex usage · 150 input (40 cached) · 30 output tokens',
       `Codex tokens (provider: OpenAI Codex, model ${model}) · 150 input · 40 cached · 30 output · 180 total`)
     .replaceAll('Codex usage · 12,345 input (8,000 cached) · 678 output tokens',

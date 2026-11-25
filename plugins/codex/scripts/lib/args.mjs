@@ -36,6 +36,9 @@ export function parseArgs(argv, config = {}) {
       if (!token.startsWith("-") || token === "-") continue;
       const rawKey = token.startsWith("--") ? token.slice(2).split("=", 1)[0] : token.slice(1);
       const key = aliasMap[rawKey] ?? rawKey;
+      if (config.rejectedOptions && Object.hasOwn(config.rejectedOptions, key)) {
+        throw new Error(config.rejectedOptions[key]);
+      }
       if (!booleanOptions.has(key) && !valueOptions.has(key)) {
         const suggestion = config.rejectOptionTypos
           ? [...valueOptions, ...booleanOptions]
