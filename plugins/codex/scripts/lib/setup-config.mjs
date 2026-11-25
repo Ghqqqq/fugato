@@ -484,7 +484,6 @@ function modelMappingChanges(models, kind, env, warnings) {
     const colon = setting.lastIndexOf(":"), model = colon < 0 ? setting : setting.slice(0, colon), effort = colon < 0 ? undefined : setting.slice(colon + 1);
     if (!model || model.trim() === "default" || effort === "" || effort === "default") throw new Error(`${flag} needs id=model[:effort], or id=default to reset both values.`);
     if (backendForModel(model) === "antigravity") {
-      if (kind === "persona") throw new Error(`Roundtable persona ${id} requires a Codex model.`);
       const checkedModel = workerPreference("defaultModel", model, env);
       if (!checkedModel) throw new Error(`${flag} requires a valid Gemini model name.`);
       const checkedEffort = effort === undefined ? undefined : geminiEffort(effort);
