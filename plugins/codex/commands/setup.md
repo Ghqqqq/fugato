@@ -4,7 +4,15 @@ argument-hint: '[--sync-tools [--profile chrome|codex-app] [--replace-cua] [--cu
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
-Use repeatable `--role-model id=model[:effort]` to save worker role settings. Use `id=default` to reset a role. The high-stakes tuple is fixed. The legacy `--ultra-routine-model` shortcut sets the model for `scan`, `implement`, `investigate` and `review` unless a role has its own saved model.
+Use repeatable `--role-model id=model[:effort]` to save worker role settings.
+Specify each role once per command. Omit the effort to clear its saved value,
+or use `id=default` to clear both fields. Setup refuses to set or reset
+`high-stakes` and reports `the high-stakes tuple is fixed at gpt-6.2-astra/xhigh`.
+
+The legacy `--ultra-routine-model` shortcut supplies a saved Codex model for
+`scan`, `implement`, `investigate` and `review`. A role-specific model takes
+precedence. These roles inherit only the model from the shortcut. Clear it
+with `--ultra-routine-model default`.
 
 Run:
 
