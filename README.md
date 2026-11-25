@@ -40,15 +40,21 @@ Upgrading from Duet or Fugato 1.6.0? Your state carries over: see the
 
 ### Google Gemini workers
 
-Fugato also supports Google workers through an authenticated Antigravity CLI
-(`agy acp`). Run `fugato setup --backend antigravity` and
-`fugato models --backend antigravity`, then dispatch
-`Agent(subagent_type: "fugato:gemini-native", prompt: "<brief>")` or
-`fugato task --backend antigravity` with the brief on stdin.
-Google tasks use Antigravity's own tools and permission rules; this first version
-requires full-access execution and supports independent workers. The
-[Antigravity guide](docs/antigravity.md) covers setup, approvals, session
-continuation and the exact support boundaries.
+Fugato runs Gemini workers through Google's official Antigravity CLI
+(`agy acp`). Before using personal sign-in, read Google's conditions for
+third-party clients and single-user interactive development.
+[Terms and sign-in](docs/antigravity.md#terms-and-sign-in)
+
+Install `agy` and sign in once with `agy acp --login`. Run
+`fugato setup --backend antigravity` to check access and
+`fugato models --backend antigravity` to list your plan's Gemini models.
+Dispatch `Agent(subagent_type: "fugato:gemini-native", prompt: "<brief>")`
+in Claude Code or pass the brief on stdin to `fugato task --backend antigravity`.
+Workers require full access. In agy's default mode, each edit and command
+needs approval. Wait for the native worker's report before using `SendMessage`.
+Answer a displayed permission question with exactly `Allow once` or `Deny`.
+Send a new assignment once the turn finishes. Continuing a worker requires
+agy 1.5.15 or later. [Setup and usage](docs/antigravity.md#set-up)
 
 ## Quick start
 
@@ -235,7 +241,7 @@ pane shows the posts as an index; press one to read it.
 | Topic | Page |
 | --- | --- |
 | Commands and CLI | [Commands](docs/commands.md) |
-| Google Gemini workers | [Antigravity ACP](docs/antigravity.md) |
+| Google Gemini workers | [Antigravity ACP setup](docs/antigravity.md#set-up) · [Terms and sign-in](docs/antigravity.md#terms-and-sign-in) |
 | Modes | [Ultra](docs/ultra-codex.md) · [Pair](docs/pair.md) · [Duel](docs/duel.md) · [Roundtable](docs/roundtable.md) |
 | Dispatch, reports, questions and recovery | [Direct mode](docs/direct-mode.md) · [Worker lifecycle](docs/worker-lifecycle.md) |
 | Settings, sandbox, browser and Computer Use | [Configuration](docs/configuration.md) · [Browser](docs/browser-approvals.md) · [Computer Use](docs/computer-use-approvals.md) |

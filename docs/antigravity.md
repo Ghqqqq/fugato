@@ -1,63 +1,116 @@
 # Google Gemini workers through Antigravity ACP
 
-Fugato can run Google Gemini workers through the Antigravity CLI's Agent Client
-Protocol (ACP) server. Claude remains the coordinator; Antigravity supplies the
-agent loop, model, tools and account authentication. Each worker has its own
-`agy acp` process and uses Fugato's existing job tracking, parent questions,
-reports, journal, cancellation and continuation commands.
+Claude can delegate a local task to a Gemini worker through the Antigravity
+CLI's Agent Client Protocol (ACP) server. Each worker runs its own `agy acp`
+process. Antigravity supplies the model and tools. Fugato tracks the job,
+forwards permission questions and returns the report. Gemini tasks can run
+alongside Codex tasks and do not require the Codex CLI.
 
-This is an additional worker backend. Existing Codex commands and saved Codex
-model defaults retain their behavior. Google tasks do not require the Codex CLI.
+## Terms and sign-in
+
+Fugato launches Google's official `agy` binary with the single argument
+`acp` and identifies itself as `fugato`. Antigravity reads its own cached
+credentials. Fugato never extracts, copies or proxies Google sign-in tokens.
+Google's ACP guide says “Any ACP client can launch Antigravity CLI.”
+[ACP guide](https://antigravity.google/docs/ide/extensions/acp) ·
+[Fugato ACP client](../plugins/codex/scripts/lib/acp-client.mjs)
+
+Google's FAQ says using third-party software to access Antigravity with an
+Antigravity login violates the Terms. It recommends a Gemini Enterprise or
+Google AI Studio API key for third-party coding agents. Its section on
+headless `agy -p` also says that wrapping `agy` inside third-party coding
+agents is unsupported under consumer plans. [Google FAQ](https://antigravity.google/docs/faq/)
+
+On the Google AI Developers Forum, Google addressed the official, unmodified
+`antigravity-acp` runtime from the ACP Registry. The replies say an ACP client
+such as T3 Code or Zed may run that runtime with native personal sign-in for
+single-user interactive development. General ACP clients are limited to the
+Gemini models in the user's plan. Extracting or proxying OAuth tokens is
+prohibited. These forum replies do not establish formal Google policy.
+If you need certainty, use a Google AI Studio API key or Gemini Enterprise.
+[Forum reply on personal sign-in](https://discuss.ai.google.dev/t/tos-clarification-is-t3-code-official-antigravity-acp-agent-permitted-under-the-antigravity-terms-of-service/192027/2) ·
+[Forum clarification on clients and models](https://discuss.ai.google.dev/t/conflicting-guidance-on-using-t3-code-with-personal-google-ai-subscriptions/197131/3)
 
 ## Set up
 
-Install the [Antigravity CLI](https://antigravity.google/docs/cli/acp/) using
-Google's current instructions, then authenticate in an interactive terminal:
+Antigravity CLI first shipped `agy acp` in 1.5.0. Use 1.5.15 or later for
+continuations. Fugato has been tested live with 1.5.16.
+[Antigravity CLI release notes](https://antigravity.google/docs/changelog/)
+
+Install the CLI with Google's installer. It installs `~/.local/bin/agy` and
+may add that directory to your shell profile. In the terminal that will launch
+Claude Code, make it available immediately and check the version.
 
 ```sh
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+export PATH="$HOME/.local/bin:$PATH"
 agy --version
-agy acp --login
+```
+
+For native Google sign-in, run `agy acp --login` once. Open the Google URL
+it prints and paste the returned code into the terminal. An interactive
+`agy` session can also complete sign-in.
+
+With the Fugato plugin installed, run these commands from the project in a
+Claude Code session. From the root of a Fugato checkout, you can use
+`plugins/codex/bin/fugato` in place of `fugato`. [Plugin installation](../README.md#install)
+
+```sh
 fugato setup --backend antigravity
 fugato models --backend antigravity
 ```
 
-The readiness check initializes ACP and creates a session without sending a
-model prompt. It uses Antigravity's existing CLI credentials. Fugato does not
-copy those credentials into its Codex home or change the user's Antigravity
-configuration. For installations outside `PATH`, set
-`FUGATO_ANTIGRAVITY_BIN` to the executable's absolute path; it is an executable
-path, not a shell command with arguments.
+Setup checks the login by initializing ACP and creating a session without a
+model prompt. Launch uses the same ACP handshake and skips the old
+`agy acp --help` probe. A missing executable or one that cannot speak ACP
+produces install and login guidance. For a custom install, set
+`FUGATO_ANTIGRAVITY_BIN` to an absolute path or a path relative to the task
+directory, such as `./tools/agy`. A bare executable name uses `PATH`. Fugato
+launches the exact absolute path it checked for the turn and records that path
+for recovery. [Executable resolution](../plugins/codex/scripts/lib/antigravity.mjs) ·
+[Worker launch](../plugins/codex/scripts/codex-companion.mjs)
 
-Available models depend on the account and server. Fugato identifies itself as
-`fugato`; Google's [ACP guide](https://antigravity.google/docs/ide/extensions/acp)
-allows Gemini for all ACP clients and restricts third-party models to specified
-IDE clients. Fugato's supported Google route is Gemini.
+The model list includes only the account's advertised `gemini-*` IDs. It lists
+thinking levels only for the currently selected model. Use
+`fugato models --backend antigravity --json` for the IDs and configuration
+options. With no model override on a fresh task, Fugato uses the current
+Gemini model or selects the first advertised Gemini model if needed. An
+explicit non-Gemini `--model`, an unavailable ID or an account with no Gemini
+model fails before the prompt. After changing models, Fugato refreshes the
+configuration before validating any requested `--effort`.
+[`listAntigravityModels` and `setSelection`](../plugins/codex/scripts/lib/antigravity.mjs)
 
 ## Start a native worker in Claude Code
-
-Use the new agent type:
 
 ```text
 Agent(subagent_type: "fugato:gemini-native", prompt: "Investigate the parser failure, implement the agreed fix and run the relevant tests.")
 ```
 
-The agent uses Antigravity's current model and thinking level unless the brief
-explicitly selects values returned by `fugato models --backend antigravity`:
+To select a model or thinking level for this assignment, put an optional
+`DUET:` header on the first line of the prompt. Use a listed model ID and omit
+`--effort` to keep that model's configured thinking level.
 
 ```text
-DUET: --model <model-id> --effort <thinking-value> --max-minutes 10
+DUET: --model <gemini-model-id> --effort <thinking-value> --max-minutes 10
 Investigate the parser failure, implement the agreed fix and run the tests.
 ```
 
-`DUET:` remains the compatible task-header syntax. The Gemini preset fixes
-`--backend antigravity`; a conflicting backend is rejected. It does not inherit
-the Claude shell's effort or Fugato's Codex model/effort preferences.
+The native preset fixes the backend to `antigravity` and rejects a conflicting
+backend. The Claude shell's effort and saved Codex model and effort defaults
+do not select Gemini settings.
 
-The result appears as a normal Fugato worker report. `SendMessage` answers a
-pending parent question or adds a later assignment; `/tasks` stops the worker.
-Messages sent during an active turn are queued for the next turn in this first
-implementation. They are never reported as already injected into the active
-Google prompt.
+Wait for the worker's report before using `SendMessage`. While the turn is
+running, even a progress notice showing a permission request is too early
+to answer. Fugato refuses the message with this reply.
+
+> This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again; answer a displayed permission question with exactly Allow once or Deny.
+
+When the agent returns a `needs_answer` report for a permission question,
+send exactly `Allow once` or `Deny`. Any other text shows the question again
+and starts no work. Once the turn finishes, send the next assignment with
+`SendMessage` to continue the session. Use `/tasks` to stop the worker.
+[Message routing](../plugins/codex/hooks/steering.mjs) ·
+[Native adapter](../plugins/codex/hooks/native-agent.mjs)
 
 ## Companion CLI
 
@@ -67,10 +120,8 @@ Investigate the parser failure, implement the agreed fix and run the tests.
 TASK
 ```
 
-The worker can run alongside Codex workers. Assign parallel writers disjoint
-paths or separate worktrees, as with existing Fugato workers.
-
-Continue the same session by its actual reported worker name or job ID:
+Use the reported worker name or job ID for a follow-up. This example continues
+a worker named `GeminiWorker`.
 
 ```sh
 fugato task --to GeminiWorker <<'TASK'
@@ -78,97 +129,120 @@ Check the edge case reported by the reviewer and update the tests.
 TASK
 ```
 
-`--to`, `--thread`, `--continue` and tracked `--resume-last` preserve the recorded
-backend. A session cannot switch between Codex and Antigravity. Continuation
-uses ACP `session/load`; if the server does not advertise that capability, the
-request fails with an explanation rather than creating an empty replacement
-session. Historical replay during loading is excluded from the new report.
+Both `--to <jobId>` and `--continue <jobId>` keep the selected job's backend.
+Bare `fugato task --resume-last` and `fugato task-resume-candidate` select
+Codex jobs. Add `--backend antigravity` to either command to select Gemini
+jobs. [Companion CLI](../plugins/codex/scripts/codex-companion.mjs)
 
-`models --backend antigravity --json` exposes model IDs and configuration options
-advertised by the server. Model changes can alter the available thinking
-options; Fugato applies the model first, refreshes the configuration and then
-validates the requested thinking value. Unavailable values fail explicitly.
+Continuation requires an ACP server that advertises `session/load` and
+reports agy 1.5.15 or later. Earlier versions can replay history after the
+load reply, mixing old commands and messages into the new turn. Fugato
+refuses the continuation before loading if either check fails. On supported
+versions, it starts capturing the new report after the replay.
+[`supportsOrderedReplay` and `runAntigravityTurn`](../plugins/codex/scripts/lib/antigravity.mjs)
 
 ## Permissions and isolation
 
-Antigravity executes its own tools and applies its own permission rules. ACP
-client capabilities do not impose a filesystem sandbox. This version therefore
-accepts only Fugato's `danger-full-access` mode for Google tasks. If a saved
-default requires `read-only` or `workspace-write`, dispatch fails before starting
-the server. An authorized task can explicitly select
-`--sandbox danger-full-access`; sandboxed work should continue to use Codex.
+Antigravity runs its own tools. Fugato requires `danger-full-access`, the
+built-in sandbox default. If your saved default is `read-only` or
+`workspace-write`, a fresh dispatch fails unless you explicitly pass
+`--sandbox danger-full-access` in the native header or CLI command. Use it
+only for assignments authorized for full access. Native `isolation: "worktree"`
+and `isolation: "remote"` are refused before spawn. For parallel local writers,
+assign disjoint paths or start each CLI task in a separately prepared worktree.
+[Task validation](../plugins/codex/scripts/lib/backends.mjs) ·
+[Native isolation checks](../plugins/codex/hooks/native-agent.mjs)
 
-Fugato forwards Antigravity's permission requests to the parent using the
-existing question/answer flow. The two choices are **Allow once** and **Deny**.
-Only the exact single-use answer can select the server's `allow_once` option;
-ambiguous answers, missing options, cancellation and expired questions grant
-nothing. Fugato does not request an always-allow option or pass
-`--dangerously-skip-permissions`. Actions already permitted by Antigravity's
-own rules may run without an ACP permission request.
+In agy's default mode, every edit and command prompts for permission. Claude
+reviews the displayed operation and answers exactly `Allow once` or `Deny`.
+The report card shows the full approval text with its whitespace preserved.
+The answer applies only to the operation shown. If the operation changes
+while the answer is pending, or if agy's `rawInput` and its `args` copy
+disagree, Fugato denies the request with `operation-changed-before-approval`.
+After `Deny`, agy usually ends the turn and Fugato reports the job as blocked
+with `approval_denied`.
 
-Native plan mode and Claude permission mapping are refused because their
-restrictions cannot be represented faithfully by this adapter. The plain
-foreground compatibility CLI, which has no parent waiting for questions,
-denies new permission requests. The normal `fugato task` launcher owns its wait
-and supports the parent approval flow.
+For a CLI task, run the `fugato answer` command in the report's `next` field
+and pass the exact answer on stdin. It targets the displayed question ID.
+The foreground compatibility CLI denies requests because it has no waiting
+parent. [Question handling](../plugins/codex/scripts/lib/job-runtime.mjs)
+
+Each question shows separately labelled, JSON-quoted fields for the supplied
+arguments, locations and operation details, with control and bidirectional
+formatting characters escaped. A serialized question over 16 KiB is denied
+with `operation-too-large-to-display-exactly`. A request of kind `other` with
+reviewable input can reach Claude. An execution request without a command
+line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/scripts/lib/antigravity.mjs)
 
 ## Reports, budgets and stopping
 
-- Text, disclosed thought chunks, tool updates and file diffs feed the existing
-  activity log and report. Captured command events remain separate from the
-  worker's claims about verification. Workspace snapshots track file changes.
-- ACP v1 has no native Fugato JSON output-schema field. The requested report
-  format is included in the prompt and parsed through the existing report
-  parser; a prose answer remains a prose report.
-- Reports identify `backend: antigravity` and `provider: Google Antigravity`.
-  ACP `usage_update` is stored as `acpUsage` in result details. Its `used` field
-  measures context occupancy, not tokens consumed in the turn. It is not
-  converted to Codex token totals or a zero-cost usage claim.
-- `--max-minutes`, owner loss, lease expiry and user cancellation all stop the
-  same owned ACP connection. `session/cancel` is followed by a bounded wait for
-  the prompt response and cleanup of the owned process group. Reports distinguish
-  an acknowledged end from an unconfirmed interruption.
-- If the worker crashes before saving its result, the outcome remains unknown.
-  ACP v1 cannot read an exact lost turn from another connection. Fugato does not
-  replay the assignment or send its session ID to Codex recovery. Inspect the
-  job log and Antigravity before deciding how to proceed.
+- Native report cards identify the backend as `antigravity` and the provider
+  as `Google Antigravity`. The card shows the model and total tokens when
+  reported. [Native report rendering](../plugins/codex/hooks/native-agent.mjs)
+- Per-turn `usage` comes from the `session/prompt` result. Fugato's
+  `inputTokens` includes agy's input tokens plus cache reads and writes.
+  `cachedInputTokens` counts only cache reads. `reasoningOutputTokens` comes
+  from agy's `thoughtTokens`. Fugato also records `outputTokens` and
+  `totalTokens` when supplied. Background reports accept partial counters.
+  [Usage mapping](../plugins/codex/scripts/lib/antigravity.mjs) ·
+  [Background delivery](../plugins/codex/scripts/lib/report-delivery.mjs)
+- In result details, `acpUsage.used` from `usage_update` measures context
+  occupancy. Since turn usage arrives only at the end, Fugato refuses an
+  explicit `--max-tokens` limit and ignores a saved default token limit for
+  Gemini tasks. Use `--max-minutes` for a running-time budget.
+  [Budget handling](../plugins/codex/scripts/codex-companion.mjs)
+- Tool updates and completed file diffs supply activity and report evidence.
+  Captured commands use agy's `rawInput.CommandLine`. A permission denial
+  stays in the report as a blocker. Fugato excludes the denied command from
+  the checks that ran and lists the worker's own verification claims separately.
+  Fugato sends the requested JSON format in the prompt and parses the response.
+  [Command capture and prompt handling](../plugins/codex/scripts/lib/antigravity.mjs)
+- Cancellation, lease expiry, owner loss or a time limit interrupt the
+  running turn. Fugato sends `session/cancel`, waits briefly for a reply and
+  cleans up the owned process group. The report records whether agy
+  acknowledged cancellation.
+- If a worker crashes after saving a successful result, Fugato restores the
+  result that matches the job, session and turn. If the crash leaves a
+  submitted turn without a recoverable result, Fugato reports its outcome as
+  unknown and never replays the assignment.
+  [Result recovery](../plugins/codex/scripts/codex-companion.mjs)
+- While the original agy process is still running the turn, Fugato blocks a
+  second prompt on the same ACP session, even from another workspace.
+  `fugato cancel <jobId>` can stop the surviving process group after a
+  worker crash. It checks the process start time and leaves a reused PID
+  alone. Once the owned process is gone, the worker's concurrency slot is
+  released and the session can continue.
+  [Process verification](../plugins/codex/scripts/lib/acp-process.mjs) ·
+  [Concurrency slots](../plugins/codex/scripts/lib/concurrency.mjs)
 
-## First-version support
+## Support boundaries
 
-| Supported | Kept on the Codex route |
+| Supported on Gemini | Outside Gemini worker support |
 | --- | --- |
-| Native Gemini worker and CLI tasks | Native Codex review command |
-| Independent parallel workers | Existing Pair, Ultra, Duel and Roundtable default dispatch |
-| Dynamic model and thinking selection | Cross-provider roundtable personas |
-| Parent questions, single-use approvals and reports | Codex browser/Computer Use grants and permission mapping |
-| Session continuation when advertised by the server | Claude transcript `--fork` / `transfer` |
-| Cancellation, leases and running-time budgets | Codex priority `--fast` and per-turn `--max-tokens` |
+| Native and CLI tasks, including independent parallel workers | Codex review and roundtable personas |
+| Gemini model and thinking selection | Setting agy's session mode (`default`, `accept-edits`, `auto`, `plan`) from Fugato |
+| Single-use approvals and reports | Claude permission mapping and plan mode, Codex browser and Computer Use grants |
+| Session continuation with agy 1.5.15+ and `session/load` | Claude transcript `--fork` and `transfer` |
+| Cancellation, leases and running-time budgets | Codex priority `--fast` and a per-turn `--max-tokens` limit |
 
-Unsupported task options fail before starting Antigravity. A separate Google
-worker can still contribute evidence to a Claude-led task without changing an
-existing orchestration mode's dispatch policy.
+Pair, Ultra, Duel and Roundtable retain their existing dispatch defaults.
 
 ## Development and live verification
 
-The ACP tests use a real child process implementing a deterministic fake server:
+The ACP tests launch a deterministic fixture as a child process. They cover
+model selection, approval questions, history replay, usage, cancellation and
+crash recovery. The CLI and native tests exercise dispatch and continuation.
 
 ```sh
-node --test tests/antigravity.test.mjs tests/antigravity-cli.test.mjs
+node --test tests/antigravity*.test.mjs
 npm run test:native
 npm run verify
 ```
 
-The fixture covers protocol framing, bidirectional permission RPCs, dynamic
-configuration, history replay, cancellation, malformed responses and child
-process failures. CLI and native tests exercise dispatch and continuation without
-a Codex executable. They do not establish compatibility with a particular live
-Antigravity account or CLI release.
-
-A live check requires an installed, authenticated `agy`: run the setup and
-model-list commands above, use a disposable workspace for one task, continue
-the returned worker and cancel a second task. Verify the reported model,
-permission question and cancellation confirmation before relying on a release
-in a longer workflow.
+For a live check, run the setup and model-list commands above. In a disposable
+workspace, start a worker, answer an edit or command question, and continue
+the reported worker. Check the model and token count on its report. Cancel a
+second task and check whether agy acknowledged the interruption.
 
 Protocol references:
 

@@ -2,17 +2,32 @@
 
 ## Unreleased
 
-- Add Google Gemini workers through the Antigravity CLI's ACP v1 server:
-  `fugato task --backend antigravity` and native `fugato:gemini-native` reuse
-  task tracking, parent questions, reports, cancellation and session continuation.
-- Discover Google models and thinking options from the authenticated server with
-  `models --backend antigravity`; check readiness with `setup --backend antigravity`.
-  Google workers keep their backend on follow-up and use their own defaults.
-- Forward ACP permissions for explicit single-use parent approval. Reject
-  unsupported Codex sandbox, permission mapping, fork, priority, token-budget
-  and roundtable options before launching a Google worker. Preserve ACP usage
-  separately from Codex token totals. Document the live-account verification
-  boundary and first-version support in the Antigravity guide.
+- Add full-access Gemini workers through Google's official `agy acp` runtime
+  with `fugato task --backend antigravity` and native `fugato:gemini-native`.
+  Resolve relative executable paths from the task directory and launch the
+  same absolute path recorded for recovery.
+  Document [setup and Google's sign-in conditions](../../docs/antigravity.md).
+- Check readiness over ACP, list only `gemini-*` models and show thinking
+  levels for the current model. Without a model override, replace a non-Gemini
+  default with the first advertised Gemini model before sending a prompt.
+- Show the full approval text with whitespace preserved. Deny changed
+  operations, conflicting argument copies, questions over 16 KiB and
+  executions missing a command line. Denied commands remain blockers and
+  are excluded from checks that ran.
+- Report the provider, model and available turn token counts. Input includes
+  cache reads and writes. Background delivery accepts partial counts. Keep
+  context occupancy in `acpUsage`, refuse explicit token limits and ignore
+  saved token limits for Gemini tasks.
+- Refuse mid-turn `SendMessage`. Once a permission report returns, only
+  `Allow once` or `Deny` answers it. After the turn finishes, a new message
+  starts the next assignment.
+- Require agy 1.5.15+ for continuation. Exact job follow-ups retain the
+  backend. Use `--backend antigravity` with `--resume-last` or
+  `task-resume-candidate` to select a Gemini job.
+- Restore a matching result saved before a crash. A lost result stays unknown
+  and its assignment is never replayed. Block concurrent prompts on the same
+  session across workspaces. Check the process start time before cancellation
+  to avoid signalling a reused PID. Release the slot once the owned process exits.
 
 ## 1.7.2
 
