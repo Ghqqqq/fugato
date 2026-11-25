@@ -8,6 +8,7 @@ import { inertIndexlessWorkspace } from "./indexless-state.mjs";
 import { APPROVAL_OPTIONS, ACTION_APPROVAL_OPTIONS, parseApprovalAnswer } from "./server-requests.mjs";
 import { finishJournalJob } from "./run-journal.mjs";
 import { buildWorkerReport } from "./worker-report.mjs";
+import { jobBackend } from "./backends.mjs";
 import { dedupeBlockers } from "./blockers.mjs";
 import { reportJobs, reportWorkerTarget } from "./worker-resolve.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
@@ -18,8 +19,12 @@ export const ACTIVE = new Set(["queued", "running"]);
 const INERT_INDEXLESS_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 // Thread IDs are global to the isolated runtime, unlike workspace job indexes.
 // Read matching records and check for unindexed owners across workspaces.
-export function recordedThreadJobs(threadId) {
+export function recordedThreadJobs(threadId, backend = null) {
   const inventory = { jobs: [], complete: true }, root = resolveStateRoot();
+  const matchesBackend = job => {
+    try { return backend === null || jobBackend(job) === backend; }
+    catch { inventory.complete = false; return false; }
+  };
   let directories;
   try { directories = fs.readdirSync(root, { withFileTypes: true }); }
   catch { inventory.complete = false; return inventory; }
@@ -57,7 +62,7 @@ export function recordedThreadJobs(threadId) {
     }
     const present = new Set(files.map(name => name.slice(0, -5)));
     for (const job of indexed.values()) {
-      if (job.threadId === threadId && !present.has(job.id)) inventory.complete = false;
+      if (job.threadId === threadId && !present.has(job.id) && matchesBackend(job)) inventory.complete = false;
     }
     for (const name of files) {
       const job = indexed.get(name.slice(0, -5));
@@ -72,6 +77,13 @@ export function recordedThreadJobs(threadId) {
             continue;
           }
           if (stored.threadId !== threadId) continue;
+        }
+        // The backend is part of the turn's identity. A different provider's
+        // records cannot own this turn. Conflicting copies still defer recovery.
+        if (backend && stored && typeof stored === "object") {
+          const matches = matchesBackend(stored);
+          if (job && matchesBackend(job) !== matches) inventory.complete = false;
+          if (!matches) continue;
         }
         if (!stored || stored.id !== name.slice(0, -5) || typeof stored.workspaceRoot !== "string" || !stored.workspaceRoot ||
             typeof stored.status !== "string" || !stored.status ||
@@ -92,7 +104,7 @@ export function recordedThreadJobs(threadId) {
           else if (!stored.turnId) continue;
         }
         inventory.jobs.push(stored);
-      } catch (error) { if (!inert || !(error instanceof SyntaxError)) inventory.complete = false; }
+      } catch (error) { if ((!job || matchesBackend(job)) && (!inert || !(error instanceof SyntaxError))) inventory.complete = false; }
     }
     if (inert) {
       try { if (inertIndexlessWorkspace(directory, { minAgeMs: INERT_INDEXLESS_MIN_AGE_MS }).reason) inventory.complete = false; }
@@ -110,7 +122,7 @@ export function turnInJobStartWindow(job, startedAt) {
   return startedAt >= since;
 }
 
-export function uniqueTurnAttribution(job, turn, inventory = recordedThreadJobs(job.threadId), admittingJobId = null) {
+export function uniqueTurnAttribution(job, turn, inventory = recordedThreadJobs(job.threadId, "codex"), admittingJobId = null) {
   if (!inventory.complete || turnInJobStartWindow(job, turn.startedAt) !== true) return false;
   return !inventory.jobs.some(candidate => {
     if (candidate.id === job.id && candidate.workspaceRoot === job.workspaceRoot) return false;

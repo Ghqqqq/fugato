@@ -2032,7 +2032,7 @@ export async function readAppServerTurn(cwd, job, { admittingJobId = null, env =
       // A dead wrapper may have stopped before turn/start, or after sending it
       // but before saving its reply. Never infer absence from an unreadable list.
       if (response.thread?.id !== threadId || !Array.isArray(response.thread.turns)) return null;
-      const inventory = recordedThreadJobs(threadId);
+      const inventory = recordedThreadJobs(threadId, "codex");
       if (!inventory.complete) return null;
       // Recovered jobs written before turn handles were published keep theirs in recovery.
       const owned = new Set(inventory.jobs.filter(candidate => candidate.id !== job.id || candidate.workspaceRoot !== job.workspaceRoot)

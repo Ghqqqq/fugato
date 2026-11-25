@@ -1032,19 +1032,19 @@ function taskBrief(request) {
   return prompt?.trim() || (request.threadId || request.resumeLast ? DEFAULT_CONTINUE_PROMPT : "");
 }
 
-function admissionJobs(workspaceRoot, jobs, threadId, backend) {
+function admissionInventory(workspaceRoot, jobs, threadId, backend) {
   const local = jobs.filter(job => job.threadId === threadId && jobBackend(job) === backend);
-  if (backend !== "antigravity") return local;
+  if (backend !== "antigravity") return { jobs: local, complete: true };
   // ACP session handles span workspaces. A crashed wrapper can leave a
   // submitted prompt alive after its PID-based session lock is reclaimed.
-  const foreign = recordedThreadJobs(threadId).jobs.filter(job => job.workspaceRoot !== workspaceRoot && isAntigravityJob(job));
-  return local.concat(foreign);
+  const inventory = recordedThreadJobs(threadId);
+  const foreign = inventory.jobs.filter(job => job.workspaceRoot !== workspaceRoot && isAntigravityJob(job));
+  return { jobs: local.concat(foreign), complete: inventory.complete };
 }
 
-function threadBlocker(workspaceRoot, jobs, threadId, jobId, backend) {
+function threadBlocker(workspaceRoot, jobs, jobId, current) {
   const order = (a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")) || a.id.localeCompare(b.id);
-  const current = jobs.find(job => job.id === jobId);
-  const candidates = admissionJobs(workspaceRoot, jobs, threadId, backend).filter(job => job.id !== jobId)
+  const candidates = jobs.filter(job => job.id !== jobId)
     .map(job => job.workspaceRoot && job.workspaceRoot !== workspaceRoot ? job : readStoredJob(workspaceRoot, job.id) ?? job)
     .filter(job => job.status !== "blocked" && (ACTIVE.has(job.status) || ((job.turnId || job.turnSubmission || job.status === "failed") && unresolvedTask(job))));
   // Prefer the actual turn over queued follow-ups that will themselves be
@@ -1053,12 +1053,13 @@ function threadBlocker(workspaceRoot, jobs, threadId, jobId, backend) {
     ?? candidates.filter(job => !current || order(job, current) < 0).sort(order)[0];
 }
 
-function threadBusyExecution(workspaceRoot, predecessor, request, taskMetadata) {
-  const stored = readStoredJob(workspaceRoot, predecessor.id) ?? predecessor;
-  const blocker = threadBusyBlocker(workspaceRoot, stored);
+function threadBusyExecution(workspaceRoot, threadId, predecessor, request, taskMetadata) {
+  const root = predecessor?.workspaceRoot ?? workspaceRoot;
+  const blocker = predecessor ? threadBusyBlocker(root, readStoredJob(root, predecessor.id) ?? predecessor)
+    : { code: "thread_busy", message: `Ownership of Antigravity session ${threadId} is unknown because its cross-workspace job inventory is incomplete.` };
   // Preserve the foreground CLI's stderr diagnostic alongside its typed result.
   if (!request.detached) process.stderr.write(`${blocker.message}\n`);
-  return buildTaskExecution({ status: 0, threadId: predecessor.threadId, turnId: null, finalMessage: blocker.message, blockers: [blocker] }, request, taskMetadata);
+  return buildTaskExecution({ status: 0, threadId, turnId: null, finalMessage: blocker.message, blockers: [blocker] }, request, taskMetadata);
 }
 
 function threadBusyBlocker(workspaceRoot, stored) {
@@ -1108,28 +1109,34 @@ async function executeTaskRun(request) {
   }
 
   if (resumeThreadId) {
-    for (const candidate of admissionJobs(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, backend)) {
+    const jobs = listJobs(workspaceRoot);
+    const inventory = admissionInventory(workspaceRoot, jobs, resumeThreadId, backend);
+    if (!inventory.complete) return threadBusyExecution(workspaceRoot, resumeThreadId, null, request, taskMetadata);
+    for (const candidate of inventory.jobs) {
       if (candidate.id === request.jobId) continue;
       const root = candidate.workspaceRoot ?? workspaceRoot;
       const stored = restoreMissingTaskRecord(root, candidate);
       if (needsAcpRecovery(stored)) await reconcileLostTurn(root, stored);
     }
-    const predecessor = threadBlocker(workspaceRoot, listJobs(workspaceRoot), resumeThreadId, request.jobId, backend);
+    const predecessor = threadBlocker(workspaceRoot, inventory.jobs, request.jobId, jobs.find(job => job.id === request.jobId));
     // A lost turn/start response leaves no turn ID. Read that predecessor's
     // thread before admission, just as we reconcile an exact recorded turn.
     if (predecessor) await reconcileLostTurn(predecessor.workspaceRoot ?? workspaceRoot, predecessor, { admittingJobId: request.jobId });
     // Claim the target before starting a turn. updateState serializes competing
     // workers; unrelated threads remain free to run in parallel. Recovery does
     // network I/O outside this lock; always recheck all blockers after it.
-    let blocker;
+    let blocker, incomplete;
     updateState(workspaceRoot, (state) => {
-      blocker = threadBlocker(workspaceRoot, state.jobs, resumeThreadId, request.jobId, backend);
-      if (blocker) return;
+      const latest = admissionInventory(workspaceRoot, state.jobs, resumeThreadId, backend);
+      incomplete = !latest.complete;
+      if (incomplete) return;
       const current = state.jobs.find((job) => job.id === request.jobId);
+      blocker = threadBlocker(workspaceRoot, latest.jobs, request.jobId, current);
+      if (blocker) return;
       if (!current) throw new Error("The current task record is missing; refusing to resume a thread without tracking its active turn.");
       current.threadId = resumeThreadId;
     });
-    if (blocker) return threadBusyExecution(blocker.workspaceRoot ?? workspaceRoot, blocker, request, taskMetadata);
+    if (incomplete || blocker) return threadBusyExecution(workspaceRoot, resumeThreadId, blocker, request, taskMetadata);
   }
 
   const before = snapshotWorkspace(workspaceRoot);
@@ -2305,11 +2312,27 @@ function readEndedAcpResult(job, artifacts) {
     if (result?.backend !== "antigravity" || result.jobId !== job.id || result.threadId !== job.threadId ||
         result.turnId !== job.turnId || result.turnEnded !== true || !Number.isInteger(result.status) ||
         typeof result.rawOutput !== "string") return null;
-    const report = buildWorkerReport(result, { jobId: job.id, ...artifacts });
-    const reason = result.interruptionReason;
-    const status = reason ? reason === "cancelled_by_user" ? "cancelled" : "interrupted" : report.status;
-    const turnResolution = result.turnResolution ?? (reason ? result.interruptionConfirmed ? "interrupted" : "unknown"
+    const ownReason = result.interruptionReason;
+    const turnResolution = result.turnResolution ?? (ownReason ? result.interruptionConfirmed ? "interrupted" : "unknown"
       : result.status === 0 ? "completed" : "failed");
+    const reason = ownReason || job.cancelRequested?.reason;
+    const stopStatus = reason === "cancelled_by_user" ? "cancelled" : "interrupted";
+    if (reason && !ownReason) {
+      // Cancellation won the publication lock after the worker saved its
+      // result. Preserve the actual turn outcome across a retry of recovery.
+      Object.assign(result, { status: 1, workerStatus: stopStatus, turnResolution,
+        interruptionReason: reason, interruptionConfirmed: result.interruptionConfirmed === true });
+      const temporary = artifacts.resultFile + "." + randomUUID() + ".tmp";
+      try {
+        fs.writeFileSync(temporary, JSON.stringify(result, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+        fs.renameSync(temporary, artifacts.resultFile);
+      } finally {
+        fs.rmSync(temporary, { force: true });
+      }
+    }
+    const report = buildWorkerReport(result, { jobId: job.id, ...artifacts });
+    const status = reason ? stopStatus : report.status;
+    if (reason) Object.assign(report, continuationReport(job));
     const recovery = result.recovery ?? { status: "recovered", source: "result-artifact", threadId: job.threadId,
       turnId: job.turnId, turnStatus: turnResolution, detail: "Recovered the matching final Antigravity result saved before the worker exited." };
     const completedAt = job.completedAt ?? nowIso();
@@ -2388,7 +2411,7 @@ export async function reconcileLostTurn(workspaceRoot, job, { turnResult = null,
     const attributionConfirmed = latest => {
       if (result.turnStatus === "notStarted" && stored.turnSubmission === null) return latest.turnSubmission === null;
       if (!latest.threadId || latest.turnId) return true;
-      const inventory = recordedThreadJobs(latest.threadId);
+      const inventory = recordedThreadJobs(latest.threadId, "codex");
       return result.turnId ? uniqueTurnAttribution(latest, { id: result.turnId, startedAt: result.turnStartedAt }, inventory, admittingJobId) : inventory.complete;
     };
     if (!stored.turnId) {
