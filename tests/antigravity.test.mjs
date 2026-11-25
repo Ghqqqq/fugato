@@ -6,7 +6,7 @@ import path from "node:path";
 import { installFakeAntigravity } from "./fake-antigravity-fixture.mjs";
 import { formatActivity } from "../plugins/codex/scripts/lib/activity.mjs";
 import { parseStructuredReport } from "../plugins/codex/scripts/lib/worker-report.mjs";
-import { ensureAntigravityAvailable, listAntigravityModels, runAntigravityTurn } from "../plugins/codex/scripts/lib/antigravity.mjs";
+import { ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "../plugins/codex/scripts/lib/antigravity.mjs";
 
 function fixture(t, options = "normal", version = "1.5.16") {
   const directory = fs.mkdtempSync(path.join(process.env.CODEX_COMPANION_TEST_ROOT, "agy-"));
@@ -506,5 +506,27 @@ test("Antigravity protects a fresh active session against a concurrent continuat
 test("Antigravity availability errors explain the executable and login prerequisites", t => {
   const fake = fixture(t);
   process.env.FUGATO_ANTIGRAVITY_BIN = path.join(fake.directory, "missing-agy");
+  assert.equal(resolveAntigravityExecutable(fake.directory), null);
   assert.throws(() => ensureAntigravityAvailable(fake.directory), /FUGATO_ANTIGRAVITY_BIN/);
+});
+
+test("Antigravity launches the executable checked in the requested subdirectory", async t => {
+  const root = fixture(t);
+  const requestCwd = path.join(root.directory, "package");
+  const selected = installFakeAntigravity(requestCwd);
+  process.env.FUGATO_ANTIGRAVITY_BIN = `./${path.basename(selected.binary)}`;
+  const checked = ensureAntigravityAvailable(requestCwd);
+  assert.equal(checked, selected.binary);
+  assert.equal(resolveAntigravityExecutable(root.directory), root.binary);
+
+  const runAndList = async options => {
+    assert.equal((await root.run({ executionCwd: requestCwd, ...options })).status, 0);
+    assert.equal((await listAntigravityModels(root.directory, options)).provider, "antigravity");
+  };
+  await runAndList({ requestCwd });
+  process.env.FUGATO_ANTIGRAVITY_BIN = root.binary;
+  await runAndList({ executable: checked });
+  // argv[1] identifies the script launched by the shebang or Windows .cmd shim.
+  assert.deepEqual(selected.state().launches.map(launch => launch.script), Array(4).fill(selected.script));
+  assert.deepEqual(root.state().launches, []);
 });

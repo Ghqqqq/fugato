@@ -19,7 +19,7 @@ const save = change => {
   const temp = statePath + "." + process.pid + ".tmp";
   fs.writeFileSync(temp, JSON.stringify(value)); fs.renameSync(temp, statePath);
 };
-save(value => value.launches.push({ pid: process.pid, args: process.argv.slice(2) }));
+save(value => value.launches.push({ pid: process.pid, script: process.argv[1], args: process.argv.slice(2) }));
 if (process.argv.includes("--version") || process.argv.includes("--help")) {
   process.stdout.write("Antigravity fixture ACP v1\n"); process.exit(0);
 }
@@ -204,5 +204,5 @@ process.stdout.on("error", () => process.exit(0));
     fs.writeFileSync(binary, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
   }
   const state = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
-  return { binary, statePath, state, requests: () => state().requests };
+  return { binary, script, statePath, state, requests: () => state().requests };
 }

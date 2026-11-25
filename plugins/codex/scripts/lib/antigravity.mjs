@@ -28,11 +28,26 @@ function denyPermission(options) {
   return deny ? { outcome: { outcome: "selected", optionId: deny.optionId } } : cancelledOutcome();
 }
 
-export function ensureAntigravityAvailable(cwd) {
+export function resolveAntigravityExecutable(cwd) {
   const command = binary();
-  const executable = executableOnPath(command.includes(path.sep) || command.includes("/") ? path.resolve(cwd, command) : command);
-  if (!executable) throw notStarted(new Error(`Antigravity executable '${command}' was not found or is not executable. ${INSTALL_HELP} ${LOGIN_HELP}`));
-  return { available: true, binary: executable };
+  if (!command.includes("/") && !command.includes(path.sep)) return executableOnPath(command);
+  const executable = path.isAbsolute(command) ? command : path.resolve(cwd, command);
+  try {
+    fs.accessSync(executable, fs.constants.X_OK);
+    return fs.statSync(executable).isFile() ? executable : null;
+  } catch { return null; }
+}
+
+export function ensureAntigravityAvailable(cwd) {
+  const executable = resolveAntigravityExecutable(cwd);
+  if (!executable) throw notStarted(new Error(`Antigravity executable '${binary()}' was not found or is not executable. ${INSTALL_HELP} ${LOGIN_HELP}`));
+  return executable;
+}
+
+function launchExecutable(cwd, options) {
+  if (options.executable == null) return ensureAntigravityAvailable(options.requestCwd ?? cwd);
+  if (!path.isAbsolute(options.executable)) throw notStarted(new Error("The supplied Antigravity executable must be an absolute path."));
+  return options.executable;
 }
 
 function report(options, message, phase = null, extra = {}) {
@@ -348,10 +363,10 @@ function toolActivityItem(tool, diffs) {
   return { type: "dynamicToolCall", id: tool.toolCallId, status, tool: tool.name ?? tool.title ?? tool.kind ?? "Antigravity tool" };
 }
 
-export async function listAntigravityModels(cwd) {
-  const availability = ensureAntigravityAvailable(cwd);
+export async function listAntigravityModels(cwd, options = {}) {
+  const executable = launchExecutable(cwd, options);
   const configuration = sessionConfiguration();
-  const client = new AcpClient(availability.binary, path.resolve(cwd), { onNotification: message => configuration.observe(message) });
+  const client = new AcpClient(executable, path.resolve(cwd), { onNotification: message => configuration.observe(message) });
   try {
     await initialize(client);
     await client.request("session/new", { cwd: path.resolve(cwd), mcpServers: [] }, { onResponse: response => configuration.accept(response, true) });
@@ -375,7 +390,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
   const content = promptContent(options);
   if (options.sandbox && options.sandbox !== "danger-full-access") throw notStarted(new Error("Antigravity ACP does not implement Fugato's Codex sandbox modes. Select danger-full-access explicitly; Antigravity's own permission rules still apply."));
   if (options.signal?.aborted) throw notStarted(new Error("Antigravity task interrupted before startup."));
-  const availability = ensureAntigravityAvailable(cwd);
+  const executable = launchExecutable(cwd, options);
   const reservation = await acquireConcurrency({ jobFile: options.jobId ? resolveJobFile(cwd, options.jobId) : null, signal: options.signal,
     onQueued: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "queued", phase: "queued (concurrency limit)" })); report(options, "Queued (concurrency limit).", "queued (concurrency limit)"); },
     onAdmitted: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "running", phase: "starting" })); } });
@@ -419,7 +434,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
     if (threadId) {
       releaseAdmission = acquireSessionAdmission(threadId);
     }
-    client = new AcpClient(availability.binary, executionCwd, {
+    client = new AcpClient(executable, executionCwd, {
       timeoutMs: options.connectTimeoutMs ?? 30000,
       onRequest: (message, signal) => {
         if (message.method === "session/request_permission") {
