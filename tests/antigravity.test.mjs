@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { installFakeAntigravity } from "./fake-antigravity-fixture.mjs";
+import { AcpClient } from "../plugins/codex/scripts/lib/acp-client.mjs";
+import { upsertJob, readJobFile, resolveJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 import { formatActivity } from "../plugins/codex/scripts/lib/activity.mjs";
 import { parseStructuredReport } from "../plugins/codex/scripts/lib/worker-report.mjs";
 import { ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "../plugins/codex/scripts/lib/antigravity.mjs";
@@ -340,6 +342,22 @@ test("Antigravity applies dynamic config IDs and refreshes thinking options afte
     { sessionId: result.threadId, configId: "selected-model", value: "gemini-3.8-flash" },
     { sessionId: result.threadId, configId: "reasoning-choice", value: "medium" }
   ]);
+});
+
+test("Antigravity persists the server's fallback model and thinking level before sending the prompt", async t => {
+  const fake = fixture(t, { modelIds: ["gemini-4-carbon", "gemini-3.8-flash"], currentModel: "gemini-3.8-flash", currentEffort: "medium" });
+  const jobId = "task-selection";
+  upsertJob(fake.directory, { id: jobId, backend: "antigravity", workspaceRoot: fake.directory, status: "queued" });
+  const request = AcpClient.prototype.request;
+  let atPrompt;
+  t.mock.method(AcpClient.prototype, "request", function(method, ...args) {
+    if (method === "session/prompt") atPrompt = readJobFile(resolveJobFile(fake.directory, jobId));
+    return request.call(this, method, ...args);
+  });
+  const result = await fake.run({ jobId, model: "gemini-4-neon", effort: "xhigh", modelDefault: true, effortDefault: true });
+  assert.deepEqual([atPrompt.selectedModel, atPrompt.selectedEffort], ["gemini-3.8-flash", "medium"]);
+  assert.equal(result.status, 0);
+  assert.deepEqual([result.model, result.effort], [atPrompt.selectedModel, atPrompt.selectedEffort]);
 });
 
 for (const [behavior, model, effort] of [

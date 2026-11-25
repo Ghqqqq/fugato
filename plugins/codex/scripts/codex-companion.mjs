@@ -16,7 +16,7 @@ import { normalizeBrowserOrigins, normalizeBundleIds } from "./lib/server-reques
 import { browserOriginSetup, computerUseSetup, transportSetup, defaultSandboxSetup, defaultModeSetup, permissionMappingSetup, readTomlField, dispatchSetup, dispatchPreference, contextSetup, budgetDefaultsSetup, personaModelsSetup, workerDefaultsSetup, readWorkerDefaults, normalizeRequestedModel, isSupportedReasoningEffort, ensureBrowserApproval, ensureComputerUseApproval, ensureProjectDocs, projectDocsSetup, SANDBOX_MODES } from "./lib/setup-config.mjs";
 import { budgetLimit, newJobBudget } from "./lib/job-budget.mjs";
 import { listModels, renderModels } from "./lib/models.mjs";
-import { ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "./lib/antigravity.mjs";
+import { ANTIGRAVITY_DEFAULT_MODEL, ANTIGRAVITY_DEFAULT_EFFORT, ensureAntigravityAvailable, listAntigravityModels, resolveAntigravityExecutable, runAntigravityTurn } from "./lib/antigravity.mjs";
 import { acpExecutable, acpProcessGone, isAntigravityJob, stopOrphanedAcpGroup } from "./lib/acp-process.mjs";
 import { acpSetting, jobBackend, normalizeBackend, validateAntigravityTask } from "./lib/backends.mjs";
 import { activityReader, formatActivity, redactActivity, snippet } from "./lib/activity.mjs";
@@ -613,9 +613,11 @@ async function handleModels(argv) {
     const catalog = await listAntigravityModels(resolveCommandCwd(options));
     const report = { backend: "antigravity", source: "antigravity-acp", models: catalog.data.map(model => ({
       slug: model.model ?? model.id, displayName: model.displayName, isDefault: Boolean(model.isDefault),
+      isFugatoDefault: model.model === ANTIGRAVITY_DEFAULT_MODEL,
       efforts: model.supportedReasoningEfforts?.map(value => value.reasoningEffort) ?? [], defaultEffort: model.defaultReasoningEffort ?? null
     })), configOptions: catalog.configOptions };
-    const rows = report.models.map(model => [model.slug, model.displayName, model.isDefault ? "current" : "", model.efforts.join(", ")].map(escapeDiagnosticControls).join(" | "));
+    const rows = report.models.map(model => [model.slug, model.displayName,
+      [model.isDefault && "current", model.isFugatoDefault && "Fugato default"].filter(Boolean).join(", "), model.efforts.join(", ")].map(escapeDiagnosticControls).join(" | "));
     outputCommandResult(report, ["Google models from Antigravity ACP", "ID | Name | Selection | Thinking options for the current model", ...rows,
       "Model and thinking values come from the server. Changing models can change the available thinking options.", ""].join("\n"), options.json);
     return;
@@ -1162,7 +1164,7 @@ async function executeTaskRun(request) {
     result = await (backend === "antigravity" ? runAntigravityTurn : runAppServerTurn)(workspaceRoot, {
     // Without a resolved path the runner checks the request directory again and
     // fails before launch; it never falls back to the workspace root.
-    ...(backend === "antigravity" ? { requestCwd: request.cwd, ...(executable ? { executable } : {}) } : {}),
+    ...(backend === "antigravity" ? { requestCwd: request.cwd, modelDefault: request.modelDefault, effortDefault: request.effortDefault, ...(executable ? { executable } : {}) } : {}),
     executionCwd: fs.realpathSync(request.cwd),
     jobId: request.jobId,
     onThreadBusy: (threadId, turnIds) => {
@@ -1259,7 +1261,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
     sandboxPolicy: result.sandboxPolicy ?? null,
     approvalPolicy: result.approvalPolicy ?? "unknown",
     model: result.model ?? request.model ?? null,
-    effort: result.effort ?? request.effort ?? null,
+    effort: result.effort ?? (request.backend === "antigravity" ? null : request.effort ?? null),
     serviceTier: result.serviceTier ?? request.serviceTier ?? null,
     approvedBrowserOrigins: result.approvedBrowserOrigins ?? request.approvedBrowserOrigins ?? [],
     approvedComputerApps: result.approvedComputerApps ?? request.approvedComputerApps ?? [],
@@ -1402,7 +1404,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   });
   // Set once on creation; adoption may change sessionId, never this origin.
   // A null submission distinguishes new, never-submitted jobs from legacy ones.
-  const record = { ...job, ...(identity.backend === "antigravity" ? { backend: identity.backend } : {}), turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
+  const record = { ...job, ...(identity.backend === "antigravity" ? { backend: identity.backend, request: { backend: identity.backend, ...identity.settings } } : {}),
+    turnSubmission: null, reportTracking: 1, launcherPid: process.pid, dispatchSessionId: job.sessionId ?? null, ownerId: lifecycle.owner ?? ownerId(job.id), sessionId: job.sessionId ?? null, leaseRenewedAt: Date.now(), leaseSec: lifecycle.leaseSec ?? 180, questionTimeoutSec: lifecycle.questionTimeoutSec ?? 900,
     ...(lifecycle.budget ? { budget: lifecycle.budget } : {}),
     ...(identity.dispatchNonce ? { dispatchNonce: identity.dispatchNonce } : {}),
     ...(identity.dispatchToolUseId ? { dispatchToolUseId: identity.dispatchToolUseId,
@@ -1450,7 +1453,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   // another worker, even if a competing launcher has not published handles yet.
   if (duplicateDispatch) return { ...duplicateDispatch, dispatchReused: true };
   try {
-    const linkedRun = linkJournalJob({ ...record, cwd: identity.cwd, model: identity.model, effort: identity.effort, request: { run: identity.run, ...(identity.roundtable ? { roundtable: identity.roundtable } : {}) } }, taskBrief(identity));
+    const linkedRun = linkJournalJob({ ...record, cwd: identity.cwd, model: identity.settings.model, effort: identity.settings.effort, request: { run: identity.run, ...(identity.roundtable ? { roundtable: identity.roundtable } : {}) } }, taskBrief(identity));
     if (linkedRun) {
       Object.assign(record, linkedRun);
       updateJob(workspaceRoot, record.id, () => linkedRun);
@@ -1485,12 +1488,11 @@ function buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrows
   return record;
 }
 
-function buildTaskRequest({ cwd, backend = "codex", model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins = [], approvedComputerApps = [], resumeLast, threadId, jobId, report, detached = false, developerInstructions, claudeMd, skills, agentType, agentMemory, claudeInstructionsBase, gitContext, budget, permissionPolicy, roundtable }) {
+function buildTaskRequest({ cwd, backend = "codex", settings, serviceTier, prompt, write, sandbox, approvedBrowserOrigins = [], approvedComputerApps = [], resumeLast, threadId, jobId, report, detached = false, developerInstructions, claudeMd, skills, agentType, agentMemory, claudeInstructionsBase, gitContext, budget, permissionPolicy, roundtable }) {
   return {
     cwd,
     ...(backend === "antigravity" ? { backend } : {}),
-    model,
-    effort,
+    ...settings,
     serviceTier,
     prompt,
     developerInstructions,
@@ -1779,6 +1781,23 @@ function checkLivePermission(options, workspaceRoot, job) {
   }
 }
 
+function antigravityTaskSettings(options, previous, recorded) {
+  const settings = {};
+  const defaults = [
+    ["model", "selectedModel", ANTIGRAVITY_DEFAULT_MODEL],
+    ["effort", "selectedEffort", ANTIGRAVITY_DEFAULT_EFFORT]
+  ];
+  for (const [key, selectedKey, fallback] of defaults) {
+    const actual = previous?.result?.[key] ?? previous?.[selectedKey];
+    const inherited = actual ?? recorded[key];
+    const marker = key + "Default";
+    settings[key] = acpSetting(options[key] ?? inherited ?? fallback, key);
+    // A continued job may have ended before ACP applied its default request.
+    if (options[key] === undefined && actual == null && (inherited == null || previous?.request?.[marker])) settings[marker] = true;
+  }
+  return settings;
+}
+
 async function handleTask(argv) {
   // Parsing --session updates process.env; keep the inherited transcript's
   // original session identity so a nested host cannot relabel its parent's path.
@@ -1934,10 +1953,10 @@ async function handleTask(argv) {
     }
   }
   const defaults = backend === "codex" ? readWorkerDefaults() : {};
-  const model = backend === "antigravity" ? acpSetting(options.model ?? recordedSettings.model, "model")
-    : normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model;
-  const effort = backend === "antigravity" ? acpSetting(options.effort ?? recordedSettings.effort, "effort")
-    : normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort;
+  const settings = backend === "antigravity" ? antigravityTaskSettings(options, sourceJob, recordedSettings) : {
+    model: normalizeRequestedModel(options.model) ?? seating?.member.model ?? recordedSettings.model ?? defaults.model,
+    effort: normalizeReasoningEffort(options.effort) ?? seating?.member.effort ?? recordedSettings.effort ?? defaults.effort
+  };
   if (options.fast && options.normal) throw new Error("Choose either --fast or --normal.");
   const serviceTier = options.fast ? "priority" : options.normal || options.fast === false ? null : recordedSettings.serviceTier ?? null;
   const prompt = readTaskPrompt(cwd, options, positionals);
@@ -2037,7 +2056,7 @@ async function handleTask(argv) {
     else ensureCodexAvailable(cwd);
 
     if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, true, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchNonce, dispatchToolUseId, report: Boolean(options.report || options.detached || options.follow || options.direct) });
     if (job.dispatchReused) {
       await waitForJob(workspaceRoot, job, { owner: job.ownerId, timeoutSec: options["timeout-sec"], direct: true, quiet: options.quiet, toolUseId: dispatchToolUseId });
       return;
@@ -2049,8 +2068,7 @@ async function handleTask(argv) {
       permissionPolicy,
       cwd,
       backend,
-      model,
-      effort,
+      settings,
       serviceTier,
       prompt,
       write,
@@ -2090,8 +2108,8 @@ async function handleTask(argv) {
   }
 
   if (roundtable && !threadId) updateMember(roundtable.roomId, roundtable.persona, { claim: true });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, model, effort, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
-  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, model, effort, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, sandbox, approvedBrowserOrigins, lifecycle, approvedComputerApps, false, { cwd, backend, continued, threadId, resumeLast, prompt, settings, agentName, nativeAgentName, run: options.run, roundtable, dispatchToolUseId, report: Boolean(options.report) });
+  job.request = buildTaskRequest({ ...claudeInstructions, budget, permissionPolicy, cwd, backend, settings, serviceTier, prompt, write, sandbox, approvedBrowserOrigins, approvedComputerApps, resumeLast, threadId, jobId: job.id, report: Boolean(options.report) });
   if (options.run !== undefined) job.request.run = options.run;
   if (inheritance?.details) job.request.settingsInheritance = inheritance.details;
   Object.assign(job.request, forkRequest);
@@ -2104,8 +2122,7 @@ async function handleTask(argv) {
         permissionPolicy,
         cwd,
         backend,
-        model,
-        effort,
+        ...settings,
         serviceTier,
         prompt,
         write,

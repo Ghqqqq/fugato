@@ -277,6 +277,9 @@ export function jobView(value: unknown, marker: CodexLiveMarker, details = true,
   const request = object(job.request);
   const report = object(job.report);
   const result = object(job.result);
+  const gemini = (request.backend ?? job.backend ?? result.backend) === 'antigravity';
+  const model = gemini ? result.model || job.selectedModel || request.model : request.model;
+  const effort = gemini ? result.effort || (job.selectedEffort !== undefined ? job.selectedEffort : request.effort) : request.effort;
   const blockers = Array.isArray(report.blockers) && report.blockers.length ? report.blockers : result.blockers;
   const blockerCode = clean(object(Array.isArray(blockers) ? blockers[0] : undefined).code);
   const unresolved = unresolvedTask(job);
@@ -340,10 +343,10 @@ export function jobView(value: unknown, marker: CodexLiveMarker, details = true,
     active, finished, unresolved, notStarted,
     createdAt: marker.createdAt || string(job.createdAt),
     startedAt: string(job.startedAt) || marker.createdAt || string(job.createdAt),
-    completedAt: string(job.completedAt), model: limitChars(clean(request.model), 100),
+    completedAt: string(job.completedAt), model: limitChars(clean(model), 100),
     // These are already per-turn deltas from the runtime; never use thread totals.
     usage: usageView(result.usage ?? report.usage ?? job.usage),
-    effort: limitChars(clean(request.effort), 40), fast: request.serviceTier === 'priority',
+    effort: limitChars(clean(effort), 40), fast: request.serviceTier === 'priority',
     sandbox: limitChars(clean(job.sandbox), 100), workspaceRoot: marker.workspaceRoot,
     ...summaryFields({ currentOperation, lastActivityAt: string(latest.at) }),
     question, ...(terminalQuestion ? { terminalQuestion } : {}), finalStatus: clean(report.status) || status,

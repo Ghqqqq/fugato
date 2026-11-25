@@ -4,13 +4,14 @@ import path from "node:path";
 // A real stdio peer exercises framing, bidirectional requests and process
 // ownership without installing agy or touching the user's Google credentials.
 export function installFakeAntigravity(directory, options = {}) {
-  const { behavior = "normal", version = "1.5.16", serverRequests = [], turnUpdates = null, loadPermission, promptUsage } = typeof options === "string" ? { behavior: options } : options;
+  const { behavior = "normal", version = "1.5.16", serverRequests = [], turnUpdates = null, loadPermission, promptUsage,
+    modelIds, currentModel, currentEffort, sessionGate, promptGate } = typeof options === "string" ? { behavior: options } : options;
   fs.mkdirSync(directory, { recursive: true });
   const statePath = path.join(directory, "antigravity-state.json");
   const script = path.join(directory, "fake-agy.mjs");
   fs.writeFileSync(statePath, JSON.stringify({ requests: [], serverResponses: [], sessions: [], launches: [], nextSession: 1 }));
-  const config = { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage };
-  fs.writeFileSync(script, `#!${process.execPath}\nconst { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage } = ${JSON.stringify(config)};\n` + String.raw`
+  const config = { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage, modelIds, currentModel, currentEffort, sessionGate, promptGate };
+  fs.writeFileSync(script, `#!${process.execPath}\nconst { statePath, behavior, version, serverRequests, turnUpdates, loadPermission, promptUsage, modelIds, currentModel, currentEffort, sessionGate, promptGate } = ${JSON.stringify(config)};\n` + String.raw`
 import fs from "node:fs";
 import readline from "node:readline";
 const read = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -46,11 +47,11 @@ const geminiModels = [
 ];
 const otherModels = [{ value: "claude-opus-5-5", name: "Claude Opus 5.5" },
   { value: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" }, { value: "gpt-oss-120b-medium", name: "GPT-OSS 120B (Medium)" }];
-const available = behavior === "no-gemini" ? otherModels : [...geminiModels, ...otherModels];
+const available = (behavior === "no-gemini" ? otherModels : [...geminiModels, ...otherModels]).filter(model => !modelIds || modelIds.includes(model.value));
 const modelId = behavior === "dynamic-selectors" ? "selected-model" : "model";
 const thoughtId = behavior === "dynamic-selectors" ? "reasoning-choice" : "thought_level";
-let sessionId = null, model = ["non-gemini-default", "no-gemini"].includes(behavior) ? otherModels[0].value : geminiModels[0].value;
-let thought = "high", promptRequest = null, thinkingOverride = null;
+let sessionId = null, model = currentModel ?? (["non-gemini-default", "no-gemini"].includes(behavior) ? otherModels[0].value : geminiModels[0].value);
+let thought = currentEffort ?? "high", promptRequest = null, thinkingOverride = null;
 let scriptedReplies = 0;
 let pendingLoad = null;
 const configs = () => [
@@ -64,6 +65,7 @@ const configs = () => [
 const update = (data, id = sessionId) => send({ method: "session/update", params: { sessionId: id, update: data } });
 const configNotification = () => ({ method: "session/update", params: { sessionId, update: { sessionUpdate: "config_option_update", configOptions: configs() } } });
 function sessionReply(id, loaded = false) {
+  if (sessionGate && !fs.existsSync(sessionGate)) { setTimeout(() => sessionReply(id, loaded), 10); return; }
   const suffix = loaded ? "load" : "new";
   const response = { id, result: { ...(loaded ? {} : { sessionId }), configOptions: configs() } };
   if (["config-after-" + suffix, "config-before-" + suffix, "config-before-new-only"].includes(behavior)) {
@@ -81,6 +83,7 @@ function editCall(toolCallId) {
 }
 function finish(stopReason = "end_turn") {
   if (!promptRequest) return;
+  if (stopReason === "end_turn" && promptGate && !fs.existsSync(promptGate)) { setTimeout(() => finish(), 10); return; }
   if (stopReason === "end_turn" && turnUpdates) {
     for (const frame of turnUpdates) update(frame);
   } else if (stopReason === "end_turn") {

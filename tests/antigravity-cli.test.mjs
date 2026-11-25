@@ -11,10 +11,10 @@ import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 const script = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
 const stateModule = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
 
-function fixture(behavior = "normal") {
+function fixture(options = "normal") {
   const dir = makeTempDir("agy-cli-"), repo = path.join(dir, "repo");
   fs.mkdirSync(repo); initGitRepo(repo);
-  const acp = installFakeAntigravity(dir, { behavior });
+  const acp = installFakeAntigravity(dir, options);
   const codexCalls = path.join(dir, "unexpected-codex.jsonl");
   const codexTrap = path.join(dir, "unexpected-codex");
   writeExecutable(codexTrap, `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(codexCalls)}, JSON.stringify(process.argv.slice(2)) + "\\n"); process.exit(97);\n`);
@@ -98,7 +98,7 @@ test("Google tasks run without Codex and continuations retain their backend and 
 });
 
 test("Google model discovery uses the ACP catalog without a Codex default or a model turn", () => {
-  const f = fixture(); f.env.CODEX_COMPANION_BIN = f.codexTrap;
+  const f = fixture({ currentModel: "gemini-3.8-flash", currentEffort: "medium" }); f.env.CODEX_COMPANION_BIN = f.codexTrap;
   const setup = json(f.call("setup", "--backend", "antigravity", "--json"));
   assert.equal(setup.backend, "antigravity");
   assert.equal(setup.ready, true);
@@ -107,19 +107,56 @@ test("Google model discovery uses the ACP catalog without a Codex default or a m
   const catalog = json(f.call("models", "--backend", "antigravity", "--json"));
   const gemini = ["gemini-4-neon", "gemini-4-carbon", "gemini-pro-orchestrator", "gemini-3.8-flash"];
   assert.deepEqual(catalog.models.map(model => model.slug), gemini);
+  assert.deepEqual(catalog.models.filter(model => model.isDefault).map(model => model.slug), ["gemini-3.8-flash"]);
+  assert.deepEqual(catalog.models.filter(model => model.isFugatoDefault).map(model => model.slug), ["gemini-4-neon"]);
+  const table = f.call("models", "--backend", "antigravity");
+  assert.equal(table.status, 0, table.stderr);
+  assert.match(table.stdout, /^gemini-4-neon \| .* \| Fugato default \|/m);
   assert.deepEqual(catalog.configOptions.find(value => value.id === "model").options.map(option => option.value), gemini);
   assert.equal(prompts(f).length, 0);
-  const done = direct(f.call("task", "--backend", "antigravity", "--direct", "Complete a default-model assignment."));
-  assert.equal(done.status, "completed");
-  const saved = f.stored(done.jobId);
-  assert.equal(saved.result.model, "gemini-4-neon");
-  assert.notEqual(saved.request.effort, "xhigh");
-  assert.ok(!f.requests().some(message => message.method === "session/set_config_option" && /^gpt-|xhigh/.test(String(message.params?.value))));
   assertNoCodex(f);
 });
 
+test("Google dispatch records and selects Neon then xhigh when both flags are omitted", () => {
+  const f = fixture({ currentModel: "gemini-3.8-flash", currentEffort: "medium" });
+  const done = direct(f.call("task", "--backend", "antigravity", "--direct", "Complete a default-model assignment."));
+  assert.equal(done.status, "completed");
+  const { request, selectedModel, selectedEffort } = f.stored(done.jobId);
+  assert.deepEqual([request.model, request.effort, request.modelDefault, request.effortDefault], ["gemini-4-neon", "xhigh", true, true]);
+  assert.deepEqual([selectedModel, selectedEffort], ["gemini-4-neon", "xhigh"]);
+  assert.deepEqual(f.requests().map(({ method, params }) => method === "session/set_config_option" ? [params.configId, params.value] : method),
+    ["initialize", "session/new", ["model", "gemini-4-neon"], ["thought_level", "xhigh"], "session/prompt"]);
+});
+
+test("Google continuations inherit the actual fallback when Neon later becomes available", () => {
+  const f = fixture({ modelIds: ["gemini-4-carbon", "gemini-3.8-flash"], currentModel: "gemini-3.8-flash", currentEffort: "medium" });
+  const first = direct(f.call("task", "--backend", "antigravity", "--direct", "Use the account defaults."));
+  f.env.FUGATO_ANTIGRAVITY_BIN = installFakeAntigravity(path.join(f.dir, "restored")).binary;
+  const next = direct(f.call("task", "--continue", first.jobId, "--direct", "Continue on the same model."));
+  const { request, result } = f.stored(next.jobId);
+  assert.deepEqual([request.model, request.effort, result.model, result.effort], ["gemini-3.8-flash", "medium", "gemini-3.8-flash", "medium"]);
+  assert.ok(!request.modelDefault && !request.effortDefault);
+});
+
+test("each explicit Google selection is strict even when its value matches a built-in default", () => {
+  const f = fixture({ modelIds: ["gemini-3.8-flash"], currentModel: "gemini-3.8-flash", currentEffort: "medium" });
+  const task = (...flags) => f.call("task", "--backend", "antigravity", "--json", ...flags, "Check the foreground settings.");
+  for (const [flags, error] of [
+    [["--model", "gemini-4-neon"], /Unsupported Antigravity model 'gemini-4-neon'/],
+    [["--effort", "xhigh"], /Unsupported Antigravity thinking level 'xhigh'/]
+  ]) {
+    const refused = task(...flags);
+    assert.notEqual(refused.status, 0);
+    assert.match(refused.stderr + refused.stdout, error);
+  }
+  assert.equal(prompts(f).length, 0);
+  const done = json(task("--model", "gemini-3.8-flash"));
+  const { request, selectedEffort } = f.stored(done.jobId);
+  assert.deepEqual([request.model, request.modelDefault, request.effortDefault, selectedEffort], ["gemini-3.8-flash", undefined, true, "medium"]);
+});
+
 test("Google tasks submit only with an allowed Gemini model", () => {
-  const f = fixture("non-gemini-default");
+  const f = fixture({ behavior: "non-gemini-default", modelIds: ["gemini-4-carbon", "gemini-3.8-flash", "claude-opus-5-5"] });
   const task = (...flags) => f.call("task", "--backend", "antigravity", "--direct", ...flags, "Check the model selection.");
   const rejected = task("--model", "claude-opus-5-5");
   assert.notEqual(rejected.status, 0);
@@ -128,10 +165,9 @@ test("Google tasks submit only with an allowed Gemini model", () => {
   const offset = f.requests().length;
   const completed = direct(task());
   assert.equal(completed.status, "completed");
-  assert.equal(f.stored(completed.jobId).result.model, "gemini-4-neon");
+  assert.equal(f.stored(completed.jobId).result.model, "gemini-4-carbon");
   const requests = f.requests().slice(offset);
-  assert.deepEqual(requests.map(value => value.method), ["initialize", "session/new", "session/set_config_option", "session/prompt"]);
-  assert.equal(requests[2].params.value, "gemini-4-neon");
+  assert.deepEqual(requests.filter(value => value.method === "session/set_config_option").map(value => value.params.value), ["gemini-4-carbon", "xhigh"]);
 
   const none = fixture("no-gemini");
   const unavailable = none.call("task", "--backend", "antigravity", "--direct", "Check the model selection.");

@@ -1321,7 +1321,7 @@ test('native Gemini worker dispatches ACP, keeps its backend on reload and omits
   assert.equal(launch.argv.includes('--model'), false);
   assert.equal(launch.argv.includes('--fast'), false);
   assert.equal(launch.argv.includes('--sandbox'), false, 'The preset must not override a configured sandbox');
-  assert.equal(acp.requests().some(request => request.method === 'session/set_config_option'), false);
+  assert.deepEqual(acp.requests().filter(request => request.method === 'session/set_config_option').map(request => request.params.value), ['xhigh']);
   assert.equal(fs.existsSync(f.env.CODEX_FIXTURE_STATE_PATH), false, 'Codex must not run for a Gemini task');
   assert.equal(first.usage.totalTokens, 9652, 'Use the prompt result, not the context occupation update');
   const notices = f.capture.notices.map(notice => notice.message.content[0].text).join('\n');
@@ -1343,6 +1343,31 @@ test('native Gemini worker dispatches ACP, keeps its backend on reload and omits
 });
 
 const geminiType = 'fugato:gemini-native';
+test('the native Gemini header shows dispatch settings and refreshes them after ACP selection', async () => {
+  const f = fixture('review-ok', 'gemini-display');
+  const sessionGate = path.join(f.root, 'start-session'), promptGate = path.join(f.root, 'finish-turn');
+  const acp = installFakeAntigravity(path.join(f.root, 'acp'), { sessionGate, promptGate,
+    modelIds: ['gemini-4-carbon', 'gemini-3.8-flash'], currentModel: 'gemini-3.8-flash', currentEffort: 'medium' });
+  f.env.FUGATO_ANTIGRAVITY_BIN = acp.binary;
+  const prompt = 'Show the settings for this turn.';
+  const pending = f.turn(prompt, 1, false, { agentType: geminiType, ...appendRenderPrompt(f, prompt) });
+  const header = async () => renderLeaves(await renderNativePrompt(f, prompt, 120)).join('');
+  try {
+    await until(() => acp.requests().some(request => request.method === 'session/new'));
+    await f.advance(1500);
+    assert.match(await header(), /worker · gemini-4-neon xhigh/);
+    fs.writeFileSync(sessionGate, '');
+    await until(() => acp.requests().some(request => request.method === 'session/prompt'));
+    await f.advance(2000);
+    assert.match(await header(), /worker · gemini-3\.8-flash medium/);
+    assert.equal(f.jobs()[0].result, undefined);
+  } finally {
+    fs.writeFileSync(sessionGate, '');
+    fs.writeFileSync(promptGate, '');
+    await pending;
+  }
+});
+
 const renderCard = async (f, report) => {
   const card = await f.invoke('ui.render', { component: 'AssistantMessage', viewport: { columns: 120 },
     props: { text: JSON.stringify(report) } }, async () => assert.fail('Native report fell through to raw JSON'));

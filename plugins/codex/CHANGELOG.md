@@ -7,9 +7,11 @@
   Resolve relative executable paths from the task directory and launch the
   same absolute path recorded for recovery.
   Document [setup and Google's sign-in conditions](../../docs/antigravity.md).
-- Check readiness over ACP, list only `gemini-*` models and show thinking
-  levels for the current model. Without a model override, replace a non-Gemini
-  default with the first advertised Gemini model before sending a prompt.
+- Check readiness over ACP and list advertised Gemini models. Mark
+  `gemini-4-neon` as the Fugato default and request `xhigh` thinking.
+  If Neon is unavailable, use the current or first advertised Gemini model.
+  If `xhigh` is unavailable, keep the selected model's current level. The native
+  agent header and `fugato-live` show the settings from dispatch through selection.
 - Show the full approval text with whitespace preserved. Deny changed
   operations, conflicting argument copies, questions over 16 KiB and
   executions missing a command line. Denied commands remain blockers and

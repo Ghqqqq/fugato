@@ -70,14 +70,20 @@ launches the exact absolute path it checked for the turn and records that path
 for recovery. [Executable resolution](../plugins/codex/scripts/lib/antigravity.mjs) ·
 [Worker launch](../plugins/codex/scripts/codex-companion.mjs)
 
-The model list includes only the account's advertised `gemini-*` IDs. It lists
-thinking levels only for the currently selected model. Use
-`fugato models --backend antigravity --json` for the IDs and configuration
-options. With no model override on a fresh task, Fugato uses the current
-Gemini model or selects the first advertised Gemini model if needed. An
-explicit non-Gemini `--model`, an unavailable ID or an account with no Gemini
-model fails before the prompt. After changing models, Fugato refreshes the
-configuration before validating any requested `--effort`.
+## Default model and thinking level
+
+Fresh Gemini workers request `gemini-4-neon` with `xhigh` thinking. If Neon
+is unavailable, Fugato keeps agy's current Gemini model or selects the first
+advertised Gemini model. It then checks the selected model's thinking options
+and keeps its current level if `xhigh` is unavailable. Explicit `--model` and
+`--effort` values must be supported. A continuation inherits the settings
+actually used on its thread. The native agent header and `fugato-live` show
+the requested settings at dispatch and update when agy selects a fallback.
+
+`fugato models --backend antigravity` lists the account's advertised
+`gemini-*` IDs and labels Neon as the Fugato default when available. Thinking
+options apply to agy's current model. In the `--json` output, `isDefault`
+identifies that current model and `isFugatoDefault` identifies Neon.
 [`listAntigravityModels` and `setSelection`](../plugins/codex/scripts/lib/antigravity.mjs)
 
 ## Start a native worker in Claude Code
@@ -87,8 +93,8 @@ Agent(subagent_type: "fugato:gemini-native", prompt: "Investigate the parser fai
 ```
 
 To select a model or thinking level for this assignment, put an optional
-`DUET:` header on the first line of the prompt. Use a listed model ID and omit
-`--effort` to keep that model's configured thinking level.
+`DUET:` header on the first line of the prompt. Either flag can be supplied
+on its own.
 
 ```text
 DUET: --model <gemini-model-id> --effort <thinking-value> --max-minutes 10

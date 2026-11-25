@@ -12,6 +12,8 @@ import { PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
+export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
+export const ANTIGRAVITY_DEFAULT_EFFORT = "xhigh";
 const LOGIN_HELP = "Run `agy acp --login` (or an interactive `agy` session) to sign in, then retry.";
 const cancelledOutcome = () => ({ outcome: { outcome: "cancelled" } });
 const notStarted = error => Object.assign(error, { turnStatus: "notStarted", turnEnded: true });
@@ -140,30 +142,33 @@ function sessionConfiguration(sessionId = null) {
   };
 }
 
-async function setSelection(client, sessionId, configuration, kind, requested, signal) {
-  let option = configOption(configuration.options, kind);
-  if (kind === "model") {
-    option = geminiModelOption(option);
-    if (requested && !isGemini(requested)) throw new Error(`Antigravity supports only Gemini models (gemini-*). Cannot select '${requested}'.`);
-    if (!requested) {
-      if (option.currentValue) return;
-      requested = configValues(option)[0]?.value;
-      if (!requested) throw new Error("Antigravity did not advertise a Gemini model for this account.");
-    }
-  } else if (!requested) return;
-  if (!option) throw new Error(`Antigravity does not advertise a ${kind === "model" ? "model" : "thinking level"} selector; leave this option unset to use its configured default.`);
+async function setSelection(client, sessionId, configuration, kind, requested, isDefault, signal) {
+  const selector = configOption(configuration.options, kind);
+  const model = kind === "model";
+  if (model && requested && !isGemini(requested)) throw new Error(`Antigravity supports only Gemini models (gemini-*). Cannot select '${requested}'.`);
+  const option = model ? geminiModelOption(selector) : selector;
+  if (!model && !requested) return;
+  if (!option) {
+    if (isDefault) return;
+    throw new Error("Antigravity does not advertise a thinking level selector; leave this option unset to use its configured default.");
+  }
   const values = configValues(option);
-  const exact = values.find(value => value.value === requested);
-  // Thinking display labels may be title-cased while IDs are opaque. Model
-  // IDs always require an exact match; never guess a different billed model.
-  const selected = exact ?? (kind === "thought_level" ? values.find(value => String(value.name).toLowerCase() === String(requested).toLowerCase()) : null);
-  if (!selected) throw new Error(`Unsupported Antigravity ${kind === "model" ? "model" : "thinking level"} '${requested}'. Available values: ${values.map(value => value.value).join(", ") || "none"}.`);
-  if (option.currentValue === selected.value) return;
+  let selected = values.find(value => value.value === requested);
+  // Thinking labels may be title-cased while their IDs are opaque.
+  if (!selected && !model) selected = values.find(value => String(value.name).toLowerCase() === String(requested).toLowerCase());
+  if (!selected && (isDefault || !requested)) {
+    if (!model || option.currentValue) return option.currentValue;
+    selected = values[0];
+    if (!selected) throw new Error("Antigravity did not advertise a Gemini model for this account.");
+  }
+  if (!selected) throw new Error(`Unsupported Antigravity ${model ? "model" : "thinking level"} '${requested}'. Available values: ${values.map(value => value.value).join(", ") || "none"}.`);
+  if (option.currentValue === selected.value) return selected.value;
   await client.request("session/set_config_option", { sessionId, configId: option.id, value: selected.value }, { signal, onResponse: result => {
     if (!Array.isArray(result?.configOptions)) throw new Error("Antigravity did not return its updated session configuration.");
     if (!result.configOptions.some(value => value.id === option.id && value.currentValue === selected.value)) throw new Error("Antigravity did not acknowledge the requested session configuration.");
     configuration.accept(result);
   } });
+  return selected.value;
 }
 
 function parentBridgeServers(cwd, options) {
@@ -528,14 +533,14 @@ export async function runAntigravityTurn(cwd, options = {}) {
       // arrive as soon as its first live handle is published.
       releaseAdmission = acquireSessionAdmission(threadId);
     }
-    await setSelection(client, threadId, configuration, "model", options.model, options.signal);
-    await setSelection(client, threadId, configuration, "thought_level", options.effort, options.signal);
+    const selectedModel = await setSelection(client, threadId, configuration, "model", options.model, options.modelDefault, options.signal);
+    await setSelection(client, threadId, configuration, "thought_level", options.effort, options.effortDefault, options.signal);
     model = configSelection(configuration.options, "model");
     effort = configSelection(configuration.options, "thought_level");
-    if (!isGemini(model) || (options.model && options.model !== model)) throw new Error("Antigravity did not confirm the selected Gemini model before prompt submission.");
+    if (!isGemini(model) || selectedModel !== model) throw new Error("Antigravity did not confirm the selected Gemini model before prompt submission.");
     if (options.signal?.aborted) throw new Error("Antigravity task interrupted before prompt submission.");
     turnId = `acp-${randomUUID()}`;
-    persist({ threadId, turnId, turnSubmission: { at: new Date().toISOString(), transport: "acp-stdio", threadId } });
+    persist({ threadId, turnId, selectedModel: model, selectedEffort: effort, turnSubmission: { at: new Date().toISOString(), transport: "acp-stdio", threadId } });
     reservation.submitted();
     submitted = true; capture = true;
     promptPromise = client.request("session/prompt", { sessionId: threadId, prompt: content }, { timeoutMs: 0 });

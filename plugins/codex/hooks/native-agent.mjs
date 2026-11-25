@@ -87,13 +87,15 @@ const ended = (job, state) => (['interrupted', 'cancelled'].includes(job.status)
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_RECORDS = 128, MAX_STORE_SIZE = 2 * 1024 * 1024;
 const nativeAgents = { plugin: 'fugato', key: 'nativeAgents' };
+const displayModel = job => job.result?.model || job.selectedModel || job.request?.model;
+const displayEffort = job => job.result?.effort ?? (job.selectedEffort !== undefined ? job.selectedEffort : job.request?.effort);
 // Display metadata only; the durable binding remains the execution authority.
 async function publishActivity($, state, job) {
   try {
     const current = await $.store.get(keyFor(state.session, state.agentId));
     if (current && bindingTurn(current) !== bindingTurn(state)) return;
     const entry = { jobId: job.id, threadId: job.threadId || '', workspace: job.request?.cwd || state.cwd || '',
-      name: job.agentName || state.name || state.agentId, model: job.result?.model || job.request?.model || 'unknown',
+      name: job.agentName || state.name || state.agentId, model: displayModel(job) || 'unknown',
       ...(job.request?.backend === 'antigravity' ? { backend: 'antigravity' } : {}) };
     for (let attempt = 0; attempt < 8; attempt++) {
       const { value = {}, version } = await $.state.get(nativeAgents);
@@ -262,9 +264,10 @@ function updateDisplay($, state, job) {
   if (job) {
     view.jobId = job.id || state.jobId;
     const request = job.request;
-    const model = job.result?.model ?? request?.model, effort = job.result?.effort ?? request?.effort;
+    const model = displayModel(job), effort = displayEffort(job);
     if (typeof model === 'string') view.model = model;
     if (typeof effort === 'string') view.effort = effort;
+    else if (job.selectedEffort === null) delete view.effort;
     if (typeof request?.sandbox === 'string') view.sandbox = request.sandbox;
     if (request && Object.hasOwn(request, 'serviceTier')) view.speed = request.serviceTier === 'priority' ? 'fast' : 'normal';
     view.question = ACTIVE.includes(job.status) && job.pendingQuestion?.answer === undefined
@@ -1659,7 +1662,7 @@ function observer() {
 }
 function progressFor($, e, state, publish, currentFlight) {
   let starting, lookup, busy = false, keepaliveInFlight = false, stopped = false, lastAt, lastStreamedAt, startedAt;
-  let enrichmentDeadline, enrichmentFailed = false;
+  let enrichmentDeadline, enrichmentFailed = false, selectionTimer;
   let noticing = Promise.resolve();
   const feed = liveProgress.get(e.agentId);
   const attemptId = state.incoming?.attemptId ?? state.intent?.attemptId;
@@ -1721,8 +1724,24 @@ function progressFor($, e, state, publish, currentFlight) {
       for (const field of fields) state[field] = observed[field];
       if (!state.status || ACTIVE.includes(state.status)) state.status = observed.status;
       await persist(fields);
-      await notice(`${runtimeLabel(state)} worker ${job.agentName || state.name} started · job ${job.id} · ${job.request?.model ?? 'server default'} / ${job.request?.effort ?? 'server default'} / ${job.request?.sandbox}`);
+      const gemini = job.request?.backend === 'antigravity';
+      const model = gemini ? displayModel(job) : job.request?.model;
+      const effort = gemini ? displayEffort(job) : job.request?.effort;
+      await notice(`${runtimeLabel(state)} worker ${job.agentName || state.name} started · job ${job.id} · ${model ?? 'server default'} / ${effort ?? 'server default'} / ${job.request?.sandbox}`);
       if (!active()) return;
+      // The first snapshot can precede ACP startup. Refresh the display until
+      // the server confirms selection, even when the worker is otherwise quiet.
+      if (gemini && !job.selectedModel && ACTIVE.includes(job.status)) {
+        selectionTimer = $.clock.every(2000, async () => {
+          if (!active() || lookup) return;
+          lookup = handles($, { ...state }, job.id, false, false, { timeoutMs: 2000 });
+          try {
+            const latest = await lookup;
+            if (latest.selectedModel || !ACTIVE.includes(latest.status)) selectionTimer.cancel();
+          } catch (error) { progressError($, error); }
+          finally { lookup = null; }
+        });
+      }
       notices.started = true;
       await persist();
     })().catch(error => { enrichmentFailed = true; throw error; }).finally(() => { starting = null; });
@@ -1732,6 +1751,7 @@ function progressFor($, e, state, publish, currentFlight) {
     start,
     async stop() {
       stopped = true;
+      selectionTimer?.cancel();
       // The host bounds and terminates this process. Join it before releasing
       // the flight; late lookup results cannot publish or persist anything.
       await optional(() => lookup);

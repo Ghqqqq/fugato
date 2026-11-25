@@ -922,6 +922,17 @@ test('command cleanup follows shared vectors, redirections, heredocs and the for
   }
 });
 
+test('the Gemini pane header follows dispatch, selected settings and final results', () => {
+  const request = { backend: 'antigravity', model: 'gemini-4-neon', effort: 'xhigh' };
+  const selected = { selectedModel: 'gemini-3.8-flash', selectedEffort: 'medium' };
+  const result = { model: 'gemini-4-carbon', effort: 'high' };
+  const header = (fields: Record<string, unknown>) => feedItems(jobView({ id: 'job-a', status: 'running', request, ...fields }, marker()), epoch)[0]?.title;
+  expect(header({})).toContain(' · worker · gemini-4-neon xhigh');
+  expect(header(selected)).toContain(' · worker · gemini-3.8-flash medium');
+  expect(header({ ...selected, result, status: 'completed' })).toContain(' · worker · gemini-4-carbon high');
+  expect(header({ request: { model: 'gpt-6-astra', effort: 'xhigh' }, result: { model: 'other', effort: 'low' } })).toContain(' · worker · astra xhigh');
+});
+
 test('the list shares one fourteen-cell time axis and hides timeline/detail at their width thresholds', () => {
   const live = { ...running(), agentName: 'Carnot', role: 'reviewer', startedAt: new Date(epoch + 60000).toISOString() };
   const done = { ...running(), id: 'done', agentName: 'Sohonie', role: 'implementer', status: 'completed', active: false, finished: true,
