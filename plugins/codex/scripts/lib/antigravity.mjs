@@ -30,7 +30,11 @@ function denyPermission(options) {
 
 export function resolveAntigravityExecutable(cwd) {
   const command = binary();
-  if (!command.includes("/") && !command.includes(path.sep)) return executableOnPath(command);
+  if (process.platform === "win32") {
+    const name = /[\\/]/.test(command) ? path.win32.resolve(cwd, command) : command;
+    return executableOnPath(name);
+  }
+  if (!command.includes("/")) return executableOnPath(command);
   const executable = path.isAbsolute(command) ? command : path.resolve(cwd, command);
   try {
     fs.accessSync(executable, fs.constants.X_OK);
@@ -289,9 +293,8 @@ function observeTool(tools, update) {
     tool.rawInput = Object.hasOwn(update, "rawInput") ? update.rawInput : update.args;
     tool.args = Object.hasOwn(update, "args") ? update.args : update.rawInput;
   }
-  for (const diff of toolDiffs(update)) {
-    if (!call.diffs.some(previous => isDeepStrictEqual(previous, diff))) call.diffs.push(diff);
-  }
+  const diffs = toolDiffs(update);
+  if (diffs.length) call.diffs = diffs;
   call.tool = tool;
   tools.set(update.toolCallId, call);
   return call;
@@ -479,10 +482,8 @@ export async function runAntigravityTurn(cwd, options = {}) {
             if (typeof update.toolCallId !== "string") break;
             {
             const { tool, diffs } = observeTool(tools, update);
-            if (update.sessionUpdate === "tool_call") {
-              toolSinceChunk = true;
-              publishAnonymous();
-            }
+            toolSinceChunk = true;
+            publishAnonymous();
             const lifecycle = ["completed", "failed", "cancelled"].includes(tool.status) ? "completed" : "started";
             if (activityLifecycles.get(tool.toolCallId) === lifecycle || activityLifecycles.get(tool.toolCallId) === "completed") break;
             activityLifecycles.set(tool.toolCallId, lifecycle);

@@ -85,7 +85,7 @@ test("Antigravity includes cache reads and writes in Fugato input token totals",
     { inputTokens: 9588, cachedInputTokens: 7508, outputTokens: 149, reasoningOutputTokens: 149, totalTokens: 9737 });
 });
 
-test("Antigravity retains every observed edit diff through a text-only completion", async t => {
+test("Antigravity retains the latest edit diffs through a text-only completion", async t => {
   const first = { type: "diff", path: "/fixture/calc.py", oldText: "return a - b", newText: "return a + b" };
   const second = { type: "diff", path: "/fixture/test_calc.py", oldText: "pass", newText: "assert add(1, 2) == 3" };
   const rawInput = { Path: first.path, Target: first.oldText, Replacement: first.newText };
@@ -96,8 +96,46 @@ test("Antigravity retains every observed edit diff through a text-only completio
     { sessionUpdate: "tool_call_update", toolCallId: "edit", status: "completed", content: [{ type: "content", content: { type: "text", text: "Updated." } }] }
   ] });
   const result = await fake.run();
-  assert.deepEqual(result.touchedFiles, [first.path, second.path]);
-  assert.deepEqual(result.fileChanges[0].content.filter(block => block.type === "diff"), [first, second]);
+  // Each diff-bearing update replaces the proposal, and the text result preserves it.
+  assert.deepEqual(result.touchedFiles, [second.path]);
+  assert.deepEqual(result.fileChanges[0].content.filter(block => block.type === "diff"), [second]);
+});
+
+test("a revised pending edit reports only the file presented for approval", async t => {
+  const proposal = path => ({
+    rawInput: { Path: path, Target: "before", Replacement: "after" }, locations: [{ path }],
+    content: [{ type: "diff", path, oldText: "before", newText: "after" }]
+  });
+  const toolCallId = "edit";
+  const fake = fixture(t, { serverRequests: [{ ...permissionRequest({ toolCallId }), beforeUpdates: [
+    { sessionUpdate: "tool_call", toolCallId, name: "edit_file", kind: "edit", status: "pending", ...proposal("/fixture/a.txt") },
+    { sessionUpdate: "tool_call_update", toolCallId, ...proposal("/fixture/b.txt") }
+  ] }], turnUpdates: [{ sessionUpdate: "tool_call_update", toolCallId, status: "completed" }] });
+  const activity = [];
+  let question;
+  const result = await fake.run({
+    onApprovalRequest: request => { question = request.question; return "once"; },
+    onProgress: event => activity.push(...(event.activity ?? []))
+  });
+  assert.match(question, /\/fixture\/b\.txt/);
+  assert.doesNotMatch(question, /\/fixture\/a\.txt/);
+  assert.deepEqual(result.touchedFiles, ["/fixture/b.txt"]);
+  assert.deepEqual(activity.filter(item => item.type === "fileChange").map(item => item.path), ["/fixture/b.txt"]);
+});
+
+test("a tool status update separates anonymous progress from the final report", async t => {
+  const chunk = text => ({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+  const notice = "Waiting for the command.";
+  const body = JSON.stringify({ status: "completed", summary: "Command finished." });
+  const fake = fixture(t, { turnUpdates: [
+    { ...commandCall("list", "ls"), status: "in_progress" }, chunk(notice),
+    { sessionUpdate: "tool_call_update", toolCallId: "list", status: "completed" }, chunk(body)
+  ] });
+  const messages = [];
+  const result = await fake.run({ onProgress: event => messages.push(...(event.activity ?? []).filter(item => item.type === "agentMessage")) });
+  assert.equal(result.finalMessage, body);
+  assert.equal(parseStructuredReport(result.finalMessage)?.summary, "Command finished.");
+  assert.deepEqual(messages.map(item => item.body), [notice, "Command finished."]);
 });
 
 test("interleaved message IDs preserve the last active message and emit each complete message once", async t => {
@@ -508,6 +546,22 @@ test("Antigravity availability errors explain the executable and login prerequis
   process.env.FUGATO_ANTIGRAVITY_BIN = path.join(fake.directory, "missing-agy");
   assert.equal(resolveAntigravityExecutable(fake.directory), null);
   assert.throws(() => ensureAntigravityAvailable(fake.directory), /FUGATO_ANTIGRAVITY_BIN/);
+});
+
+test("Antigravity resolves explicit extensionless Windows paths in PATHEXT order", t => {
+  const platform = Object.getOwnPropertyDescriptor(process, "platform"), env = process.env;
+  t.after(() => { Object.defineProperty(process, "platform", platform); process.env = env; });
+  Object.defineProperty(process, "platform", { value: "win32" });
+  process.env = { ...env, PATHEXT: ".BAT;.CMD;.EXE" };
+  const cwd = "C:\\workspace", base = path.win32.join(cwd, "tools", "agy");
+  t.mock.method(fs, "accessSync", file => {
+    if (file !== base + ".CMD" && file !== base + ".EXE") throw new Error("File not found");
+  });
+  t.mock.method(fs, "statSync", () => ({ isFile: () => true }));
+  for (const command of [".\\tools\\agy", base]) {
+    process.env.FUGATO_ANTIGRAVITY_BIN = command;
+    assert.equal(resolveAntigravityExecutable(cwd), base + ".CMD");
+  }
 });
 
 test("Antigravity launches the executable checked in the requested subdirectory", async t => {
