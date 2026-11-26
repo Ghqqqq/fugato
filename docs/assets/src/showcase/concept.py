@@ -1,4 +1,4 @@
-"""How it works, drawn literally: Claude plans criteria and briefs, Codex workers run, Claude accepts on evidence."""
+"""How it works, drawn literally: Claude plans criteria and briefs, workers run, Claude accepts on evidence."""
 import os, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.environ.get('ART_DIR', os.path.join(HERE, '..', 'fugato'))); sys.path.insert(0, HERE)
@@ -75,10 +75,10 @@ def concept(theme):
     p = pg.p
     A, B, C = 0, 560, 1190
     pg.text('Claude plans', 46, A, 52, ITALIC_SEMI)
-    pg.text('Codex works', 46, B, 52, ITALIC_SEMI)
+    pg.text('Workers run', 46, B, 52, ITALIC_SEMI)
     pg.text('Claude accepts', 46, C, 52, ITALIC_SEMI)
     pg.text('acceptance criteria and one brief per worker', 25, A, 92, ROMAN, p['muted'])
-    pg.text('each worker on its own Codex thread', 25, B, 92, ROMAN, p['muted'])
+    pg.text('each worker on its own thread', 25, B, 92, ROMAN, p['muted'])
     pg.text('evidence first, then a verdict', 25, C, 92, ROMAN, p['muted'])
     rows = [
         ('the cause of the flake is found', 'Zhang', 'investigator', 0, 250,
@@ -93,7 +93,7 @@ def concept(theme):
         # Claude plans: a criterion and the brief that carries it.
         pg.box(A, y, p['claude'])
         pg.text(criterion, 29, A + 30, y, ROMAN)
-        # Codex works: the worker enters after the one before it, like the mark's voices.
+        # Workers run: the worker enters after the one before it, like the mark's voices.
         x0 = B + start
         pg.arrow(A + 452, x0 - 12, y - 7, 'brief' if k == 0 else None)
         nx = pg.code([(name, p['ink'], True)], x0, y)
@@ -116,7 +116,7 @@ def concept(theme):
             pg.tick(C, vy, p['ok'])
         e = pg.text(verdict[0], 29, C + 30, vy, ROMAN)
         pg.text(' · ' + verdict[1], 25, e, vy, ROMAN, p['muted'])
-    return pg.svg(1600, 420, 'How Fugato works: Claude writes criteria and briefs, Codex workers run on their own threads, Claude accepts on evidence')
+    return pg.svg(1600, 420, 'How Fugato works: Claude writes criteria and briefs, workers run on their own threads, Claude accepts on evidence')
 
 
 for theme in ('light', 'dark'):

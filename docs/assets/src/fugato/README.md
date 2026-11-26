@@ -7,7 +7,7 @@
 | --- | --- |
 | `fugato-banner-{light,dark}.svg` | The exposition banner: four voices enter one after another and close on a final barline |
 | `fugato-glyph-<mode>-{light,dark}.svg` | One small stroke figure per mode, for the mode table |
-| `fugato-score-<mode>-{light,dark}.svg` | Each mode drawn as a page of a score: Claude's stave and the Codex voices |
+| `fugato-score-<mode>-{light,dark}.svg` | Each mode drawn as a page of a score: Claude's stave and the worker voices |
 
 The drawings reuse the mark's stroke (`docs/assets/fugato-mark-*.svg`) and its
 four tones. Text is set as glyph outlines, so the images look the same on every

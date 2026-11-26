@@ -67,7 +67,7 @@ def glyphs(theme):
 
 
 class Score:
-    """A mode drawn as a page of a score: Claude's stave and the Codex voices, time running left to right."""
+    """A mode drawn as a page of a score: Claude's stave and the worker voices, time running left to right."""
 
     def __init__(self, theme, height, top):
         self.p, self.h, self.top = PALETTE[theme], height, top
@@ -199,7 +199,7 @@ def ultra(theme):
     s.add(f'<path d="M252 {top}C240 {top} 240 {top + 10} 240 {top + 28}V{mid - 16}C240 {mid - 4} 234 {mid} 226 {mid}'
           f'C234 {mid} 240 {mid + 4} 240 {mid + 16}V{bot - 28}C240 {bot - 10} 240 {bot} 252 {bot}" '
           f'stroke="{p["muted"]}" stroke-width="2" stroke-linecap="round"/>')
-    s.text("Codex", 31, 212, mid - 6, ITALIC_SEMI, p["ink"], "end")
+    s.text("Workers", 31, 212, mid - 6, ITALIC_SEMI, p["ink"], "end")
     s.text("voices in flight", 23, 212, mid + 24, ROMAN, p["muted"], "end")
     s.barline(268, yc - 44, bot + 24)
     s.barline(1468, yc - 44, bot + 24, final=True)
@@ -221,7 +221,7 @@ def ultra(theme):
         s.mark(m, x, yc - 58)
     s.dot(284, yc)
     s.mark("accept", 1474, yc - 58, ink=True, anchor="middle")
-    return s.svg("Ultra: Claude's stave above five Codex voices in flight; each phrase is accepted as it arrives "
+    return s.svg("Ultra: Claude's stave above five worker voices in flight; each phrase is accepted as it arrives "
                  "while the next starts, across understand, design, implement, review and verify")
 
 
