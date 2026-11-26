@@ -374,11 +374,16 @@ export function pending(roomId, { now = Date.now(), windowMs = NOTIFICATION_WIND
   return locked(roomId, env, ({ room, events, dir }) => {
     if (room.status !== "open") return [];
     const notices = [];
+    let changed = false;
     for (const member of room.members) {
       if (member.status === "stopped") continue;
       const relevant = memberUpdates(events, member);
-      if (!relevant.length) { member.firstPendingAt = null; continue; }
-      member.firstPendingAt = relevant[0].at;
+      const nextFirstPendingAt = relevant.length ? relevant[0].at : null;
+      if (member.firstPendingAt !== nextFirstPendingAt) {
+        member.firstPendingAt = nextFirstPendingAt;
+        changed = true;
+      }
+      if (!relevant.length) continue;
       if (!relevant.some(event => event.author.kind === "chair" && wakes(event, member))
           && time - Date.parse(member.firstPendingAt) < windowMs) continue;
       const summaries = relevant.map(event => ({ seq: event.seq, kind: event.kind, author: event.author, ...(event.title ? { title: short(event.title) } : { delta: `${event.thread === event.seq ? event.kind : "reply"} in thread #${event.thread}` }) }));
@@ -386,7 +391,7 @@ export function pending(roomId, { now = Date.now(), windowMs = NOTIFICATION_WIND
       notices.push({ persona: member.persona, name: member.name, threadId: member.threadId, jobIds: member.jobIds, wake: relevant.some(event => wakes(event, member)), events: summaries,
         text: `Roundtable ${roomId}: ${relevant.length} updates for you — ${preview}${relevant.length > 5 ? "; …" : ""}. Call forum_read to see them.` });
     }
-    save(dir, room);
+    if (changed) save(dir, room);
     return notices;
   });
 }

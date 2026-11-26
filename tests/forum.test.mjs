@@ -827,3 +827,47 @@ test("releaseMemberClaim clears claimedAt only when claimedAt matches, jobIds is
   updateMember(id, "improver", { threadId: "thread-1" }, f.env);
   assert.deepEqual(releaseMemberClaim(id, "improver", { claimedAt: threaded.claimedAt }, f.env), { released: false });
 });
+
+test("pending() rewrites room.json only when a member's firstPendingAt changes", () => {
+  const f = fixture(), id = f.room.roomId;
+  const roomFile = path.join(f.env.CODEX_COMPANION_HOME, "duet", "roundtables", id, "room.json");
+  const stampPast = () => {
+    const past = new Date(Date.now() - 10_000);
+    fs.utimesSync(roomFile, past, past);
+    return { mtimeMs: fs.statSync(roomFile).mtimeMs, content: fs.readFileSync(roomFile, "utf8") };
+  };
+  f.post("improver", "intent"); f.post("critic", "idea"); f.post("conjecturer", "idea");
+  const idle = stampPast();
+  assert.deepEqual(pending(id, { now: Date.now() + 60_000 }, f.env), []);
+  assert.equal(fs.statSync(roomFile).mtimeMs, idle.mtimeMs);
+  assert.equal(fs.readFileSync(roomFile, "utf8"), idle.content);
+
+  const request = f.post("critic", "request", "Check pending writes", { mentions: ["improver"] });
+  const at = Date.parse(request.at);
+  const beforeSet = stampPast();
+  assert.deepEqual(pending(id, { now: at + 1000 }, f.env), []);
+  assert.ok(fs.statSync(roomFile).mtimeMs > beforeSet.mtimeMs);
+  assert.notEqual(fs.readFileSync(roomFile, "utf8"), beforeSet.content);
+  assert.equal(f.state().members.find(member => member.name === "improver").firstPendingAt, request.at);
+
+  const afterSet = stampPast();
+  const notices = pending(id, { now: at + 30_000 }, f.env);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].name, "improver");
+  assert.equal(fs.statSync(roomFile).mtimeMs, afterSet.mtimeMs);
+  assert.equal(fs.readFileSync(roomFile, "utf8"), afterSet.content);
+
+  ack(id, "improver", request.seq, f.env);
+  const afterAck = stampPast();
+  assert.deepEqual(pending(id, { now: at + 60_000 }, f.env), []);
+  assert.equal(fs.statSync(roomFile).mtimeMs, afterAck.mtimeMs);
+  assert.equal(fs.readFileSync(roomFile, "utf8"), afterAck.content);
+
+  const stale = JSON.parse(fs.readFileSync(roomFile, "utf8"));
+  stale.members.find(member => member.name === "improver").firstPendingAt = request.at;
+  fs.writeFileSync(roomFile, `${JSON.stringify(stale)}\n`);
+  const beforeClear = stampPast();
+  assert.deepEqual(pending(id, { now: at + 60_000 }, f.env), []);
+  assert.ok(fs.statSync(roomFile).mtimeMs > beforeClear.mtimeMs);
+  assert.equal(f.state().members.find(member => member.name === "improver").firstPendingAt, null);
+});
