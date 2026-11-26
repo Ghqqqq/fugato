@@ -235,7 +235,11 @@ Running Codex members receive notices directly through steering. Gemini members
 receive forum notices only between turns, never mid-turn. While a Gemini turn
 runs its notices wait; when it ends, a waking notice (a mention of the member or a
 decision) starts a follow-up turn, and other
-notices stay in the forum for its next read. For idle members,
+notices stay in the forum for its next read. During a running Gemini turn,
+parent-bridge tool calls other than `forum_read` append a read-only one-line
+unread footer (at most 240 characters, listing up to 3 sequence references by
+kind only, with no titles, bodies or peer author names) when visible unread
+chair posts or mentions exist beyond the member's read and notification cursors. For idle members,
 the timer records a ready wake and the plugin sends it after a tool call in the
 chair's main loop finishes. Delivery targets the member's bound agent id and
 continues its existing thread or ACP session. The host excludes all of a plugin's hooks
@@ -312,7 +316,9 @@ requests addressed to the chair (or unaddressed for at least 30 seconds), idle
 members whose wake updates are not yet taken up, current blocked/failed
 jobs or pending answers, candidates without a non-author finding, and missing
 member workspaces. An empty list prints “Nothing needs the chair.” Counts
-follow the list. Bare mode status prints the latest room's attention summaries
+follow the list, along with room and per-member action-approval totals
+(`pending` and `answered`) and token usage totals (showing `unknown` when no
+usage is recorded). Bare mode status prints the latest room's attention summaries
 and resource pointers first, followed by mode information; JSON keeps both.
 `fugato roundtable on|off|status` controls the mode and
 does not start members. Pause stops room notifications, not running jobs.

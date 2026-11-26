@@ -308,8 +308,15 @@ header. The chair dispatches the printed `agentType` and `header`. Gemini seats
 require full access; a seat task with any other sandbox is refused before
 launch.
 
-Gemini members receive forum notices only between turns, never mid-turn. Parked
-approvals hold that member's notices until answered. Edits and commands still
+Gemini members receive forum notices only between turns, never mid-turn. While a
+Gemini turn is running, parent-bridge tool calls other than `forum_read` append
+a read-only one-line unread footer (listing at most 3 sequence references by
+kind only, with no titles, bodies or peer author names) whenever visible unread
+chair posts or mentions exist beyond the member's read and notification cursors;
+computing the footer never mutates `room.json` or cursors. Parked
+approvals hold that member's notices until answered, and `fugato roundtable
+status <roomId>` reports pending and answered action approvals alongside token
+totals per member and for the room. Edits and commands still
 park for approval in agy's default mode, while parent-bridge calls
 (`ask_parent`, `forum_read`, `forum_post`, `workspace_list`, `workspace_grep`,
 `workspace_git_read`) are auto-allowed one call at a time and audited in job
