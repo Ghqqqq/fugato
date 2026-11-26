@@ -173,7 +173,7 @@ Open-ended goals explored by persistent Codex or Gemini personas in a shared for
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fugato-score-ultra-dark.svg">
-  <img src="docs/assets/fugato-score-ultra-light.svg" alt="Ultra drawn as a score: Claude's stave above five Codex voices in flight; each short phrase is accepted as it arrives while the next starts, across understand, design, implement, review and verify" width="100%">
+  <img src="docs/assets/fugato-score-ultra-light.svg" alt="Ultra drawn as a score: Claude's stave above five worker voices in flight; each short phrase is accepted as it arrives while the next starts, across understand, design, implement, review and verify" width="100%">
 </picture>
 
 Claude splits the work-list across parallel readers, independent designs
