@@ -3736,16 +3736,22 @@ async function handleCleanup(argv) {
   const { planRetention, applyRetentionWithBroker } = await import("./lib/retention.mjs");
   const plan = planRetention({ days: options.days });
   const dryRun = options["dry-run"], result = dryRun ? plan : await applyRetentionWithBroker(plan);
-  const bytes = dryRun ? [...plan.jobs, ...plan.runs, ...plan.runSessions, ...plan.markers, ...plan.threads].reduce((sum, item) => sum + item.bytes, 0) : result.bytesFreed;
-  const counts = dryRun ? `${plan.jobs.length} jobs, ${plan.runs.length} runs, ${plan.runSessions.length} run pointers, ${plan.markers.length} markers, ${plan.threads.length} threads eligible` : `${result.jobsDeleted} jobs, ${result.runsDeleted} runs, ${result.runSessionsDeleted} run pointers, ${result.markersDeleted} markers, ${result.threadsDeleted} threads deleted; ${result.threadsSkipped} threads skipped`;
+  const bytes = dryRun ? [...plan.jobs, ...plan.runs, ...plan.runSessions, ...plan.markers, ...plan.rooms, ...plan.admissionLocks, ...plan.approvalDirs, ...plan.threads].reduce((sum, item) => sum + item.bytes, 0) : result.bytesFreed;
+  const counts = dryRun ? `${plan.jobs.length} jobs, ${plan.runs.length} runs, ${plan.runSessions.length} run pointers, ${plan.markers.length} markers, ${plan.rooms.length} rooms, ${plan.admissionLocks.length} admission locks, ${plan.approvalDirs.length} approval dirs, ${plan.threads.length} threads eligible` : `${result.jobsDeleted} jobs, ${result.runsDeleted} runs, ${result.runSessionsDeleted} run pointers, ${result.markersDeleted} markers, ${result.roomsDeleted} rooms, ${result.admissionLocksDeleted} admission locks, ${result.approvalDirsDeleted} approval dirs, ${result.threadsDeleted} threads deleted; ${result.threadsSkipped} threads skipped`;
   const summary = `${dryRun ? "Dry run" : "Cleanup"} (${plan.days} days): ${counts}; ${(bytes / 1_000_000).toFixed(2)} MB ${dryRun ? "eligible; nothing deleted" : "freed"}.`;
   const legacyRetained = result.retained.filter(job => job.reason === "legacy-paths").length;
   const quotePath = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const planned = dryRun ? [
+    ...plan.rooms.map(item => `Planned room: ${item.roomId} (${item.path}, ${item.bytes} bytes)`),
+    ...plan.admissionLocks.map(item => `Planned admission lock: ${item.path} (${item.bytes} bytes)`),
+    ...plan.approvalDirs.map(item => `Planned approval dir: ${item.path} (${item.bytes} bytes)`)
+  ] : [];
   const directories = [
     ...result.inertWorkspaces.map(item => `Inert workspace: ${item.workspace} — does not block inventory or retention; safe to delete manually while inactive: rm -r ${quotePath(item.workspace)}`),
-    ...result.workspacesRetained.map(item => `Kept workspace (may be live): ${item.workspace} (${item.reason})`)
+    ...result.workspacesRetained.map(item => `Kept workspace (may be live): ${item.workspace} (${item.reason})`),
+    ...(result.roomsRetained ?? []).map(item => `Retained room: ${item.roomId} (${item.path}): ${item.reason}`)
   ];
-  outputCommandResult(result, `${[summary, ...directories, ...(legacyRetained ? [`${legacyRetained} retained (legacy paths)`] : []), ...result.warnings, ...(result.errors.length ? [`${result.errors.length} errors/skips; use --json for details.`] : [])].join("\n")}\n`, options.json);
+  outputCommandResult(result, `${[summary, ...planned, ...directories, ...(legacyRetained ? [`${legacyRetained} retained (legacy paths)`] : []), ...result.warnings, ...(result.errors.length ? [`${result.errors.length} errors/skips; use --json for details.`] : [])].join("\n")}\n`, options.json);
 }
 
 async function main() {
