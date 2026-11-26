@@ -1202,21 +1202,23 @@ test("status scopes jobs to the current session and --all recovers workspace ses
   const jobsDir = path.join(stateDir, "jobs");
   fs.mkdirSync(jobsDir, { recursive: true });
   fs.writeFileSync(path.join(jobsDir, "task-legacy.json"), "{malformed");
-  fs.writeFileSync(path.join(jobsDir, "task-finished.json"), JSON.stringify({ ...jobs[1],
-    usage: { inputTokens: 10, cachedInputTokens: 4, outputTokens: 3, totalTokens: 13 } }));
+  const usage = { inputTokens: 10, cachedInputTokens: 4, outputTokens: 3, totalTokens: 13 };
+  const expectedTotals = {
+    ...usage, jobsWithUsage: 1, jobsWithoutUsage: 3,
+    jobsByKey: { inputTokens: 1, cachedInputTokens: 1, outputTokens: 1, totalTokens: 1 }, partialKeys: [],
+    byBackendModel: [{ backend: "codex", model: "unknown", ...usage, jobs: 1 }]
+  };
+  fs.writeFileSync(path.join(jobsDir, "task-finished.json"), JSON.stringify({ ...jobs[1], usage }));
   const damaged = f.call("status", "--all", "--json");
   const intact = damaged.status === 0 && JSON.parse(damaged.stdout);
   assert.deepEqual(intact && { jobs: [...intact.running, intact.latestFinished, ...intact.recent].map(job => job.id),
-    usageTotals: intact.usageTotals }, { jobs: jobs.map(job => job.id), usageTotals: {
-    inputTokens: 10, cachedInputTokens: 4, outputTokens: 3, totalTokens: 13, jobsWithUsage: 1, jobsWithoutUsage: 3 } }, damaged.stderr);
-  const usage = { inputTokens: 10, cachedInputTokens: 4, outputTokens: 3, totalTokens: 13 };
+    usageTotals: intact.usageTotals }, { jobs: jobs.map(job => job.id), usageTotals: expectedTotals }, damaged.stderr);
   fs.writeFileSync(path.join(jobsDir, "task-finished.json"), JSON.stringify({ ...jobs[1], result: { usage } }));
   fs.writeFileSync(path.join(jobsDir, "task-active.json"), JSON.stringify({ ...jobs[0], result: { usage } }));
   fs.writeFileSync(path.join(stateDir, "state.json"), JSON.stringify({ version: 1, config: {},
     jobs: jobs.map(job => ({ ...job, usage: null })) }));
   const nullCached = f.call("status", "--all", "--json");
-  assert.deepEqual(nullCached.status === 0 && JSON.parse(nullCached.stdout).usageTotals,
-    { ...usage, jobsWithUsage: 1, jobsWithoutUsage: 3 }, nullCached.stderr);
+  assert.deepEqual(nullCached.status === 0 && JSON.parse(nullCached.stdout).usageTotals, expectedTotals, nullCached.stderr);
   const indexed = run(process.execPath, ["--input-type=module", "-e", `
     import fs from "node:fs";
     import { updateJob, listJobs } from ${JSON.stringify(new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href)};
@@ -1226,8 +1228,7 @@ test("status scopes jobs to the current session and --all recovers workspace ses
     console.log(JSON.stringify({ usage: listJobs(process.cwd()).find(job => job.id === "task-finished").usage,
       usageTotals: buildStatusSnapshot(process.cwd(), { all: true }).usageTotals }));
   `], { cwd: f.repo, env: f.env });
-  assert.deepEqual(indexed.status === 0 && JSON.parse(indexed.stdout), { usage,
-    usageTotals: { ...usage, jobsWithUsage: 1, jobsWithoutUsage: 3 } }, indexed.stderr);
+  assert.deepEqual(indexed.status === 0 && JSON.parse(indexed.stdout), { usage, usageTotals: expectedTotals }, indexed.stderr);
 });
 
 test("status previews recent structured activity and identifies the worker and run settings", () => {

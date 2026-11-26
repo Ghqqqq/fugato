@@ -274,9 +274,9 @@ pane shows the posts as an index; press one to read it.
   workers require permission mapping off and full access (dispatch is refused
   while permission mapping is on); in `agy`'s default mode, Fugato forwards
   `agy`'s approval requests to Claude.
-- Fugato reports show worker token usage when the backend reports it; Gemini
-  counters can be partial, and `fugato-live` shows usage only when all of its
-  counters are present. Worker tokens do not appear in Claude's `/usage`.
+- Fugato reports, run journals and `fugato-live` show worker token usage when
+  the backend reports it, including partial Gemini counters without fabricating
+  missing fields as zero. Worker tokens do not appear in Claude's `/usage`.
 
 ## Documentation
 

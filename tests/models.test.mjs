@@ -61,18 +61,28 @@ function json(result) {
   assert.doesNotMatch(result.stdout + result.stderr, /CACHE_SECRET|MODEL_SECRET|RUNTIME_SECRET|PRIVATE_ETAG|identity|token/);
   return JSON.parse(result.stdout);
 }
-test("models CLI uses the sanitized cache, marks effective tiers and optionally includes hidden models", () => {
+test("models CLI uses the sanitized cache, marks roleless defaults and optionally includes hidden models", () => {
   const f = fixture();
+  const defaults = json(f.call("models", "--json"));
+  assert.deepEqual(defaults.tiers, {
+    strong: { value: "gpt-6-astra", source: "built-in" },
+    effort: { value: "xhigh", source: "built-in" },
+    routine: { value: "gpt-6.1-sol", source: "built-in" }
+  });
   json(f.call("setup", "--default-model", "fixture-strong", "--default-effort", "high", "--ultra-routine-model", "fixture-routine", "--json"));
   const report = json(f.call("models", "--json"));
   assert.equal(report.source, "cache");
   assert.deepEqual(report.models.map(model => model.slug), ["fixture-strong", "fixture-routine"]);
-  assert.deepEqual(report.models.map(model => model.inUse), [["strong"], ["routine"]]);
+  assert.deepEqual(report.models.map(model => model.inUse), [["default"], ["ultra-routine"]]);
   assert.deepEqual(report.models[0].efforts, ["high", "xhigh"]);
   assert.equal(report.models[0].contextWindow, 256000);
   assert.equal(report.tiers.strong.source, "saved");
   const human = f.call("models");
   assert.equal(human.status, 0, human.stderr);
+  assert.match(human.stdout, /Roleless defaults: model fixture-strong\/high \(model: saved, effort: saved\); ultra routine model fixture-routine \(saved\)/);
+  assert.match(human.stdout, /fixture-strong \| Strong \|.*\| default \|/);
+  assert.match(human.stdout, /fixture-routine \| Routine \|.*\| ultra-routine \|/);
+  assert.doesNotMatch(human.stdout, /Fugato tiers:/);
   assert.doesNotMatch(human.stdout + human.stderr, /fixture-hidden|SECRET|identity|token/);
   assert.equal(json(f.call("models", "--all", "--json")).models[2].visibility, "hide");
   fs.rmSync(f.cacheFile);

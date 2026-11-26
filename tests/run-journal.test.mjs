@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { makeTempDir, initGitRepo, run, requireLocalSockets, waitForCondition } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { resolveStateDir, resolveStateRoot, unresolvedTask } from "../plugins/codex/scripts/lib/state.mjs";
-import { startRun, addEntry, linkJournalJob, finishJournalJob, validateRun, showRun, closeRun } from "../plugins/codex/scripts/lib/run-journal.mjs";
+import { startRun, addEntry, linkJournalJob, finishJournalJob, validateRun, showRun, closeRun, summarizeUsage, renderUsageTotals, activeRunContext } from "../plugins/codex/scripts/lib/run-journal.mjs";
 import { planRetention, applyRetention, runAutomaticRetention } from "../plugins/codex/scripts/lib/retention.mjs";
 
 const cli = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
@@ -133,25 +133,28 @@ test("status and journal show total known job usage and count jobs without usage
   fs.writeFileSync(path.join(f.state, "jobs", `${foreign.id}.json`), JSON.stringify(foreign));
   fs.writeFileSync(path.join(f.state, "state.json"), JSON.stringify({ version: 1, config: {},
     jobs: [...jobs, foreign].map(({ result, ...job }) => job) }));
+  const fullCounts = n => ({ inputTokens: n, cachedInputTokens: n, outputTokens: n, totalTokens: n });
   const expected = { inputTokens: 300, cachedInputTokens: 50, outputTokens: 30, totalTokens: 330,
-    jobsWithUsage: 2, jobsWithoutUsage: 1 };
+    jobsWithUsage: 2, jobsWithoutUsage: 1, jobsByKey: fullCounts(2), partialKeys: [],
+    byBackendModel: [{ backend: "codex", model: "fixture-model", inputTokens: 300, cachedInputTokens: 50, outputTokens: 30, totalTokens: 330, jobs: 2 }] };
   assert.deepEqual(json(f.call(["status", "--json"])).usageTotals, expected);
   assert.deepEqual(json(f.call(["status", "--all", "--json"])).usageTotals,
-    { inputTokens: 400, cachedInputTokens: 70, outputTokens: 40, totalTokens: 440, jobsWithUsage: 3, jobsWithoutUsage: 1 });
+    { inputTokens: 400, cachedInputTokens: 70, outputTokens: 40, totalTokens: 440, jobsWithUsage: 3, jobsWithoutUsage: 1, jobsByKey: fullCounts(3), partialKeys: [],
+      byBackendModel: [{ backend: "codex", model: "fixture-model", inputTokens: 400, cachedInputTokens: 70, outputTokens: 40, totalTokens: 440, jobs: 3 }] });
   assert.deepEqual(json(f.call(["status", "--all", "--json", "--dispatch-nonce", "absent"])).usageTotals,
-    { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, jobsWithUsage: 0, jobsWithoutUsage: 0 });
+    { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, jobsWithUsage: 0, jobsWithoutUsage: 0, jobsByKey: fullCounts(0), partialKeys: [], byBackendModel: [] });
+  const expectedLine1 = "Usage totals: input 300, cached 50, output 30, total 330 (2 job(s) with usage; 1 job(s) without usage).";
+  const expectedGroup = "  codex / fixture-model: input 300, cached 50, output 30, total 330 (2 job(s))";
   const human = f.call(["status"]);
   assert.equal(human.status, 0, human.stderr);
-  assert.match(human.stdout, /input 300.*cached 50.*output 30.*total 330/);
-  assert.match(human.stdout, /1 job\(s\) without usage/);
+  assert.ok(human.stdout.includes(`${expectedLine1}\n${expectedGroup}`));
   // Journal totals must survive the job retention policy using saved reports.
   fs.rmSync(path.join(f.state, "jobs"), { recursive: true });
   fs.rmSync(path.join(f.state, "state.json"));
   assert.deepEqual(json(f.journal(["show"])).usageTotals, expected);
   const journal = f.call(["journal", "show"]);
   assert.equal(journal.status, 0, journal.stderr);
-  assert.match(journal.stdout, /input 300.*cached 50.*output 30.*total 330/);
-  assert.match(journal.stdout, /1 job\(s\) without usage/);
+  assert.ok(journal.stdout.includes(`${expectedLine1}\n${expectedGroup}`));
   const open = fs.openSync;
   let reportReads = 0, view;
   const guard = t.mock.method(fs, "openSync", function(file, ...args) {
@@ -953,12 +956,45 @@ test("SessionStart adds one recovery line only for the active session, SessionEn
     const result = lifecycle("SessionStart", SESSION, source), value = json(result), context = value.hookSpecificOutput.additionalContext;
     const original = JSON.parse(baseline.stdout).hookSpecificOutput.additionalContext;
     assert.ok(context.startsWith(original + "\n")); assert.equal(context.split("\n").length, original.split("\n").length + 1);
-    assert.ok(context.includes(runId)); assert.ok(context.includes("journal show")); assert.ok(context.length - original.length < 300);
+    assert.ok(context.includes(runId)); assert.ok(context.includes("fugato journal show")); assert.equal(context.includes("CODEX_COMPANION"), false); assert.ok(context.length - original.length < 300);
   }
+  const direct = activeRunContext(f.cwd, SESSION, f.env);
+  assert.ok(direct.includes("Run fugato journal show to recover"));
+  assert.equal(direct.includes("CODEX_COMPANION"), false);
   assert.equal(lifecycle("SessionStart", "another-session").stdout, baseline.stdout);
   assert.equal(lifecycle("SessionEnd").status, 0); assert.equal(fs.existsSync(f.pointer), true);
   json(f.journal(["close"], { judgment: "abandoned", summary: "Stopped" }));
   assert.equal(lifecycle("SessionStart").stdout, baseline.stdout);
+});
+
+test("summarizeUsage and renderUsageTotals keep partial Gemini usage and group by backend and model", () => {
+  const codex = { request: { model: "gpt-6-astra" }, result: { usage: { inputTokens: 100, cachedInputTokens: 20, outputTokens: 10, totalTokens: 110 } } };
+  const gemini = { request: { backend: "antigravity", model: "gemini-4-neon" }, result: { model: "gemini-4-neon", usage: { inputTokens: 400, outputTokens: 60, totalTokens: 460 } } };
+  const mixed = summarizeUsage([codex, gemini, { usage: { inputTokens: 5, cachedInputTokens: -1 } }, { usage: {} }, null]);
+  assert.deepEqual(mixed, {
+    inputTokens: 500, cachedInputTokens: 20, outputTokens: 70, totalTokens: 570, jobsWithUsage: 2, jobsWithoutUsage: 3,
+    jobsByKey: { inputTokens: 2, cachedInputTokens: 1, outputTokens: 2, totalTokens: 2 }, partialKeys: ["cachedInputTokens"],
+    byBackendModel: [
+      { backend: "antigravity", model: "gemini-4-neon", inputTokens: 400, outputTokens: 60, totalTokens: 460, jobs: 1 },
+      { backend: "codex", model: "gpt-6-astra", inputTokens: 100, cachedInputTokens: 20, outputTokens: 10, totalTokens: 110, jobs: 1 }
+    ]
+  });
+  assert.equal("cachedInputTokens" in mixed.byBackendModel[0], false);
+  assert.equal(renderUsageTotals(mixed), [
+    "Usage totals: input 500, cached 20 (partial: 1/2), output 70, total 570 (2 job(s) with usage; 3 job(s) without usage).",
+    "  antigravity / gemini-4-neon: input 400, output 60, total 460 (1 job(s))",
+    "  codex / gpt-6-astra: input 100, cached 20, output 10, total 110 (1 job(s))"
+  ].join("\n"));
+  assert.equal(renderUsageTotals(summarizeUsage([gemini])), [
+    "Usage totals: input 400, cached unknown, output 60, total 460 (1 job(s) with usage; 0 job(s) without usage).",
+    "  antigravity / gemini-4-neon: input 400, output 60, total 460 (1 job(s))"
+  ].join("\n"));
+  const partialGroup = summarizeUsage([gemini, { backend: "antigravity", selectedModel: "gemini-4-neon", usage: { inputTokens: 100, cachedInputTokens: 25, outputTokens: 15, totalTokens: 115 } }]);
+  assert.equal(renderUsageTotals(partialGroup).split("\n")[1], "  antigravity / gemini-4-neon: input 500, cached 25 (partial: 1/2), output 75, total 575 (2 job(s))");
+  assert.equal(renderUsageTotals(summarizeUsage([codex])), [
+    "Usage totals: input 100, cached 20, output 10, total 110 (1 job(s) with usage; 0 job(s) without usage).",
+    "  codex / gpt-6-astra: input 100, cached 20, output 10, total 110 (1 job(s))"
+  ].join("\n"));
 });
 
 test("cleanup plans and removes expired open/closed runs and pointers, retaining activity and run copies", async () => {
