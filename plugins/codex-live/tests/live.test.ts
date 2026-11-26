@@ -1080,3 +1080,26 @@ test('Gemini roundtable member rows, headers, status lines and cache validation 
   expect(validView({ ...state, usageByJob: { bad: { backend: 'other' as never, model: 'gemini-4-neon',
     usage: { inputTokens: 1, cachedInputTokens: 0, outputTokens: 1, totalTokens: 2 } } } })).toBe(false);
 });
+
+test('partial usage is preserved by jobView and never fabricates NaN or zero totals in footers', () => {
+  const partial = jobView({ id: 'gem-a', status: 'completed', completedAt: createdAt,
+    request: { backend: 'antigravity', model: 'gemini-4-neon' },
+    result: { model: 'gemini-4-neon', usage: { inputTokens: 300, outputTokens: 40, totalTokens: 340 } } }, marker('gem-a'));
+  const noTotal = jobView({ id: 'gem-b', status: 'completed', completedAt: createdAt,
+    request: { backend: 'antigravity', model: 'gemini-3.8-flash' },
+    result: { model: 'gemini-3.8-flash', usage: { inputTokens: 120, outputTokens: 20 } } }, marker('gem-b'));
+  const bad = jobView({ id: 'gem-bad', status: 'completed', completedAt: createdAt,
+    request: { backend: 'antigravity', model: 'gemini-4-neon' },
+    result: { usage: { inputTokens: 100, cachedInputTokens: null } } }, marker('gem-bad'));
+  expect(partial.usage).toEqual({ inputTokens: 300, outputTokens: 40, totalTokens: 340 });
+  expect(noTotal.usage).toEqual({ inputTokens: 120, outputTokens: 20 });
+  expect(bad.usage).toBe(undefined);
+  const state = boundState({ jobs: [partial, noTotal], selectedId: noTotal.id, nowMs: epoch });
+  expect(validView(state)).toBe(true);
+  expect(validView({ ...state, jobs: [{ ...partial, usage: {} }] })).toBe(false);
+  expect(footerLayout(partial, state, 60, true, 0).right).toBe('340 tokens');
+  expect(footerLayout(noTotal, state, 60, true, 0).right).toBe('');
+  expect(sessionFooter({ jobs: [], selectedId: null, nowMs: epoch,
+    usageByJob: { b: { backend: 'antigravity', model: 'gemini-3.8-flash', usage: { inputTokens: 120, outputTokens: 20 } } } }, 80).right).toBe('');
+  expect(sessionFooter(state, 80).right).toBe('340+ tokens · gemini-4-neon 340');
+});

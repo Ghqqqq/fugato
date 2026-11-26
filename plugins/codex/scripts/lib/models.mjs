@@ -111,5 +111,5 @@ export function renderModels(report) {
   const { strong, effort, routine } = report.tiers;
   return [`Models source: ${clean(report.source)}; fetched: ${clean(report.fetchedAt)}; invalid entries dropped: ${clean(report.droppedInvalid)}`,
     "Slug | Display name | Supported efforts | Default effort | Context window | In use | Description", ...rows,
-    `Fugato tiers: strong ${clean(strong.value)}/${clean(effort.value)} (model: ${clean(strong.source)}, effort: ${clean(effort.source)}); routine ${clean(routine.value)} (${clean(routine.source)})`, ""].join("\n");
+    `Roleless defaults: model ${clean(strong.value)}/${clean(effort.value)} (model: ${clean(strong.source)}, effort: ${clean(effort.source)}); ultra routine model ${clean(routine.value)} (${clean(routine.source)})`, ""].join("\n");
 }

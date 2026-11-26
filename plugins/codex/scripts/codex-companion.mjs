@@ -636,8 +636,8 @@ async function handleModels(argv) {
   const defaults = workerDefaultsSetup();
   const tiers = { strong: defaults.defaultModel, effort: defaults.defaultEffort, routine: defaults.ultraRoutineModel };
   const models = catalog.models.map(model => ({ ...model, inUse: [
-    ...(model.slug === tiers.strong.value ? ["strong"] : []),
-    ...(model.slug === tiers.routine.value ? ["routine"] : [])
+    ...(model.slug === tiers.strong.value ? ["default"] : []),
+    ...(model.slug === tiers.routine.value ? ["ultra-routine"] : [])
   ] }));
   const report = { ...catalog, models, tiers, roles };
   outputCommandResult(report, renderModels(report) + "\n" + renderRoleTable(roles), options.json);

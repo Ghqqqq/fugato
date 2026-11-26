@@ -21,10 +21,10 @@ export type CodexNativeActivity = {
 export type CodexLiveBackend = 'codex' | 'antigravity';
 
 export type CodexLiveUsage = {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
 };
 export type CodexLiveUsageEntry = { model: string; usage: CodexLiveUsage; sessionId?: string; backend?: CodexLiveBackend };
 

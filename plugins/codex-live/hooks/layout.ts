@@ -793,16 +793,20 @@ export function footerLayout(job: CodexLiveJob | ForumRoom, state: CodexLiveStat
   const turns = 'turns' in job ? (job as CodexLiveSession).turns : [job];
   const uses = turns.reduce((sum, turn) => sum + (turn.toolUses ?? toolUseCount(turn.events)), 0);
   const ids = new Set(turns.map(turn => turn.id));
-  const tokens = new Map(Object.entries(state.usageByJob ?? {}).filter(([id, entry]) => entry.sessionId === job.id || ids.has(id))
-    .map(([id, entry]) => [id, entry.usage.totalTokens]));
-  for (const turn of turns) if (!tokens.has(turn.id) && turn.usage) tokens.set(turn.id, turn.usage.totalTokens);
-  const total = [...tokens.values()].reduce((sum, n) => sum + n, 0);
-  const known = tokens.size > 0;
+  const seen = new Map<string, number | undefined>();
+  for (const [id, entry] of Object.entries(state.usageByJob ?? {})) {
+    if (entry.sessionId === job.id || ids.has(id)) seen.set(id, entry.usage.totalTokens);
+  }
+  for (const turn of turns) if (turn.usage && seen.get(turn.id) === undefined) seen.set(turn.id, turn.usage.totalTokens);
+  const knownTotals = [...seen.values()].filter((n): n is number => n !== undefined);
+  const total = knownTotals.reduce((sum, n) => sum + n, 0);
+  const known = knownTotals.length > 0;
+  const partial = known && knownTotals.length < seen.size;
   const statusWord = job.unresolved ? 'unknown' : job.active && (job.question || job.status === 'waiting') || job.status === 'needs_input'
     ? 'needs answer' : ['cancelled', 'interrupted', 'stopped'].includes(job.status) ? 'stopped' : job.status === 'completed' ? 'done' : job.status === 'blocked' ? 'blocked' : word.toLowerCase();
   const status = `${statusWord}${hasIndexSummary(job) ? ' · details unavailable' : job.detailsUnavailable ? ' · stale' : ''}`;
   const detail = ` · ${uses} tool${uses === 1 ? '' : 's'} · ${elapsed(job, state.nowMs)}`;
-  return feedFooter(status + detail, color, columns, following, newLines, known ? `${compactNumber(total)} tokens` : '', status.length);
+  return feedFooter(status + detail, color, columns, following, newLines, known ? `${compactNumber(total)}${partial ? '+' : ''} tokens` : '', status.length);
 }
 
 function feedFooter(status: string, color: ThemeKey, columns: number, following: boolean, newLines: number, tokens = '', wordLength = status.length):
@@ -828,10 +832,15 @@ export function emptyLines(columns: number): FeedLines {
 }
 export function sessionFooter(state: CodexLiveState, columns: number) {
   const models = new Map<string, number>();
-  for (const entry of Object.values(state.usageByJob ?? {})) models.set(entry.model, (models.get(entry.model) ?? 0) + entry.usage.totalTokens);
+  let missingTotal = false;
+  for (const entry of Object.values(state.usageByJob ?? {})) {
+    if (entry.usage.totalTokens === undefined) { missingTotal = true; continue; }
+    models.set(entry.model, (models.get(entry.model) ?? 0) + entry.usage.totalTokens);
+  }
   const ranked = [...models].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const total = ranked.reduce((sum, [, n]) => sum + n, 0);
-  const right = `${compactNumber(total)} tokens${ranked.slice(0, 2).map(([model, n]) => ` · ${shortModel(model)} ${compactNumber(n)}`).join('')}${ranked.length > 2 ? ` · +${ranked.length - 2}` : ''}`;
+  const right = !ranked.length && missingTotal ? ''
+    : `${compactNumber(total)}${missingTotal ? '+' : ''} tokens${ranked.slice(0, 2).map(([model, n]) => ` · ${shortModel(model)} ${compactNumber(n)}`).join('')}${ranked.length > 2 ? ` · +${ranked.length - 2}` : ''}`;
   return feedFooter('this session', 'subtle', columns, true, 0, right);
 }
 

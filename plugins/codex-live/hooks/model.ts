@@ -16,10 +16,22 @@ const number = (value: unknown): number | undefined =>
 const validBlockerCode = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-z0-9_.:-]{1,64}$/i.test(value);
 const usageKeys = ['inputTokens', 'cachedInputTokens', 'outputTokens', 'totalTokens'] as const;
+const usageLabels = ['input', 'cached', 'output', 'total'] as const;
+const isUsageCount = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 export function usageView(value: unknown): CodexLiveUsage | undefined {
-  const usage = object(value);
-  return usageKeys.every(key => Number.isSafeInteger(usage[key]) && (usage[key] as number) >= 0)
-    ? Object.fromEntries(usageKeys.map(key => [key, usage[key]])) as CodexLiveUsage : undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const usage = value as Record<string, unknown>;
+  if (usage.reasoningOutputTokens !== undefined && !isUsageCount(usage.reasoningOutputTokens)) return undefined;
+  const result: CodexLiveUsage = {};
+  let present = 0;
+  for (const key of usageKeys) {
+    if (usage[key] === undefined) continue;
+    if (!isUsageCount(usage[key])) return undefined;
+    result[key] = usage[key];
+    present++;
+  }
+  return present ? result : undefined;
 }
 export function jobBackend(value: { backend?: CodexLiveBackend }): CodexLiveBackend {
   return value.backend === 'antigravity' ? 'antigravity' : 'codex';
@@ -39,17 +51,29 @@ export function usageSnapshots(previous: CodexLiveState['usageByJob'], jobs: rea
   return snapshots;
 }
 export function usageLines(entries: Record<string, CodexLiveUsageEntry>, label?: string): string[] {
-  const groups = new Map<string, { backend: CodexLiveBackend; model: string; usage: CodexLiveUsage }>();
+  const groups = new Map<string, { backend: CodexLiveBackend; model: string; jobs: number;
+    usage: Record<typeof usageKeys[number], number>; counts: Record<typeof usageKeys[number], number> }>();
   for (const entry of Object.values(entries)) {
+    const parsed = usageView(entry.usage);
+    if (!parsed) continue;
     const backend = jobBackend(entry);
     const key = `${backend}\0${entry.model}`;
-    const group = groups.get(key) ?? { backend, model: entry.model, usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 } };
-    for (const field of usageKeys) group.usage[field] += entry.usage[field];
+    const group = groups.get(key) ?? { backend, model: entry.model, jobs: 0,
+      usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      counts: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 } };
+    group.jobs++;
+    for (const field of usageKeys) {
+      const value = parsed[field];
+      if (value === undefined) continue;
+      group.usage[field] += value;
+      group.counts[field]++;
+    }
     groups.set(key, group);
   }
-  return [...groups.values()].map(({ backend, model, usage }) =>
+  return [...groups.values()].map(({ backend, model, jobs, usage, counts }) =>
     `${label ?? `${runtimeLabel(backend)} session total`} (provider: ${providerLabel(backend)}, model ${model}): ` +
-    usageKeys.map((key, i) => `${usage[key].toLocaleString('en-US')} ${['input', 'cached', 'output', 'total'][i]}`).join(' · '));
+    usageKeys.flatMap((key, i) => counts[key] === 0 ? []
+      : [`${usage[key].toLocaleString('en-US')} ${usageLabels[i]}${counts[key] < jobs ? ` (partial: ${counts[key]}/${jobs})` : ''}`]).join(' · '));
 }
 
 // Persisted atoms can contain valid JSON with an invalid shape. Check every
