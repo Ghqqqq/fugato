@@ -8,7 +8,7 @@ SVG pairs in `docs/assets/`:
 | `fugato-showcase-live-{light,dark}.svg` | Claude Code with three workers in the transcript and the fugato-live pane beside it |
 | `fugato-showcase-agent-{light,dark}.svg` | One worker's agent view, ending in its report block |
 | `fugato-showcase-forum-{light,dark}.svg` | A roundtable room in the live pane, with one post opened |
-| `fugato-how-it-works-{light,dark}.svg` | Claude plans, Codex works, Claude accepts, drawn as one task |
+| `fugato-how-it-works-{light,dark}.svg` | Claude plans, workers run, Claude accepts, drawn as one task |
 
 The terminal images are not mock-ups. `capture.mjs` runs the plugins' own
 display code (`plugins/codex/hooks/native-agent.mjs` and the live pane's

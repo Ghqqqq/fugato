@@ -90,7 +90,7 @@ For a standalone read-only review of uncommitted or branch changes, run
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/fugato-how-it-works-dark.svg">
-  <img src="docs/assets/fugato-how-it-works-light.svg" alt="Claude plans: three acceptance criteria, each carried by a brief to a worker. Codex works: Zhang, Sohonie and Noether enter one after another on their own threads. Claude accepts: two reports are accepted on evidence, the review is still running" width="100%">
+  <img src="docs/assets/fugato-how-it-works-light.svg" alt="Claude plans: three acceptance criteria, each carried by a brief to a worker. Workers run: Zhang, Sohonie and Noether enter one after another on their own threads. Claude accepts: two reports are accepted on evidence, the review is still running" width="100%">
 </picture>
 
 1. **Brief.** Claude defines the acceptance criteria and gives each worker a
