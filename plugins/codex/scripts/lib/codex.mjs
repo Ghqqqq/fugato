@@ -1782,7 +1782,7 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Computer Use app ${request.app} approved by the parent (${choice}).`, null);
       return { action: "accept", reason: `parent-${choice}` };
     } : undefined;
-    client.options = { ...client.options, onApprovalRequest, permissionPolicy: options.permissionPolicy };
+    client.options = { ...client.options, onApprovalRequest, permissionPolicy: options.permissionPolicy, jobId: options.jobId };
     if (options.signal?.aborted) throw new Error("Task interrupted during startup.");
     let threadId;
     let threadPolicy;

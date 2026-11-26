@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { approvalArtifactDir } from "../plugins/codex/scripts/lib/approval-artifacts.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { makeTempDir, initGitRepo, run } from "./helpers.mjs";
@@ -129,7 +131,8 @@ test("action approvals queue with ask_parent and Computer Use, bind exact operat
   const compact = directReport({ status: "needs_answer", question: { id: "q", kind: "action-approval", text: forwarded.request.question, options: ["Allow once", "Deny"] } }, { id: "job" });
   assert.equal(compact.question.text, forwarded.request.question);
   assert.deepEqual(actionApprovalRequest(request, { ...context, turnId: "other" }, policy).reply.result, { decision: "decline" });
-  assert.equal(actionApprovalRequest({ ...request, params: { ...request.params, command: "x".repeat(1000) } }, context, policy).summary.reason, "operation-too-large-to-display-exactly");
+  assert.ok(actionApprovalRequest({ ...request, params: { ...request.params, command: "x".repeat(1000) } }, context, policy).request);
+  assert.equal(actionApprovalRequest({ ...request, params: { ...request.params, command: "x".repeat(17 * 1024) } }, context, policy).summary.reason, "operation-too-large-to-display-exactly");
   assert.equal(actionApprovalRequest(request, context, { ...policy, forwardActions: false }).request, null);
   const file = { ...request, method: "item/fileChange/requestApproval", params: { ...context, itemId: "i", startedAtMs: 1, grantRoot: f.repo } };
   assert.equal(actionApprovalRequest(file, context, policy).summary.reason, "unsupported-root-grant");
@@ -263,7 +266,7 @@ test("file approvals show updated patches and decline a displayed operation that
   assert.equal(displayed[0].signal.aborted, true);
   answer({ action: "accept" }); await flushRequests();
   assert.deepEqual(replies, [{ id: "approval", result: { decision: "decline" } }]);
-  feed({ method: "item/fileChange/patchUpdated", params: { threadId: "t", turnId: "u", itemId: "file", changes: fileItem("x".repeat(16000)).changes } });
+  feed({ method: "item/fileChange/patchUpdated", params: { threadId: "t", turnId: "u", itemId: "file", changes: fileItem("x".repeat(1024 * 1024 + 100)).changes } });
   feed(fileApproval("oversized")); await flushRequests();
   assert.equal(displayed.length, 1);
   assert.deepEqual(replies.at(-1), { id: "oversized", result: { decision: "decline" } });
@@ -344,4 +347,65 @@ test("resolved and duplicate action approvals release the question slot and cann
   f.json(f.call("wait", launch.jobId, "--owner", launch.ownerId, "--json"));
   assert.equal(f.state().resolvedApprovalReplies, undefined);
   assert.equal(f.state().serverRequestReplies.length, 1);
+});
+
+test("Codex mapped file-change approvals inline 3 KiB, stage 40 KiB and 200 KB, verify artifacts, and cancel on patch change", async t => {
+  const f = fixture(), jobId = "task-codex-staged";
+  const policy = { ...mapPermissionPolicy({ mode: "default" }), cwd: f.repo };
+  const logs = [], replies = [], displayed = [];
+  const client = await CodexAppServerClient.connect(f.repo, { env: f.env, disableBroker: true,
+    permissionPolicy: policy, jobId, onServerRequestLog: entry => logs.push(entry) });
+  t.after(() => client.close());
+  client.sendMessage = message => replies.push(message);
+  client.setServerRequestContext("t", "u");
+  const feed = message => client.handleLine(JSON.stringify(message));
+  let resolver = null;
+  client.options.onApprovalRequest = request => {
+    displayed.push(request);
+    if (resolver) return new Promise(resolve => { resolver(resolve, request); });
+    return { action: "accept" };
+  };
+
+  // 3 KiB inline file-change approval.
+  const diff3k = "+" + "a".repeat(3 * 1024);
+  feed({ method: "item/started", params: { threadId: "t", turnId: "u", item: fileItem(diff3k) } });
+  feed(fileApproval("inline-3k")); await flushRequests();
+  assert.ok(displayed[0].question.includes(diff3k));
+  assert.equal(displayed[0].artifact, undefined);
+  assert.ok(Buffer.byteLength(displayed[0].question, "utf8") <= 16 * 1024);
+  assert.deepEqual(replies.at(-1), { id: "inline-3k", result: { decision: "accept" } });
+
+  // 40 KiB staged file-change approval succeeds when artifact is intact.
+  const diff40k = "+" + "b".repeat(40 * 1024);
+  feed({ method: "item/fileChange/patchUpdated", params: { threadId: "t", turnId: "u", itemId: "file", changes: fileItem(diff40k).changes } });
+  feed(fileApproval("staged-40k")); await flushRequests();
+  const card40 = displayed[1].question;
+  assert.ok(Buffer.byteLength(card40, "utf8") < 2 * 1024);
+  const sha40 = card40.split("\n").find(line => line.startsWith("SHA-256: ")).slice("SHA-256: ".length);
+  const path40 = card40.split("\n").find(line => line.startsWith("Exact operation: ")).slice("Exact operation: ".length);
+  assert.equal(path.dirname(path40), approvalArtifactDir(f.repo, jobId, f.env));
+  if (process.platform !== "win32") assert.equal(fs.statSync(path40).mode & 0o777, 0o600);
+  const body40 = fs.readFileSync(path40, "utf8");
+  assert.equal(sha40, createHash("sha256").update(body40, "utf8").digest("hex"));
+  assert.ok(body40.includes(diff40k));
+  assert.deepEqual(replies.at(-1), { id: "staged-40k", result: { decision: "accept" } });
+
+  // 200 KB fileChange item is retained, staged, and cancelled when its patch changes.
+  const diff200k = "+" + "c".repeat(200 * 1024);
+  let resolve200; resolver = resolve => { resolve200 = resolve; };
+  feed({ method: "item/fileChange/patchUpdated", params: { threadId: "t", turnId: "u", itemId: "file", changes: fileItem(diff200k).changes } });
+  feed(fileApproval("staged-200k")); await flushRequests();
+  assert.ok(displayed[2].artifact && Buffer.byteLength(displayed[2].question, "utf8") < 2 * 1024);
+  assert.ok(fs.readFileSync(displayed[2].artifact.path, "utf8").includes(diff200k));
+  feed({ method: "item/fileChange/patchUpdated", params: { threadId: "t", turnId: "u", itemId: "file", changes: fileItem("+" + "d".repeat(200 * 1024)).changes } });
+  assert.equal(displayed[2].signal.aborted, true);
+  resolve200({ action: "accept" }); await flushRequests();
+  assert.deepEqual(replies.at(-1), { id: "staged-200k", result: { decision: "decline" } });
+
+  // Altering a staged artifact file before the answer declines with operation-changed-before-approval.
+  let resolveTamper; resolver = (resolve, req) => { fs.appendFileSync(req.artifact.path, "tamper"); resolveTamper = resolve; };
+  feed(fileApproval("staged-tamper")); await flushRequests();
+  resolveTamper({ action: "accept" }); await flushRequests();
+  assert.deepEqual(replies.at(-1), { id: "staged-tamper", result: { decision: "decline" } });
+  assert.equal(logs.at(-1).reason, "operation-changed-before-approval");
 });

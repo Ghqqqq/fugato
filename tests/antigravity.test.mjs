@@ -1,8 +1,10 @@
 import "./test-environment.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { approvalArtifactDir } from "../plugins/codex/scripts/lib/approval-artifacts.mjs";
 import { installFakeAntigravity } from "./fake-antigravity-fixture.mjs";
 import { AcpClient } from "../plugins/codex/scripts/lib/acp-client.mjs";
 import { upsertJob, readJobFile, resolveJobFile } from "../plugins/codex/scripts/lib/state.mjs";
@@ -213,21 +215,25 @@ test("Antigravity approval fields preserve exact values on individually labelled
   assert.equal(fake.state().serverResponses[0].result.outcome.optionId, "allow");
 });
 
-test("Antigravity forwards a full multi-line edit and denies questions exceeding 16 KiB serialized", async t => {
+test("Antigravity deduplicates diff text, measures raw UTF-8 inline, and denies >16 KiB without staging jobId", async t => {
   const file = "/home/developer/workspaces/accounting/services/ledger/src/reconciliation/config/default_rules.py";
   const oldText = Array.from({ length: 40 }, (_, i) => `    "region_${i + 1}": 30,`).join("\n");
   const newText = oldText.replaceAll(": 30,", ": 45,");
   const rawInput = { Path: file, Target: oldText, Replacement: newText };
   const edit = { toolCallId: "edit", name: "edit_file", kind: "edit", title: "Extend regional retention periods",
     locations: [{ path: file }], args: rawInput, rawInput, content: [{ type: "diff", path: file, oldText, newText }] };
-  // The quoted argument fits on screen. Escaping it again for the serialized question exceeds 16 KiB.
-  const oversized = { toolCallId: "large", kind: "other", rawInput: '"'.repeat(4096) };
-  const fake = fixture(t, { serverRequests: [edit, oversized].map(permissionRequest) }), questions = [];
+  // 4096 quotes JSON-encode to ~8.3 KiB raw UTF-8, so it fits inline under the 16 KiB raw cap.
+  const quoted = { toolCallId: "quoted", kind: "other", rawInput: '"'.repeat(4096) };
+  // Over 16 KiB raw without a jobId cannot be staged, so it still fails closed.
+  const oversized = { toolCallId: "large", kind: "other", rawInput: "x".repeat(17 * 1024) };
+  const fake = fixture(t, { serverRequests: [edit, quoted, oversized].map(permissionRequest) }), questions = [];
   const result = await fake.run({ onApprovalRequest: request => { questions.push(request.question); return "once"; } });
-  assert.deepEqual(questions.map(question => question.split("\n").find(line => line.startsWith("Operation details: "))),
-    [`Operation details: ${JSON.stringify(edit.content)}`]);
+  assert.equal(questions.length, 2);
+  assert.equal(questions[0].split("\n").find(line => line.startsWith("Operation details: ")),
+    `Operation details: ${JSON.stringify([{ type: "diff", path: file, oldText: { sameAs: "Arguments.Target" }, newText: { sameAs: "Arguments.Replacement" } }])}`);
+  assert.ok(Buffer.byteLength(questions[1], "utf8") <= 16 * 1024);
   const replies = Object.fromEntries(fake.state().serverResponses.map(reply => [reply.id, reply.result.outcome.optionId]));
-  assert.deepEqual(replies, { 1: "allow", 2: "deny" });
+  assert.deepEqual(replies, { 1: "allow", 2: "allow", 3: "deny" });
   assert.deepEqual(result.blockers.map(value => value.code), ["operation-too-large-to-display-exactly"]);
 });
 
@@ -637,4 +643,94 @@ test("Antigravity launches the executable checked in the requested subdirectory"
   // argv[1] identifies the script launched by the shebang or Windows .cmd shim.
   assert.deepEqual(selected.state().launches.map(launch => launch.script), Array(4).fill(selected.script));
   assert.deepEqual(root.state().launches, []);
+});
+
+function realisticJs(targetBytes, tag) {
+  const lines = [];
+  for (let i = 0; Buffer.byteLength(lines.join("\n"), "utf8") < targetBytes; i++) {
+    lines.push(`export function ${tag}_${i}(input) { const re = /\\\\"([^"\\\\]*)\\\\"/g; return String(input).replace(re, "ok:$1\\n"); }`);
+  }
+  return lines.join("\n");
+}
+
+test("Antigravity 6 KiB write_file and edit_file fit inline under 16 KiB raw and show new text once", async t => {
+  const writeJs = realisticJs(6 * 1024, "writeFn");
+  const editJs = realisticJs(6 * 1024, "editFn");
+  const oldJs = 'export const before = "old\\\\value\\nline2";';
+  const writePath = "/fixture/src/written.mjs", editPath = "/fixture/src/edited.mjs";
+  const writeInput = { Content: writeJs, Overwrite: true, Path: writePath, toolSummary: "Write realistic JS module" };
+  const editInput = { Path: editPath, Target: oldJs, Replacement: editJs, toolSummary: "Edit realistic JS module" };
+  const calls = [
+    { toolCallId: "write-6k", name: "write_file", kind: "edit", title: `Write ${writePath}`, locations: [{ path: writePath }],
+      rawInput: writeInput, args: writeInput, content: [{ type: "diff", path: writePath, newText: writeJs }] },
+    { toolCallId: "edit-6k", name: "edit_file", kind: "edit", title: `Edit ${editPath}`, locations: [{ path: editPath }],
+      rawInput: editInput, args: editInput, content: [{ type: "diff", path: editPath, oldText: oldJs, newText: editJs }] }
+  ];
+  const fake = fixture(t, { serverRequests: calls.map(permissionRequest) }), shown = new Map();
+  const result = await fake.run({ onApprovalRequest: request => { shown.set(request.toolCall.toolCallId, request.question); return "once"; } });
+  assert.equal(result.status, 0);
+  assert.deepEqual(result.blockers, []);
+  for (const [id, payload, ref] of [["write-6k", writeJs, "Arguments.Content"], ["edit-6k", editJs, "Arguments.Replacement"]]) {
+    const question = shown.get(id);
+    assert.ok(question, id);
+    assert.ok(Buffer.byteLength(question, "utf8") <= 16 * 1024, `${id} must fit within 16 KiB raw UTF-8`);
+    const encoded = JSON.stringify(payload).slice(1, -1);
+    assert.equal(question.split(encoded).length - 1, 1, `${id} new text must appear exactly once`);
+    assert.ok(question.includes(JSON.stringify({ sameAs: ref })), `${id} must reference ${ref}`);
+  }
+  assert.deepEqual(fake.state().serverResponses.map(reply => reply.result.outcome.optionId), ["allow", "allow"]);
+});
+
+test("Antigravity 40 KiB write stages a 0600 artifact, accepts intact, and denies on mutation or tamper", async t => {
+  const bigJs = realisticJs(40 * 1024, "stagedFn");
+  const filePath = "/fixture/src/large.mjs";
+  const makeCall = (id, content) => {
+    const rawInput = { Content: content, Overwrite: true, Path: filePath, toolSummary: "Write 40 KiB module" };
+    return { toolCallId: id, name: "write_file", kind: "edit", title: `Write ${filePath}`, locations: [{ path: filePath }],
+      rawInput, args: rawInput, content: [{ type: "diff", path: filePath, newText: content }] };
+  };
+  const mutatedInput = { Content: bigJs + "\n// mutated", Overwrite: true, Path: filePath, toolSummary: "Write 40 KiB module" };
+  const requests = [
+    permissionRequest(makeCall("ok-40k", bigJs)),
+    { ...permissionRequest(makeCall("mutated-40k", bigJs)),
+      afterUpdates: [{ sessionUpdate: "tool_call_update", toolCallId: "mutated-40k", rawInput: mutatedInput, args: mutatedInput }] },
+    permissionRequest(makeCall("tampered-40k", bigJs))
+  ];
+  const fake = fixture(t, { serverRequests: requests, turnUpdates: [] });
+  const jobId = "task-agy-staged-40k", cards = new Map();
+  upsertJob(fake.directory, { id: jobId, backend: "antigravity", workspaceRoot: fake.directory, status: "queued" });
+  let releaseMutated; const mutatedGate = new Promise(resolve => { releaseMutated = resolve; });
+  const result = await fake.run({ jobId, signal: AbortSignal.timeout(10000), onApprovalRequest: async request => {
+    const id = request.toolCall.toolCallId;
+    cards.set(id, request.question);
+    if (id === "mutated-40k") await mutatedGate;
+    if (id === "tampered-40k") {
+      releaseMutated();
+      const artifactPath = request.question.split("\n").find(line => line.startsWith("Exact operation: ")).slice("Exact operation: ".length);
+      fs.appendFileSync(artifactPath, "\n// tampered");
+    }
+    return "once";
+  } });
+  const card = cards.get("ok-40k");
+  assert.ok(Buffer.byteLength(card, "utf8") < 2 * 1024, "staged card must be under 2 KiB");
+  assert.ok(card.endsWith("Allow this operation once?"));
+  assert.match(card, /Read the exact operation file in full before answering\./);
+  const sha = card.split("\n").find(line => line.startsWith("SHA-256: ")).slice("SHA-256: ".length);
+  const artifactPath = card.split("\n").find(line => line.startsWith("Exact operation: ")).slice("Exact operation: ".length);
+  assert.equal(path.dirname(artifactPath), approvalArtifactDir(fake.directory, jobId));
+  if (process.platform !== "win32") assert.equal(fs.statSync(artifactPath).mode & 0o777, 0o600);
+  const expectedReview = [
+    "Antigravity requests permission.", `Tool call ID: ${JSON.stringify("ok-40k")}`, `Name: ${JSON.stringify("write_file")}`,
+    `Kind: ${JSON.stringify("edit")}`, `Agent description: ${JSON.stringify(`Write ${filePath}`)}`,
+    `Locations: ${JSON.stringify([{ path: filePath }])}`,
+    `Arguments: ${JSON.stringify({ Content: bigJs, Overwrite: true, Path: filePath, toolSummary: "Write 40 KiB module" })}`,
+    `Operation details: ${JSON.stringify([{ type: "diff", path: filePath, newText: { sameAs: "Arguments.Content" } }])}`,
+    "Allow this operation once?"
+  ].join("\n");
+  assert.equal(fs.readFileSync(artifactPath, "utf8"), expectedReview);
+  assert.equal(sha, createHash("sha256").update(expectedReview, "utf8").digest("hex"));
+  assert.ok(card.includes(`Size: ${Buffer.byteLength(expectedReview, "utf8")} bytes`));
+  const replies = Object.fromEntries(fake.state().serverResponses.map(reply => [reply.id, reply.result.outcome.optionId]));
+  assert.deepEqual(replies, { 1: "allow", 2: "deny", 3: "deny" });
+  assert.deepEqual(result.blockers.map(blocker => blocker.code), ["operation-changed-before-approval", "operation-changed-before-approval"]);
 });

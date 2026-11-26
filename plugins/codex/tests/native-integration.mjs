@@ -2009,7 +2009,9 @@ test('background delivery exempts only action-approval text through 16 KiB', asy
   const accepts = (text, kind = 'action-approval', extra = {}) => isC2Report({ ...attached, ...extra, question: { ...attached.question, text, kind } });
   const { backend, provider, model, ...codex } = attached;
   const question = { ...attached.question, text: 'x'.repeat(3000) };
-  assert.equal(isC2Report({ ...codex, question }), false);
+  assert.equal(isC2Report({ ...codex, question }), true);
+  assert.equal(isC2Report({ ...codex, question: { ...question, text: 'x'.repeat(16 * 1024 + 1) } }), false);
+  assert.equal(isC2Report({ ...codex, question: { ...question, kind: 'question' } }), false);
   assert.equal(isC2Report({ ...attached, question }), true);
   assert.equal(accepts('é'.repeat(8192)), true);
   assert.equal(accepts('é'.repeat(8192) + 'x'), false);
