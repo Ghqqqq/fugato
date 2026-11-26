@@ -23,23 +23,63 @@ function connectToEndpoint(endpoint) {
   return net.createConnection({ path: target.path });
 }
 
-export async function waitForBrokerEndpoint(endpoint, timeoutMs = 2000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const ready = await new Promise((resolve) => {
-      const socket = connectToEndpoint(endpoint);
-      const finish = value => { clearTimeout(timer); socket.destroy(); resolve(value); };
-      const timer = setTimeout(() => finish(false), Math.max(1, deadline - Date.now()));
-      socket.on("connect", () => finish(true));
-      socket.on("error", () => finish(false));
-      socket.on("close", () => finish(false));
-    });
-    if (ready) {
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(50, deadline - Date.now()))));
+const DEFAULT_BROKER_TIMEOUT_MS = 2000;
+const MAX_CONNECT_DEADLINE_WAIT_MS = 15_000;
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error.code === "EPERM"; }
+}
+
+function isProcessGroupAlive(child) {
+  if (!child?.pid) return false;
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, 0); return true; }
+    catch (error) { if (error.code === "EPERM") return true; }
   }
-  return false;
+  return isPidAlive(child.pid);
+}
+
+export async function waitForBrokerEndpoint(endpoint, timeoutMs = DEFAULT_BROKER_TIMEOUT_MS, options = {}) {
+  const { child = null, signal = null } = options;
+  const hasEvents = typeof child?.once === "function";
+  let childDead = Boolean(hasEvents && (child.exitCode !== null && child.exitCode !== undefined || child.signalCode !== null && child.signalCode !== undefined));
+  const checkDead = () => childDead || Boolean(signal?.aborted) || (Boolean(child?.pid) && !hasEvents && !isPidAlive(child.pid));
+  if (checkDead()) return false;
+  let wake = null;
+  const onStop = () => { childDead = true; wake?.(); };
+  if (hasEvents) { child.once("exit", onStop); child.once("error", onStop); }
+  signal?.addEventListener("abort", onStop, { once: true });
+  try {
+    const deadline = Date.now() + timeoutMs;
+    const pollMs = child?.pid && !hasEvents ? 25 : 50;
+    while (Date.now() < deadline && !checkDead()) {
+      const ready = await new Promise((resolve) => {
+        let done = false;
+        const socket = connectToEndpoint(endpoint);
+        const finish = value => { if (done) return; done = true; wake = null; clearTimeout(timer); socket.destroy(); resolve(value); };
+        wake = () => finish(false);
+        const timer = setTimeout(() => finish(false), Math.max(1, deadline - Date.now()));
+        socket.on("connect", () => finish(true));
+        socket.on("error", () => finish(false));
+        socket.on("close", () => finish(false));
+      });
+      if (ready) return true;
+      if (checkDead()) return false;
+      const pause = Math.max(0, Math.min(pollMs, deadline - Date.now()));
+      if (pause > 0) await new Promise((resolve) => {
+        let done = false;
+        const finish = () => { if (done) return; done = true; wake = null; clearTimeout(timer); resolve(); };
+        wake = finish;
+        const timer = setTimeout(finish, pause);
+      });
+    }
+    return false;
+  } finally {
+    if (hasEvents) { child.off?.("exit", onStop); child.off?.("error", onStop); }
+    signal?.removeEventListener("abort", onStop);
+  }
 }
 
 export async function sendBrokerShutdown(endpoint) {
@@ -252,9 +292,10 @@ export async function ensureBrokerSession(cwd, options = {}) {
   // create a workspace record.
   const lockDir = path.join(home, "duet", "broker-spawn");
   fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-  const lockDeadline = options.connectDeadline ?? Date.now() + (options.timeoutMs ?? 2000);
+  const lockDeadline = options.connectDeadline ?? Date.now() + (options.timeoutMs ?? DEFAULT_BROKER_TIMEOUT_MS);
   let release;
   while (!(release = tryAcquirePidLock(path.join(lockDir, `${path.basename(resolveStateDir(cwd))}.lock`), { deadOwnerGraceMs: 30_000 }))) {
+    if (options.signal?.aborted) return null;
     const remaining = lockDeadline - Date.now();
     if (remaining <= 0) return null;
     await new Promise(resolve => setTimeout(resolve, Math.min(50, remaining)));
@@ -302,10 +343,13 @@ export async function ensureBrokerSession(cwd, options = {}) {
       env: options.env ?? process.env
     });
 
-    const ready = await waitForBrokerEndpoint(endpoint, budget(options.timeoutMs ?? 2000));
+    const readyTimeoutMs = budget(
+      options.timeoutMs ?? (options.connectDeadline != null ? MAX_CONNECT_DEADLINE_WAIT_MS : DEFAULT_BROKER_TIMEOUT_MS)
+    );
+    const ready = await waitForBrokerEndpoint(endpoint, readyTimeoutMs, { child, signal: options.signal });
     if (!ready) {
       // This target PID was spawned here; never kill an inherited saved PID.
-      await stopOwnedProcessGroup(child);
+      if (isProcessGroupAlive(child)) await stopOwnedProcessGroup(child);
       teardownBrokerSession({
         endpoint,
         pidFile,

@@ -10,12 +10,12 @@ import { makeTempDir, initGitRepo, run, requireLocalSockets, readyBroker, waitFo
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const script = path.join(root, 'plugins/codex/scripts/codex-companion.mjs');
-function fixture() {
+function fixture(options) {
   const base = makeTempDir('isolated-plugin-');
   const bin = path.join(base, 'bin');
   const repo = path.join(base, 'repo');
   fs.mkdirSync(bin); fs.mkdirSync(repo);
-  installFakeCodex(bin); initGitRepo(repo);
+  installFakeCodex(bin, undefined, options); initGitRepo(repo);
   const env = { ...buildEnv(bin), CODEX_HOME: path.join(base,'normal'), CODEX_SQLITE_HOME: path.join(base,'normal'), CODEX_COMPANION_HOME: path.join(base,"isolated user's data"), CLAUDE_PLUGIN_DATA: path.join(base,'plugin-data') };
   return {base, repo, env, state: () => JSON.parse(fs.readFileSync(path.join(bin,'fake-codex-state.json')))};
 }
@@ -132,7 +132,7 @@ test('refuses inherited broker without matching isolation identity', async (t) =
   finally { await new Promise(resolve=>server.close(resolve)); }
 });
 test('isolated login wrapper preserves home with spaces and inherited SQLite override', () => {
-  const f=fixture();
+  const f=fixture({ mutable: true });
   const capture=path.join(f.base,'capture.json');
   fs.writeFileSync(path.join(f.base,'bin','codex'), `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(capture)},JSON.stringify({args:process.argv.slice(2),home:process.env.CODEX_HOME,sqlite:process.env.CODEX_SQLITE_HOME}));\n`,{mode:0o755});
   const wrapper=path.join(root,'plugins/codex/scripts/codex-isolated.mjs');

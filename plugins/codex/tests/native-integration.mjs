@@ -40,10 +40,10 @@ function initGitRepo(cwd) {
   fs.cpSync(path.join(gitTemplate, '.git'), path.join(cwd, '.git'), { recursive: true });
 }
 function installFakeCodex(dir, behavior, mutable) {
-  if (mutable) return generateFakeCodex(dir, behavior);
+  if (mutable) return generateFakeCodex(dir, behavior, { mutable: true });
   if (!executableCache.has(behavior)) {
     const cached = fs.mkdtempSync(path.join(cacheRoot, 'bin-'));
-    generateFakeCodex(cached, behavior);
+    generateFakeCodex(cached, behavior, { mutable: true });
     const file = path.join(cached, 'codex'), original = fs.readFileSync(file, 'utf8');
     const literal = JSON.stringify(path.join(cached, 'fake-codex-state.json'));
     const source = original.replace(`const STATE_PATH = ${literal};`,

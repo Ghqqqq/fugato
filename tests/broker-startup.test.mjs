@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import net from "node:net";
@@ -6,7 +7,7 @@ import assert from "node:assert/strict";
 import { makeTempDir, requireLocalSockets, run, readyBroker } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { spawnBrokerProcess, waitForBrokerEndpoint, sendBrokerShutdown, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { ensureBrokerSession, spawnBrokerProcess, waitForBrokerEndpoint, sendBrokerShutdown, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveCodexRuntimeIdentity, resolveIsolatedCodexHome } from "../plugins/codex/scripts/lib/codex-home.mjs";
 import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { spawnOwned } from "../plugins/codex/scripts/lib/process.mjs";
@@ -14,15 +15,15 @@ import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } };
-async function until(fn) {
-  for (const deadline = Date.now() + 10000; Date.now() < deadline;) {
+async function until(fn, timeoutMs = 30000) {
+  for (const deadline = Date.now() + timeoutMs; Date.now() < deadline;) {
     if (fn()) return;
     await delay(10);
   }
   throw new Error("Fixture condition timed out");
 }
-function fixture(behavior = "review-ok") {
-  const dir = makeTempDir("br-"); installFakeCodex(dir, behavior);
+function fixture(behavior = "review-ok", options) {
+  const dir = makeTempDir("br-"); installFakeCodex(dir, behavior, options);
   return { dir, env: buildEnv(dir), endpoint: `unix:${path.join(dir, "s")}`, socketPath: path.join(dir, "s") };
 }
 async function serve(f, handler) {
@@ -99,7 +100,7 @@ test("concurrent first callers publish and reuse one workspace broker", async t 
 
 test("broker shutdown stops admitting clients before awaiting app-server cleanup", async t => {
   if (!await requireLocalSockets(t)) return;
-  const f = fixture(), marker = path.join(f.dir, "stopping");
+  const f = fixture("review-ok", { mutable: true }), marker = path.join(f.dir, "stopping");
   const executable = path.join(f.dir, "codex");
   const original = fs.readFileSync(executable, "utf8");
   // Hold this owned fixture alive during graceful shutdown so the listener race
@@ -109,7 +110,7 @@ test("broker shutdown stops admitting clients before awaiting app-server cleanup
   fs.writeFileSync(executable, original.replace('const fs = require("node:fs");', `const fs = require("node:fs");\nsetInterval(() => {}, 1000);\nprocess.on("SIGTERM", () => { fs.writeFileSync(${JSON.stringify(marker)}, "stopping"); setTimeout(() => {}, 5000); });`));
   const child = spawnBrokerProcess({ scriptPath: new URL("../plugins/codex/scripts/app-server-broker.mjs", import.meta.url).pathname,
     cwd: f.dir, endpoint: f.endpoint, pidFile: path.join(f.dir, "broker.pid"), logFile: path.join(f.dir, "broker.log"), env: f.env });
-  assert.equal(await waitForBrokerEndpoint(f.endpoint, 10000), true);
+  assert.equal(await waitForBrokerEndpoint(f.endpoint, 30000), true);
   assert.equal(Number(fs.readFileSync(path.join(f.dir, "broker.pid"), "utf8").trim()), child.pid);
   const shutdown = sendBrokerShutdown(f.endpoint);
   await until(() => fs.existsSync(marker));
@@ -132,7 +133,7 @@ test("broker shutdown stops admitting clients before awaiting app-server cleanup
   broker.stderr.on("data", data => { stderr += data; });
   const exited = new Promise(resolve => broker.once("close", (code, signal) => resolve({ code, signal })));
   t.after(() => { if (broker.exitCode === null && broker.signalCode === null) broker.kill("SIGTERM"); });
-  assert.equal(await waitForBrokerEndpoint(lost.endpoint, 10000), true);
+  assert.equal(await waitForBrokerEndpoint(lost.endpoint, 30000), true);
   const client = await CodexAppServerClient.connect(lost.dir, { env: lost.env, brokerEndpoint: lost.endpoint });
   t.after(() => client.close());
   const { thread } = await client.request("thread/start", { cwd: lost.dir });
@@ -146,10 +147,10 @@ test("broker shutdown stops admitting clients before awaiting app-server cleanup
   assert.equal(state.lastInterrupt, null);
 });
 
-test("abandoned turns expire without interrupting connected owners or stopping live peers", { timeout: 30000 }, async t => {
+test("abandoned turns expire without interrupting connected owners or stopping live peers", { timeout: 60000 }, async t => {
   if (!await requireLocalSockets(t)) return;
   const start = async (hangInterrupt = false, review = false) => {
-    const f = fixture(review ? "review-ok" : "interruptible-slow-task");
+    const f = fixture(review ? "review-ok" : "interruptible-slow-task", hangInterrupt ? { mutable: true } : undefined);
     f.env.CODEX_COMPANION_TEST_ABANDONED_TURN_GRACE_MS = "250";
     f.env.CODEX_COMPANION_BROKER_IDLE_SEC = "1";
     if (hangInterrupt) {
@@ -160,7 +161,7 @@ test("abandoned turns expire without interrupting connected owners or stopping l
     const child = spawnBrokerProcess({ scriptPath: new URL("../plugins/codex/scripts/app-server-broker.mjs", import.meta.url).pathname,
       cwd: f.dir, endpoint: f.endpoint, pidFile: path.join(f.dir, "broker.pid"), logFile, env: f.env });
     t.after(() => { try { process.kill(child.pid, "SIGTERM"); } catch {} });
-    assert.equal(await waitForBrokerEndpoint(f.endpoint, 10000), true);
+    assert.equal(await waitForBrokerEndpoint(f.endpoint, 30000), true);
     const owner = await CodexAppServerClient.connect(f.dir, { env: f.env, brokerEndpoint: f.endpoint });
     t.after(() => owner.close());
     const { thread } = await owner.request("thread/start", { cwd: f.dir });
@@ -254,9 +255,9 @@ test("a failed detached launcher falls back once and records the target PID", as
   }
 });
 
-test("broker handshake EOF retries one private spawn; both transports preserve large JSONL", { timeout: 30000 }, async t => {
+test("broker handshake EOF retries one private spawn; both transports preserve large JSONL", { timeout: 60000 }, async t => {
   if (!await requireLocalSockets(t)) return;
-  const f = fixture("large-jsonl"), methods = [];
+  const f = fixture("large-jsonl", { mutable: true }), methods = [];
   const executable = path.join(f.dir, "codex");
   const source = fs.readFileSync(executable, "utf8"), inputMarker = 'process.stdin.setEncoding("utf8");';
   assert.ok(source.includes(inputMarker));
@@ -465,7 +466,7 @@ const {
 } = await (await import('./fake-codex-fixture.mjs')).lifecycleHarness();
 test("runtime status inspects the selected binary and broker identity without starting or retiring a runtime", async t => {
   if (!await requireLocalSockets(t)) return;
-  const f = fixture("review-ok");
+  const f = fixture("review-ok", { mutable: true });
   f.env.CODEX_COMPANION_BROKER_IDLE_SEC = "3600";
   const empty = json(f.call("runtime", "status", "--json"));
   assert.equal(empty.runtime.executable, path.join(f.dir, "codex"));
@@ -558,7 +559,7 @@ test("updated runtime completes privately while a stale broker is busy, then pre
     assert.deepEqual(legacyMethods, ["initialize", "initialize"]);
   } finally { await inherited.close(); }
 
-  const f = fixture("interruptible-slow-task");
+  const f = fixture("interruptible-slow-task", { mutable: true });
   // Retirement must come from the control request, not the normal idle timer.
   f.env.CODEX_COMPANION_BROKER_IDLE_SEC = "3600";
   const broker = await readyBroker(f.repo, f.env); t.after(broker.close);
@@ -735,12 +736,12 @@ test("stopping a direct shell's whole descendant tree preserves its worker, shar
 });
 }
 
-test("transport failures settle requests, reap runtimes and bound retained buffers", { timeout: 45000 }, async t => {
+test("transport failures settle requests, reap runtimes and bound retained buffers", { timeout: 90000 }, async t => {
   const transport = await import("../plugins/codex/scripts/lib/app-server.mjs");
   const { stopOwnedProcessGroup } = await import("../plugins/codex/scripts/lib/process.mjs");
-  const guarded = async promise => {
+  const guarded = async (promise, timeoutMs = 15000) => {
     let timer;
-    try { return await Promise.race([promise, new Promise(resolve => { timer = setTimeout(() => resolve({ watchdog: true }), 3000); })]); }
+    try { return await Promise.race([promise, new Promise(resolve => { timer = setTimeout(() => resolve({ watchdog: true }), timeoutMs); })]); }
     finally { clearTimeout(timer); }
   };
   await t.test("runtime-1: diagnostic failures preserve handoff and other handoff failures close the client", () => {
@@ -748,7 +749,7 @@ test("transport failures settle requests, reap runtimes and bound retained buffe
     const result = run(process.execPath, ["--input-type=module", "-e", `
       import fs from 'node:fs';
       import { CodexAppServerClient } from ${JSON.stringify(new URL("../plugins/codex/scripts/lib/app-server.mjs", import.meta.url).href)};
-      setTimeout(() => process.exit(42), 10000).unref();
+      setTimeout(() => process.exit(42), 30000).unref();
       const failure = Object.assign(new Error('injected handoff failure'), { code: 'EIO' });
       let warnings = 0, timingFailures = 0;
       const write = fs.writeSync;
@@ -796,7 +797,7 @@ test("transport failures settle requests, reap runtimes and bound retained buffe
       const result = run(process.execPath, ["--input-type=module", "-e", `
         import { CodexAppServerClient } from ${JSON.stringify(new URL("../plugins/codex/scripts/lib/app-server.mjs", import.meta.url).href)};
         const client = await CodexAppServerClient.connect(process.cwd(), { disableBroker: ${!broker} });
-        const watchdog = setTimeout(() => process.exit(42), 5000);
+        const watchdog = setTimeout(() => process.exit(42), 20000);
         const closed = new Promise(resolve => client.setNotificationHandler(m => { if (m.method === 'fixture/closedStdin') resolve(); }));
         const first = client.request('account/read', {}).then(() => null, error => error.code);
         await closed;
@@ -843,7 +844,7 @@ test("transport failures settle requests, reap runtimes and bound retained buffe
     assert.equal(client.pending.size, 0); assert.equal(alive(client.proc.pid), false);
 
     const startup = fixture("w5-initialize-hang"), candidates = [];
-    const startupResult = await guarded(CodexAppServerClient.connect(startup.dir, { env: startup.env, connectTimeoutMs: 1800, onClient: value => candidates.push(value) }).then(() => null, error => error.code));
+    const startupResult = await guarded(CodexAppServerClient.connect(startup.dir, { env: startup.env, connectTimeoutMs: 3000, onClient: value => candidates.push(value) }).then(() => null, error => error.code));
     for (const candidate of candidates) await candidate.close();
     assert.equal(startupResult, "ETIMEDOUT");
     assert.equal(candidates.length, 0, "an exhausted broker startup budget cannot spawn the direct fallback");
@@ -854,7 +855,7 @@ test("transport failures settle requests, reap runtimes and bound retained buffe
     const fallback = fixture("w5-initialize-hang"), clients = [];
     const close = await serve(fallback, socket => socket.destroy());
     try {
-      const result = await guarded(CodexAppServerClient.connect(fallback.dir, { env: fallback.env, brokerEndpoint: fallback.endpoint, connectTimeoutMs: 600, onClient: value => clients.push(value) }).then(() => null, error => error.code));
+      const result = await guarded(CodexAppServerClient.connect(fallback.dir, { env: fallback.env, brokerEndpoint: fallback.endpoint, connectTimeoutMs: 2500, onClient: value => clients.push(value) }).then(() => null, error => error.code));
       assert.equal(result, "ETIMEDOUT");
       assert.deepEqual(clients.map(value => value.transport), ["broker", "direct"]);
       assert.equal(new Set(clients.map(value => value.options.connectDeadline)).size, 1);
@@ -959,4 +960,47 @@ test("transport failures settle requests, reap runtimes and bound retained buffe
       client.socket.resume(); await pending;
     } finally { await client.close(); await peer?.close(); broker.close(); }
   });
+});
+
+test("ensureBrokerSession honors connectDeadline beyond 2s", async t => {
+  if (!await requireLocalSockets(t)) return;
+  const f = fixture(), delayedBroker = path.join(f.dir, "delayed-broker.mjs");
+  fs.writeFileSync(delayedBroker, `
+    import fs from "node:fs"; import net from "node:net";
+    const endpoint = process.argv[process.argv.indexOf("--endpoint") + 1];
+    const pidFile = process.argv[process.argv.indexOf("--pid-file") + 1];
+    fs.writeFileSync(pidFile, String(process.pid) + "\\n");
+    await new Promise(resolve => setTimeout(resolve, 2500));
+    const server = net.createServer(socket => socket.end());
+    server.listen(endpoint.replace(/^unix:/, ""));
+    process.on("SIGTERM", () => server.close(() => process.exit(0)));
+  `);
+  const started = Date.now();
+  const session = await ensureBrokerSession(f.dir, { scriptPath: delayedBroker, env: f.env, connectDeadline: Date.now() + 10000 });
+  const elapsed = Date.now() - started;
+  assert.ok(session, "broker ready after 2.5s must succeed within a 10s connectDeadline");
+  assert.ok(elapsed >= 2400, `expected >= 2400ms wait, got ${elapsed}ms`);
+  assert.equal(alive(session.pid), true);
+  t.after(async () => { if (alive(session.pid)) process.kill(session.pid, "SIGTERM"); await until(() => !alive(session.pid)); });
+});
+
+test("ensureBrokerSession returns promptly when the broker child exits immediately", async t => {
+  if (!await requireLocalSockets(t)) return;
+  const f = fixture(), crashDir = makeTempDir("br-crash-"), crashBroker = path.join(crashDir, "crash-broker.mjs");
+  fs.writeFileSync(crashBroker, "process.exit(1);\n");
+  const started = Date.now();
+  const session = await ensureBrokerSession(crashDir, { scriptPath: crashBroker, env: f.env, connectDeadline: Date.now() + 10000 });
+  const elapsed = Date.now() - started;
+  t.diagnostic(`ensureBrokerSession early-exit elapsed: ${elapsed}ms`);
+  assert.equal(session, null);
+  assert.ok(elapsed < 2000, `exiting broker must fail fast well under 10s deadline, took ${elapsed}ms`);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(crashDir, f.env), "broker.json")), false);
+  const missing = `unix:${path.join(crashDir, "never.sock")}`;
+  for (const event of ["exit", "error"]) {
+    const child = new EventEmitter(), t0 = Date.now();
+    const pending = waitForBrokerEndpoint(missing, 10000, { child });
+    setTimeout(() => child.emit(event, event === "error" ? new Error("spawn failed") : 1), 20);
+    assert.equal(await pending, false);
+    assert.ok(Date.now() - t0 < 1000, `waitForBrokerEndpoint should settle promptly on ${event}`);
+  }
 });

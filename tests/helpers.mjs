@@ -42,6 +42,48 @@ export function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { encoding: "utf8", mode: 0o755 });
 }
 
+let staticBinCacheDir = null;
+const staticBinCache = new Map();
+function ensureStaticBinCacheDir() {
+  if (!staticBinCacheDir) {
+    staticBinCacheDir = makeTempDir("fixture-bin-");
+    process.on("exit", () => {
+      if (process.platform === "win32") {
+        for (const cached of staticBinCache.values()) {
+          try { fs.chmodSync(cached, 0o666); } catch {}
+        }
+      }
+      try { fs.rmSync(staticBinCacheDir, { recursive: true, force: true }); } catch {}
+    });
+  }
+  return staticBinCacheDir;
+}
+
+// Copy each static fixture script once per test process into a read-only cache
+// inode, then hardlink per-test paths to it so macOS skips per-test first-exec
+// overhead and accidental in-place writes fail loudly without touching repo files.
+export function linkStaticExecutable(targetPath, fixturePath, { rewriteShebang = false } = {}) {
+  const resolved = path.resolve(fixturePath);
+  const key = `${resolved}\0${rewriteShebang ? "1" : "0"}`;
+  let cached = staticBinCache.get(key);
+  if (!cached || !fs.existsSync(cached)) {
+    const dir = ensureStaticBinCacheDir();
+    cached = path.join(dir, `${staticBinCache.size}-${path.basename(resolved)}`);
+    let content = fs.readFileSync(resolved, "utf8");
+    if (rewriteShebang) content = content.replace(/^#![^\r\n]*/, `#!${process.execPath}`);
+    fs.writeFileSync(cached, content, { encoding: "utf8", mode: 0o755 });
+    if (process.platform !== "win32") fs.chmodSync(cached, 0o555);
+    staticBinCache.set(key, cached);
+  }
+  fs.rmSync(targetPath, { force: true });
+  try { fs.linkSync(cached, targetPath); }
+  catch (error) {
+    if (error.code !== "EXDEV") throw error;
+    fs.symlinkSync(cached, targetPath);
+  }
+  return targetPath;
+}
+
 export function run(command, args, options = {}) {
   return spawnSync(command, args, {
     cwd: options.cwd,

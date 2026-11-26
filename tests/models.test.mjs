@@ -2,13 +2,15 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { makeTempDir, run, writeExecutable } from "./helpers.mjs";
+import { fileURLToPath } from "node:url";
+import { linkStaticExecutable, makeTempDir, run } from "./helpers.mjs";
 import { buildEnv } from "./fake-codex-fixture.mjs";
 import { listModels, readModelCache } from "../plugins/codex/scripts/lib/models.mjs";
 import { roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 
 const plugin = new URL("../plugins/codex/", import.meta.url);
 const launcher = new URL("bin/duet", plugin).pathname;
+const fakeModelsCodex = fileURLToPath(new URL("./fixtures/fake-models-codex.cjs", import.meta.url));
 const fetchedAt = "2026-10-31T00:00:00Z";
 const models = [
   { slug: "fixture-routine", display_name: "Routine", description: "Fast workhorse", visibility: "list", priority: 2,
@@ -28,31 +30,12 @@ function fixture({ cache = true, runtime = null, runtimeModels = models } = {}) 
   const writeCache = (entries = models) => fs.writeFileSync(cacheFile, JSON.stringify({ fetched_at: fetchedAt, identity: { token: "CACHE_SECRET" },
     client_version: "fixture", etag: "PRIVATE_ETAG", models: entries.map(model => ({ ...model, token: "MODEL_SECRET" })) }));
   if (cache) writeCache();
-  if (runtime) writeExecutable(env.CODEX_COMPANION_BIN, `#!/usr/bin/env node
-const fs = require('node:fs'), readline = require('node:readline');
-const behavior = ${JSON.stringify(runtime)}, models = ${JSON.stringify(runtimeModels)};
-fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
-const send = (id, result) => process.stdout.write(JSON.stringify({id, result}) + '\\n');
-readline.createInterface({input: process.stdin}).on('line', line => {
-  const message = JSON.parse(line);
-  fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(message) + '\\n');
-  if (message.method === 'initialize') return send(message.id, {});
-  if (message.method !== 'model/list') return;
-  if (behavior === 'hang') return;
-  if (behavior === 'error') return process.stdout.write(JSON.stringify({id: message.id, error: {code: -32601, message: 'RUNTIME_SECRET'}}) + '\\n');
-  if (behavior === 'malformed') return send(message.id, {data: 'RUNTIME_SECRET'});
-  const index = message.params.cursor === null ? 0 : 1;
-  const offset = Number(message.params.cursor ?? 0);
-  const chunk = behavior === 'catalog' ? models : behavior === 'paged' ? models.slice(offset, offset + 100) : index ? [models[2]] : [models[0], models[1]];
-  const data = chunk.map(model => ({model: model.slug, id: 'not-the-slug',
-    displayName: model.display_name, description: model.description, hidden: model.visibility === 'hide',
-    defaultReasoningEffort: model.default_reasoning_level,
-    supportedReasoningEfforts: model.supported_reasoning_levels.map(({effort}) => ({reasoningEffort: effort})), token: 'RUNTIME_SECRET'}));
-  const nextCursor = behavior === 'catalog' ? null : behavior === 'paged' ? (offset + 100 < models.length ? String(offset + 100) : null)
-    : behavior === 'loop' || index === 0 ? 'second-page' : null;
-  send(message.id, {data, nextCursor});
-});
-`);
+  if (runtime) {
+    fs.writeFileSync(path.join(dir, "models-fixture-config.json"), JSON.stringify({
+      behavior: runtime, models: runtimeModels, calls, pidFile
+    }), "utf8");
+    linkStaticExecutable(env.CODEX_COMPANION_BIN, fakeModelsCodex);
+  }
   return { dir, home, env, cacheFile, writeCache, calls, pidFile,
     call: (...args) => run(process.execPath, [launcher, ...args], { env, cwd: dir }) };
 }
@@ -72,6 +55,7 @@ test("models CLI uses the sanitized cache, marks roleless defaults and optionall
   json(f.call("setup", "--default-model", "fixture-strong", "--default-effort", "high", "--ultra-routine-model", "fixture-routine", "--json"));
   const report = json(f.call("models", "--json"));
   assert.equal(report.source, "cache");
+  assert.equal(report.fallbackReason, "unavailable");
   assert.deepEqual(report.models.map(model => model.slug), ["fixture-strong", "fixture-routine"]);
   assert.deepEqual(report.models.map(model => model.inUse), [["default"], ["ultra-routine"]]);
   assert.deepEqual(report.models[0].efforts, ["high", "xhigh"]);
@@ -93,6 +77,7 @@ test("models prefers the paginated app-server catalog and closes its runtime", (
   const f = fixture({ runtime: "ok" }); f.writeCache([{ ...models[0], slug: "cache-only" }]);
   const report = json(f.call("models", "--all", "--json"));
   assert.equal(report.source, "app-server");
+  assert.equal(Object.hasOwn(report, "fallbackReason"), false);
   assert.deepEqual(report.models.map(model => model.slug), models.map(model => model.slug));
   assert.equal(report.models[0].contextWindow, null);
   const calls = fs.readFileSync(f.calls, "utf8").trim().split("\n").map(JSON.parse).filter(call => call.method === "model/list");
@@ -101,14 +86,19 @@ test("models prefers the paginated app-server catalog and closes its runtime", (
   assert.throws(() => process.kill(Number(fs.readFileSync(f.pidFile, "utf8")), 0), { code: "ESRCH" });
 });
 
-test("invalid pages, cursor loops and a stalled app-server fall back and clean up", async () => {
-  for (const runtime of ["malformed", "loop", "hang"]) {
+test("invalid pages, cursor loops, errors and a stalled app-server report fallbackReason and clean up", async () => {
+  for (const [runtime, expectedReason, timeoutMs] of [
+    ["malformed", "invalid", 3000],
+    ["loop", "invalid", 3000],
+    ["error", "unavailable", 3000],
+    ["hang", "timeout", 800]
+  ]) {
     const f = fixture({ runtime });
-    const report = await listModels({ env: f.env, cwd: f.dir, timeoutMs: 3000 });
+    const report = await listModels({ env: f.env, cwd: f.dir, timeoutMs });
     assert.equal(report.source, "cache", runtime);
+    assert.equal(report.fallbackReason, expectedReason, runtime);
     assert.equal(report.models.length, 2);
     assert.doesNotMatch(JSON.stringify(report), /SECRET|identity|token/);
-    // Under heavy parallel load the fake runtime may not start before the deadline; the contract is fallback plus cleanup.
     if (fs.existsSync(f.pidFile)) assert.throws(() => process.kill(Number(fs.readFileSync(f.pidFile, "utf8")), 0), { code: "ESRCH" }, runtime);
   }
 });
@@ -123,6 +113,8 @@ test("cache and API catalogs reject unsafe tokens and bound untrusted display fi
     const f = fixture({ runtime, runtimeModels: entries });
     fs.writeFileSync(f.cacheFile, JSON.stringify({ fetched_at: "2026-10-31 (\nINJECTED\n)", models: entries }));
     const report = json(f.call("models", "--json"));
+    assert.equal(report.source, runtime ? "app-server" : "cache", String(runtime));
+    assert.equal(report.fallbackReason, runtime ? undefined : "unavailable", String(runtime));
     assert.deepEqual(report.models.map(model => model.slug), ["fixture-safe", "gpt-5.3-codex-spark"]);
     assert.equal(report.droppedInvalid, invalid.length);
     assert.equal(report.fetchedAt, new Date(report.fetchedAt).toISOString());
@@ -144,8 +136,15 @@ test("catalog byte and entry caps reject oversized caches and paginated API tota
   const entries = Array.from({ length: 1001 }, (_, index) => ({ ...models[0], slug: `fixture-${index}` }));
   f.writeCache(entries);
   assert.equal(readModelCache(f.env), null);
+  const atCap = fixture({ runtime: "paged", runtimeModels: entries.slice(0, 1000) });
+  const atCapReport = json(atCap.call("models", "--all", "--json"));
+  assert.equal(atCapReport.source, "app-server");
+  assert.equal(atCapReport.models.length, 1000);
+  assert.equal(Object.hasOwn(atCapReport, "fallbackReason"), false);
   const oversized = fixture({ runtime: "paged", runtimeModels: entries });
-  assert.equal(json(oversized.call("models", "--json")).source, "cache");
+  const oversizedReport = json(oversized.call("models", "--json"));
+  assert.equal(oversizedReport.source, "cache");
+  assert.equal(oversizedReport.fallbackReason, "invalid");
 });
 
 test("models rejects invalid options and overlapping homes before runtime startup", async () => {
