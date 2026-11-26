@@ -12,9 +12,12 @@ import { jobBackend } from "./lib/backends.mjs";
 import { ACTIVE, ASK_PARENT, PARENT_BRIDGE_ENV, recordedThreadJobs, askParentQuestion } from "./lib/job-runtime.mjs";
 import { readRoom, assertChair, readIndex, readThread, readResource, postEvent, renderForum, EVENT_KINDS } from "./lib/forum.mjs";
 import { readJobFile, resolveJobFile } from "./lib/state.mjs";
+import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, resolveWorkspaceExecRoot, callWorkspaceReadTool } from "./lib/workspace-read-tools.mjs";
 
 const cwd = process.env[PARENT_BRIDGE_ENV.cwd], envThread = process.env[PARENT_BRIDGE_ENV.threadId], envJob = process.env[PARENT_BRIDGE_ENV.jobId];
 const backend = process.env.CODEX_COMPANION_BRIDGE_BACKEND ?? "codex";
+const workspaceRoot = backend === "antigravity" ? resolveWorkspaceExecRoot(process.env[WORKSPACE_EXEC_CWD_ENV]) : null;
+const workspaceTools = workspaceRoot ? WORKSPACE_READ_TOOLS : [];
 const caller = { pid: process.pid, nonce: randomUUID() };
 const validThread = id => typeof id === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(id);
 // Match the job filename alphabet used by retention, with a bounded length.
@@ -131,18 +134,23 @@ process.stdin.on("data", createJsonLineReader(async line => {
         send({ id: message.id, result: {} });
         break;
       case "tools/list":
-        send({ id: message.id, result: { tools: [TOOL, ...(listingJob()?.request?.roundtable ? FORUM_TOOLS : [])] } });
+        send({ id: message.id, result: { tools: [TOOL, ...(listingJob()?.request?.roundtable ? FORUM_TOOLS : []), ...workspaceTools] } });
         break;
       case "tools/call": {
         const { name, arguments: args, _meta } = message.params ?? {};
         const forumTool = FORUM_TOOLS.some(tool => tool.name === name);
-        if (name !== TOOL.name && !forumTool) { send({ id: message.id, error: { code: -32602, message: "Unknown tool" } }); break; }
-        if (!forumTool && !valid(args)) { send({ id: message.id, result: { ...result("Invalid ask_parent arguments: question (<=1000 chars) and up to 6 options (<=160 chars) are accepted."), isError: true } }); break; }
+        const workspaceTool = workspaceTools.some(tool => tool.name === name);
+        if (name !== TOOL.name && !forumTool && !workspaceTool) { send({ id: message.id, error: { code: -32602, message: "Unknown tool" } }); break; }
+        if (!forumTool && !workspaceTool && !valid(args)) { send({ id: message.id, result: { ...result("Invalid ask_parent arguments: question (<=1000 chars) and up to 6 options (<=160 chars) are accepted."), isError: true } }); break; }
         const threadId = boundThread();
         const turnId = _meta?.["x-codex-turn-metadata"]?.turn_id;
         const job = threadId && !(typeof _meta?.threadId === "string" && _meta.threadId !== threadId)
           ? await jobForTurn(threadId, validTurn(turnId) ? turnId : null) : null;
         if (!job) { send({ id: message.id, result: { ...result("No Fugato task is listening on this thread right now. Proceed on a conservative assumption within the authorized scope and report it."), isError: true } }); break; }
+        if (workspaceTool) {
+          send({ id: message.id, result: await callWorkspaceReadTool(name, args === undefined ? {} : args, workspaceRoot) });
+          break;
+        }
         if (forumTool) {
           if (!job.request?.roundtable) throw new Error("Forum tools are available only to roundtable jobs.");
           forumArgs(name, args ?? {});
@@ -168,7 +176,9 @@ process.stdin.on("data", createJsonLineReader(async line => {
         send({ id: message.id, error: { code: -32601, message: "Method not found" } });
     }
   } catch (error) {
-    send({ id: message.id, result: { ...result(`${message.params?.name?.startsWith("forum_") ? "Roundtable forum" : "Parent question"} unavailable (${error instanceof Error ? error.message : String(error)}). Proceed conservatively and report missing essential input.`), isError: true } });
+    const label = message.params?.name?.startsWith("forum_") ? "Roundtable forum"
+      : message.params?.name?.startsWith("workspace_") ? "Workspace read tool" : "Parent question";
+    send({ id: message.id, result: { ...result(`${label} unavailable (${error instanceof Error ? error.message : String(error)}). Proceed conservatively and report missing essential input.`), isError: true } });
   }
 }));
 process.stdin.on("end", () => process.exit(0));

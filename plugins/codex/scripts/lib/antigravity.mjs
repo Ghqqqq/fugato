@@ -10,6 +10,7 @@ import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { acquireConcurrency } from "./concurrency.mjs";
 import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
+import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES } from "./workspace-read-tools.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
 export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
@@ -171,10 +172,12 @@ async function setSelection(client, sessionId, configuration, kind, requested, i
   return selected.value;
 }
 
-function parentBridgeToolKeys(toolName) {
+export function parentBridgeToolKeys(toolName) {
   if (toolName === "ask_parent") return new Set([...Object.keys(ASK_PARENT.inputSchema.properties), "toolSummary"]);
   if (toolName === "forum_read") return new Set(["resource", "after", "thread", "limit", "toolSummary"]);
   if (toolName === "forum_post") return new Set(["kind", "body", "title", "thread", "reply_to", "label", "refs", "mentions", "toolSummary"]);
+  const workspaceTool = WORKSPACE_READ_TOOLS.find(tool => tool.name === toolName);
+  if (workspaceTool) return new Set([...Object.keys(workspaceTool.inputSchema.properties), "toolSummary"]);
   return null;
 }
 
@@ -188,10 +191,14 @@ function noEntries(value) {
   return value == null || (Array.isArray(value) && value.length === 0);
 }
 
-function autoAllowedParentBridgeTool(call, bridge) {
+export function autoAllowedParentBridgeTool(call, bridge) {
   if (!bridge?.serverName || !call?.tool) return null;
   const tool = call.tool;
-  const listed = bridge.roundtable ? ["ask_parent", "forum_read", "forum_post"] : ["ask_parent"];
+  const listed = [
+    "ask_parent",
+    ...(bridge.roundtable ? ["forum_read", "forum_post"] : []),
+    ...(bridge.backend === "antigravity" ? WORKSPACE_READ_TOOL_NAMES : [])
+  ];
   const toolName = typeof tool.name === "string"
     ? listed.find(name => tool.name === `mcp_${bridge.serverName}_${name}`)
     : null;
@@ -205,18 +212,23 @@ function autoAllowedParentBridgeTool(call, bridge) {
 
 function parentBridgeServers(cwd, options) {
   const bridge = options.parentBridge;
-  if (!bridge) return { serverName: null, roundtable: false, servers: [] };
+  if (!bridge) return { serverName: null, backend: null, roundtable: false, servers: [] };
   const threadId = options.resumeThreadId ?? bridge.threadId;
   const jobId = options.jobId ?? bridge.jobId;
   if (!threadId && !jobId) throw new Error("Antigravity parent bridge requires a Fugato job or session handle.");
+  const executionCwd = path.resolve(options.executionCwd ?? cwd);
   const serverName = `${PARENT_BRIDGE_SERVER}_${randomBytes(6).toString("hex")}`;
   const env = { [PARENT_BRIDGE_ENV.cwd]: bridge.cwd ?? cwd, CODEX_COMPANION_BRIDGE_BACKEND: "antigravity",
+    [WORKSPACE_EXEC_CWD_ENV]: executionCwd,
     ...(jobId ? { [PARENT_BRIDGE_ENV.jobId]: jobId } : { [PARENT_BRIDGE_ENV.threadId]: threadId }),
     CODEX_COMPANION_HOME: resolveIsolatedCodexHome(), ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
-  return { serverName, roundtable: Boolean(bridge.roundtable), servers: [{ name: serverName, command: process.execPath,
+  return { serverName, backend: "antigravity", roundtable: Boolean(bridge.roundtable), servers: [{ name: serverName, command: process.execPath,
     args: [fileURLToPath(new URL("../parent-bridge-mcp.mjs", import.meta.url))],
     env: Object.entries(env).map(([name, value]) => ({ name, value: String(value) })) }] };
 }
+
+export const GEMINI_WORKSPACE_GUIDANCE =
+  "Read files with read_file, and use workspace_list, workspace_grep and workspace_git_read instead of shell commands for directory listing, code search and git inspection. These read-only tools stay inside the job execution directory and run without shell approval.";
 
 function promptContent(options) {
   const prompt = options.prompt?.trim() || options.defaultPrompt?.trim();
@@ -225,7 +237,8 @@ function promptContent(options) {
   // ACP v1 has no portable developer-role or outputSchema field. Forward
   // Fugato's instructions as explicit task context; its existing report parser
   // validates the final response instead of claiming server-enforced output.
-  if (options.developerInstructions) content.push({ type: "text", text: `[Fugato task instructions]\n${options.developerInstructions}` });
+  const instructions = [options.developerInstructions, options.parentBridge ? GEMINI_WORKSPACE_GUIDANCE : null].filter(Boolean).join("\n\n");
+  if (instructions) content.push({ type: "text", text: `[Fugato task instructions]\n${instructions}` });
   content.push({ type: "text", text: prompt });
   if (options.outputSchema) content.push({ type: "text", text: `Return the final answer as one JSON object matching this schema. Do not surround the object with prose or Markdown fences.\n${JSON.stringify(options.outputSchema)}` });
   return content;

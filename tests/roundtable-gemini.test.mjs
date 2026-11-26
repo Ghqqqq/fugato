@@ -296,3 +296,40 @@ test("D8 refuses auto-allow on every negative condition and preserves the normal
     });
   }
 });
+
+test("Antigravity auto-allows workspace read tools with argument-free audit entries and passes execution cwd", async t => {
+  const dir = makeTempDir("rt-ws-tools-");
+  const execDir = path.join(dir, "exec-sub");
+  fs.mkdirSync(execDir, { recursive: true });
+  const prevBin = process.env.FUGATO_ANTIGRAVITY_BIN;
+  t.after(() => {
+    if (prevBin === undefined) delete process.env.FUGATO_ANTIGRAVITY_BIN;
+    else process.env.FUGATO_ANTIGRAVITY_BIN = prevBin;
+  });
+  const mcpPermissionRequests = [
+    { tool: "workspace_list", rawInput: { path: ".", depth: 2, toolSummary: "List files" } },
+    { tool: "workspace_grep", rawInput: { pattern: "SECRET_GREP_TOKEN", fixed: true, toolSummary: "Search files" } },
+    { tool: "workspace_git_read", rawInput: { op: "status", toolSummary: "Check git status" } }
+  ];
+  const fake = installFakeAntigravity(dir, { mcpPermissionRequests });
+  process.env.FUGATO_ANTIGRAVITY_BIN = fake.binary;
+  const events = [], asked = [];
+  const res = await runAntigravityTurn(dir, {
+    executionCwd: execDir, prompt: "Inspect workspace.", sandbox: "danger-full-access",
+    parentBridge: { cwd: dir, jobId: "job-ws-1" },
+    onApprovalRequest: req => { asked.push(req); return "deny"; },
+    onProgress: ev => events.push(ev)
+  });
+  assert.equal(res.status, 0);
+  assert.deepEqual(asked, []);
+  assert.deepEqual(res.blockers, []);
+  const server = fake.requests().find(r => r.method === "session/new").params.mcpServers[0];
+  assert.equal(server.env.find(e => e.name === "CODEX_COMPANION_BRIDGE_EXEC_CWD")?.value, path.resolve(execDir));
+  const auditEvents = events.flatMap(ev => ev.activity ?? []).filter(a => a.type === "permissionAutoAllowed");
+  assert.deepEqual(auditEvents.map(a => a.text), [
+    "parent bridge tool auto-allowed: workspace_list",
+    "parent bridge tool auto-allowed: workspace_grep",
+    "parent bridge tool auto-allowed: workspace_git_read"
+  ]);
+  assert.doesNotMatch(JSON.stringify(events), /SECRET_GREP_TOKEN/);
+});
