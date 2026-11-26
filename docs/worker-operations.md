@@ -7,7 +7,7 @@ for 24 hours after the last native-unavailable observation, or until
 `fugato setup --dispatch` is run without `--dry-run`; otherwise it is for
 `native_adapter_unavailable`, `native_capacity`, per-call options the `DUET:` line
 rejects, or follow-ups to Bash-launched workers. Supply objective, owned paths, constraints
-and acceptance criteria with the [brief template](../plugins/codex/prompts/ultra-codex-protocol.md#writing-a-brief-every-codex-assignment).
+and acceptance criteria with the [brief template](../plugins/codex/prompts/protocol/core.md#writing-a-brief-every-codex-assignment).
 The completion notification carries the report. Only if it is missing, run
 `fugato result <worker>`; do not parse output files or poll.
 
@@ -46,7 +46,7 @@ progress. The wait budget defaults to 3600 s (maximum 3600) and the owner lease
 to 1800 s. Direct mode conflicts with `--follow`, `--detached`, `--background`,
 `--json`, `--feed-limit` and `--min-interval-sec`.
 
-- Terminal: apply the [acceptance protocol](../plugins/codex/prompts/ultra-codex-protocol.md#accepting-a-result-every-worker-report-no-exceptions)
+- Terminal: apply the [acceptance protocol](../plugins/codex/prompts/protocol/core.md#accepting-a-result-every-worker-report-no-exceptions)
   even on nonzero exit. Use `fugato result <worker> --details` for full evidence,
   handles, runtime settings and artifact paths. Read `rawOutputFile` only if
   report fields are insufficient.

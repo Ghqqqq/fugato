@@ -46,24 +46,26 @@ The `UserPromptSubmit` hook appends one versioned reminder to normal prompts.
 **Reminder template** (placeholders, not a current version or path):
 
 ```text
-Ultra-codex mode on (<scale>, max <n> workers (auto); roles: <role tuples>; high-stakes astra/xhigh; Gemini <availability>). Apply protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Ultra-codex mode on (<scale>, max <n> workers (auto); roles: <role tuples>; high-stakes astra/xhigh; Gemini <availability>). Apply protocol core v<core-hash> + ultra v<mode-hash> to substantive tasks; re-read <absolute-core-path> (first line: <!-- Fugato protocol core v<core-hash> -->) and <absolute-ultra-path> (first line: <!-- Fugato protocol ultra v<mode-hash> -->) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.
 ```
 
 An explicit integer renders `max <n> workers`. The `unlimited` setting renders
 `no worker cap`. Roles with the same model and effort are grouped. The Gemini
 status reads `on` or `off (Codex fallbacks)`.
-Pair and duel name their own section in their reminders. Run
-`fugato ultra-codex status --for-command` for the actual path and current version,
-or add `--json` for `protocolFile`/`protocolVersion`. All three commands use the
-same [protocol file](../plugins/codex/prompts/ultra-codex-protocol.md) and body
-hash. An edit to any mode or shared section invalidates the version for all modes.
+Pair, duel and roundtable name their own mode file in their reminders. Run
+`fugato ultra-codex status --for-command` for both current paths and versions,
+or add `--json` for `protocolFile`/`protocolVersion` (the mode file) and
+`protocolCoreFile`/`protocolCoreVersion` (the shared core). All modes share
+[core.md](../plugins/codex/prompts/protocol/core.md) plus their own mode file
+([ultra.md](../plugins/codex/prompts/protocol/ultra.md) here), each with its own
+body hash.
 
 Control-only invocations do not use Claude's Read tool or load the protocol
-body into context; the CLI reads it internally to compute the hash. Task
-invocations read the file before orchestration, then use only shared sections
-and **Ultra mode**. A reminder asks for a re-read unless the complete current
-protocol text is already in context from an earlier Read; a version mentioned in
-a reminder or command preamble does not count. The hook suppresses reminders for any of the three mode commands
+files into context; the CLI reads them internally to compute the hashes. Task
+invocations read both `core.md` and `ultra.md` before orchestration. A reminder
+asks to re-read each file unless its complete current text is already in context
+from an earlier Read; a version mentioned in a reminder or command preamble does
+not count. The hook suppresses reminders for any of the mode commands
 and stays silent without valid active state/session ID or on errors. The slash
 preamble runs the fixed `ultra-codex status --for-command`; raw task text never
 enters executable shell arguments.
@@ -79,7 +81,7 @@ are not retained. Workspace-keyed legacy records are discarded, never adopted.
 The active mode persists when resuming (`claude --resume`) or compacting the
 same session, including after a normal exit: SessionEnd keeps the mode record.
 A new session or `/clear` clears the active mode and applies the opt-in default
-saved with `fugato setup --default-mode off|ultra|pair|duel`, using standard mode
+saved with `fugato setup --default-mode off|ultra|pair|duel|roundtable`, using standard mode
 options (new installs default to off). Per-session changes never change that
 [saved default](configuration.md#default-orchestration-mode).
 SessionStart also prunes mode records older than 30 days,
@@ -204,7 +206,7 @@ Claude's effort to the two ends of each assignment:
   the interface contract so parallel pieces fit, and list the decisions that
   must come back through `ask_parent`. Read-only finders, judges, reviewers and
   investigators use a shorter probe brief with one question, evidence format
-  and explicit read-only bounds. See the [brief templates](../plugins/codex/prompts/ultra-codex-protocol.md#writing-a-brief-every-codex-assignment).
+  and explicit read-only bounds. See the [brief templates](../plugins/codex/prompts/protocol/core.md#writing-a-brief-every-codex-assignment).
 - **Full acceptance** applies to every changed deliverable, including docs,
   tests and substantive rework: status gate; scope
   check (`changedFiles`, or `touchedFiles` in `--details`, within `OWNED PATHS`,
@@ -222,7 +224,7 @@ Claude's effort to the two ends of each assignment:
   Decision-driving findings receive independent adversarial confirmation, then
   Claude spot-checks the decisive citation and records a verdict. Consequential
   or conflicting probe claims receive full acceptance. A worker's vote never
-  accepts code or replaces a required check. See the [acceptance protocol](../plugins/codex/prompts/ultra-codex-protocol.md#accepting-a-result-every-worker-report-no-exceptions).
+  accepts code or replaces a required check. See the [acceptance protocol](../plugins/codex/prompts/protocol/core.md#accepting-a-result-every-worker-report-no-exceptions).
 
 Two rules follow from this: drift is treated first as a brief defect, so the
 brief text is fixed before resending and the fix carried into sibling briefs;
@@ -311,7 +313,7 @@ without new findings for thorough work), deduplicating against all seen findings
 including rejected ones. Incomplete searches are not dry. This never replenishes
 the maximum of two rework rounds per assignment. Disclose sampled or omitted
 coverage and unresolved findings. The full policies live in the
-[Ultra mode section](../plugins/codex/prompts/ultra-codex-protocol.md#ultra-mode).
+[Ultra mode](../plugins/codex/prompts/protocol/ultra.md#ultra-mode).
 
 ## Scale and concurrency
 
@@ -456,14 +458,17 @@ disable forwarding. See [configuration](configuration.md#claude-instructions-and
 
 ## Protocol content version
 
-The first line of [the protocol](../plugins/codex/prompts/ultra-codex-protocol.md)
-is `<!-- Ultra-codex protocol v<hash> -->`. The hash is the first eight lowercase
-hex digits of SHA-256 over the UTF-8 text after removing only the matching
-version line and its newline. Keep the following blank line and all other bytes.
-`protocolVersion()` in `scripts/lib/ultra-codex-mode.mjs` computes it at runtime;
-`tests/ultra-codex-mode.test.mjs` checks that the committed header matches. All
-three modes share this hash and the absolute file path; the legacy filename and
-header are retained. After editing any body section, recompute the header.
-`fugato ultra-codex status --for-command` (or the pair/duel equivalent) reports
-the current computed version, even if the stored header is stale. The reminder
-above is a labeled template and does not need a copied literal hash.
+The protocol is split under `plugins/codex/prompts/protocol/` into shared
+[core.md](../plugins/codex/prompts/protocol/core.md) plus one file per mode
+(`ultra.md`, `pair.md`, `duel.md`, `roundtable.md`). The first line of each file
+is `<!-- Fugato protocol <part> v<hash> -->`. The hash is the first eight
+lowercase hex digits of SHA-256 over the UTF-8 text after removing only the
+matching version line and its newline. Keep the following blank line and all
+other bytes. `protocolVersion()` and `protocolParts()` in
+`scripts/lib/ultra-codex-mode.mjs` compute the hashes at runtime;
+`tests/ultra-codex-mode.test.mjs` checks that every committed header matches.
+After editing any file, recompute its header.
+`fugato ultra-codex status --for-command` (or the pair/duel/roundtable
+equivalent) reports both current computed versions, even if a stored header is
+stale. The reminder above is a labeled template and does not need copied literal
+hashes.

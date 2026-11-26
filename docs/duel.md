@@ -112,7 +112,7 @@ Read-only attacks, drafts and rebuttals use probe acceptance, promoted to full
 depth for consequential or conflicting claims. Record actual Codex job verdicts
 normally. A Claude general-purpose agent has no Fugato job ID: record its real
 agent identity, findings, checks and acceptance basis in journal **decision**
-entries. See the [duel protocol](../plugins/codex/prompts/ultra-codex-protocol.md#duel-mode)
+entries. See the [duel protocol](../plugins/codex/prompts/protocol/duel.md#duel-mode)
 and [run journal](run-journal.md).
 
 At the cap, report completed rounds, open IDs/criteria, evidence, risks and
@@ -135,15 +135,16 @@ Replacing/off discards its settings, leaving in-flight jobs unchanged. Repeated
 duel `on` retains saved rounds unless explicitly overridden. One-shot tasks do
 not write the record. See [state and lifecycle](state-and-retention.md#orchestration-mode-state).
 
-All modes share one [protocol file](../plugins/codex/prompts/ultra-codex-protocol.md)
-and current body hash. Tasks read it and apply shared sections plus **Duel mode**
-only; controls do not load the body into Claude's context. Obtain the current
-version/path with `fugato duel status --for-command`.
+All modes share [core.md](../plugins/codex/prompts/protocol/core.md) plus their
+own mode file ([duel.md](../plugins/codex/prompts/protocol/duel.md) here), each
+with its own body hash. Tasks read both files; controls do not load them into
+Claude's context. Obtain both current paths and versions with
+`fugato duel status --for-command`.
 
 **Reminder template** (placeholders):
 
 ```text
-Duel mode on (Codex builder implement <tuple>, breaker verify <tuple>, analysis architect <tuple>, max <rounds> rounds). Apply duel protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Duel mode on (Codex builder implement <tuple>, breaker verify <tuple>, analysis architect <tuple>, max <rounds> rounds). Apply duel protocol core v<core-hash> + duel v<mode-hash> to substantive tasks; re-read <absolute-core-path> (first line: <!-- Fugato protocol core v<core-hash> -->) and <absolute-duel-path> (first line: <!-- Fugato protocol duel v<mode-hash> -->) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.
 ```
 
 Round limits are advisory protocol rules, not runtime counters. Native/Bash,

@@ -3,7 +3,7 @@
   "version": "1.9.0",
   "private": true,
   "type": "module",
-  "description": "Fugato: delegate coding, research and review from Claude Code to parallel Codex workers.",
+  "description": "Fugato: delegate coding, research and review from Claude Code to parallel Codex and Gemini workers.",
   "license": "Apache-2.0",
   "engines": {
     "node": ">=18.18.0"

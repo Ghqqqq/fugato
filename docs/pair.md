@@ -70,7 +70,8 @@ and verifier reports use probe acceptance, including independent confirmation
 for decision-driving findings; consequential or conflicting claims require full
 acceptance. Pair's single-verifier allowance still applies: broader confirmation
 requires an explicit mode decision. The shared
-[brief and acceptance rules](../plugins/codex/prompts/ultra-codex-protocol.md#pair-mode)
+[pair rules](../plugins/codex/prompts/protocol/pair.md#pair-mode),
+[shared brief and acceptance rules](../plugins/codex/prompts/protocol/core.md#writing-a-brief-every-codex-assignment)
 and [run journal](run-journal.md) define the mechanics.
 
 ## Rework limits and escalation
@@ -102,16 +103,16 @@ is unresolved.
 ## Shared state, version and stop rules
 
 Pair uses the same [session record and lifecycle](state-and-retention.md#orchestration-mode-state)
-and single [protocol file](../plugins/codex/prompts/ultra-codex-protocol.md) as the
-other modes. Read the complete current file for a task, then apply shared
-sections and **Pair mode** only. Controls do not load the body into Claude's
-context. `fugato pair status --for-command` reports its current path and body hash;
-an edit anywhere invalidates that common version.
+and shared [core protocol](../plugins/codex/prompts/protocol/core.md) plus its own
+[pair protocol](../plugins/codex/prompts/protocol/pair.md). Read both files for a
+task. Controls do not load the protocol files into Claude's context.
+`fugato pair status --for-command` reports both paths and body hashes; each file
+is versioned independently.
 
 **Reminder template** (placeholders):
 
 ```text
-Pair mode on (executor role implement <tuple>, verifier role verify <tuple>, max 2 rework rounds). Apply pair protocol v<hash> to substantive tasks; re-read <absolute-protocol-path> unless its full text (first line: <!-- Ultra-codex protocol v<hash> -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Pair mode on (executor role implement <tuple>, verifier role verify <tuple>, max 2 rework rounds). Apply pair protocol core v<core-hash> + pair v<mode-hash> to substantive tasks; re-read <absolute-core-path> (first line: <!-- Fugato protocol core v<core-hash> -->) and <absolute-pair-path> (first line: <!-- Fugato protocol pair v<mode-hash> -->) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.
 ```
 
 Round limits are protocol-managed, not runtime counters. Native-first dispatch,

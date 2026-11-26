@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makeTempDir, initGitRepo, run, writeExecutable } from "./helpers.mjs";
 import { buildEnv } from "./fake-codex-fixture.mjs";
-import { clearMode, effectiveMaxWorkers, pruneModes, readMode, setMode, modeFile, protocolVersion, PROTOCOL_PATH } from "../plugins/codex/scripts/lib/ultra-codex-mode.mjs";
+import { clearMode, effectiveMaxWorkers, MODE_NAMES, pruneModes, readMode, setMode, modeFile, PROTOCOL_DIR, PROTOCOL_PARTS, protocolFile, protocolHeader, protocolParts, protocolVersion } from "../plugins/codex/scripts/lib/ultra-codex-mode.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 import { defaultModeSetup, dispatchPreference, readNativeUnavailable, roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 import { runWithRetainedStdin } from "./stdin-fixture.mjs";
@@ -78,22 +78,45 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
   assert.match(baseline, /Use `--high-stakes` when the rule/);
   assert.match(baseline, /Set explicit `--model` or `--effort` for user choices only/);
   for (const mode of MODES) {
+    const [core, active] = protocolParts(mode.name);
     const on = f.json(f.call(mode.verb, "on", ...mode.flags, "--json"));
     assert.deepEqual(on.activeMode, { name: mode.name, options: mode.options, since: on.since });
+    assert.deepEqual(
+      { protocolFile: on.protocolFile, protocolVersion: on.protocolVersion, protocolCoreFile: on.protocolCoreFile, protocolCoreVersion: on.protocolCoreVersion },
+      { protocolFile: active.file, protocolVersion: active.version, protocolCoreFile: core.file, protocolCoreVersion: core.version }
+    );
     const status = f.json(f.call(mode.verb, "status", "--cwd", other, "--json"));
     assert.deepEqual(status.activeMode, on.activeMode);
+    assert.equal(status.protocolFile, active.file);
+    assert.equal(status.protocolVersion, active.version);
+    assert.equal(status.protocolCoreFile, core.file);
+    assert.equal(status.protocolCoreVersion, core.version);
     assert.equal(modeFile(other, SESSION, f.env), f.modeFile(SESSION));
     assert.equal(fs.statSync(f.modeFile(SESSION)).mode & 0o777, 0o600);
     const reminder = f.prompt("substantive task").stdout.trim();
     assert.ok(reminder.length > 0);
-    assert.ok(reminder.includes(`v${protocolVersion()}`));
+    assert.ok(reminder.includes(`core v${core.version} + ${mode.name} v${active.version}`));
+    assert.ok(reminder.includes(core.file));
+    assert.ok(reminder.includes(active.file));
+    assert.ok(reminder.includes(core.header));
+    assert.ok(reminder.includes(active.header));
+    assert.ok(reminder.includes("Reminder/preamble version mentions do not count."));
+    for (const otherMode of MODE_NAMES.filter(name => name !== mode.name)) {
+      assert.equal(reminder.includes(protocolFile(otherMode)), false, `${mode.name} reminder must not name ${otherMode}`);
+      assert.equal(reminder.includes(`${otherMode}.md`), false, `${mode.name} reminder must not name ${otherMode}.md`);
+    }
     assert.equal(f.prompt("task", "another-session").stdout, "");
     assert.equal(f.prompt(`/fugato:${mode.verb} off`).stdout, "");
     assert.equal(f.lifecycle("SessionEnd", { reason: "prompt_input_exit", cwd: other }).status, 0);
     assert.equal(context(f.lifecycle("SessionStart", { source: "resume", cwd: other })), `${baseline}\n${reminder}`);
     assert.equal(context(f.lifecycle("SessionStart", { source: "compact" })), `${baseline}\n${reminder}`);
     assert.deepEqual(readMode(f.repo, SESSION, f.env).options, mode.options);
-    assert.equal(f.json(f.call(mode.verb, "off", "--json")).wasOn, true);
+    const off = f.json(f.call(mode.verb, "off", "--json"));
+    assert.equal(off.wasOn, true);
+    assert.equal(off.protocolFile, active.file);
+    assert.equal(off.protocolVersion, active.version);
+    assert.equal(off.protocolCoreFile, core.file);
+    assert.equal(off.protocolCoreVersion, core.version);
     assert.equal(f.prompt("task").stdout, "");
   }
   assert.equal(context(f.lifecycle("SessionStart", { source: "resume" })), baseline);
@@ -131,8 +154,9 @@ test("ultra reminder groups equal role tuples and updates when agy becomes avail
     assert.ok(status.stdout.split("\n").includes(`models: roles ${fallbackSummary}; roleless default gpt-6-astra/xhigh`));
   }
   setMode(f.repo, SESSION, { scale: "quick", maxWorkers: 2 }, f.env);
+  const [core, ultra] = protocolParts("ultra");
   const prefix = "Ultra-codex mode on (quick, max 2 workers; roles: ";
-  const suffix = `). Apply protocol v${protocolVersion()} to substantive tasks`;
+  const suffix = `). Apply protocol core v${core.version} + ultra v${ultra.version} to substantive tasks`;
   const reminder = () => {
     const result = f.prompt("task");
     assert.equal(result.status, 0, result.stderr);
@@ -298,15 +322,32 @@ test("mode CLI rejects malformed controls before writes and keeps command preamb
   assert.equal(run(process.execPath, [script, "pair", "on"], { cwd: f.repo, env: f.baseEnv }).status, 1);
   assert.equal(f.json(run(process.execPath, [script, "pair", "status", "--json"], { cwd: f.repo, env: f.baseEnv })).sessionId, null);
   for (const mode of MODES) {
+    const [core, active] = protocolParts(mode.name);
     const command = fs.readFileSync(new URL(`../plugins/codex/commands/${mode.verb}.md`, import.meta.url), "utf8");
     assert.doesNotMatch(command, /^!`[^\n]*\$ARGUMENTS/m);
     const result = run(process.execPath, [script, mode.verb, "status", "--for-command"], { cwd: f.repo, env: f.env, input: "$(exit 93) `exit 94`; off" });
     assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.stdout.includes(`Read both ${core.file} (core v${core.version}) and ${active.file} (${mode.name} v${active.version})`));
+    for (const otherMode of MODE_NAMES.filter(name => name !== mode.name)) {
+      assert.equal(result.stdout.includes(`${otherMode}.md`), false, `${mode.verb} preamble must not name ${otherMode}.md`);
+    }
+    const bareStatus = f.call(mode.verb, "status");
+    assert.equal(bareStatus.status, 0, bareStatus.stderr);
+    assert.equal(bareStatus.stdout.includes("Read both"), false);
+    assert.equal(bareStatus.stdout.includes(core.file), false);
+    assert.equal(bareStatus.stdout.includes(active.file), false);
+    const help = f.call(mode.verb, "--help");
+    assert.equal(help.status, 0, help.stderr);
+    assert.equal(help.stdout.includes("Read both"), false);
+    assert.equal(help.stdout.includes(core.file), false);
+    assert.equal(help.stdout.includes(active.file), false);
     assert.equal(fs.readFileSync(file, "utf8"), before);
   }
-  assert.equal(f.call("pair", "--help").status, 0);
-  const protocol = fs.readFileSync(PROTOCOL_PATH, "utf8");
-  assert.equal(protocol.split("\n")[0], `<!-- Ultra-codex protocol v${protocolVersion(protocol)} -->`);
+  for (const part of PROTOCOL_PARTS) {
+    const protocol = fs.readFileSync(protocolFile(part), "utf8");
+    assert.equal(protocol.split("\n")[0], protocolHeader(part, protocolVersion(protocol)));
+  }
+  assert.equal(fs.existsSync(path.join(path.dirname(PROTOCOL_DIR), "ultra-codex-protocol.md")), false);
 });
 
 test("roundtable options survive reactivation and status is a mode control", () => {

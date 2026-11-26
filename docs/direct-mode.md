@@ -220,7 +220,7 @@ plus cleanup status when captured. A refused follow-up with `thread_busy` points
 recovery/status action, or null. The blocker carries the owner's question and
 cancel action when available; `details` continues to select the refused attempt.
 
-- Terminal: apply the [acceptance protocol](../plugins/codex/prompts/ultra-codex-protocol.md#accepting-a-result-every-worker-report-no-exceptions),
+- Terminal: apply the [acceptance protocol](../plugins/codex/prompts/protocol/core.md#accepting-a-result-every-worker-report-no-exceptions),
   even after a nonzero exit. Verify the diff and checks yourself; read
   `rawOutputFile` only if report fields are insufficient.
 - `running`: run `fugato wait <worker>` in background Bash and wait for its notification.
@@ -338,7 +338,7 @@ brief's objective, owned paths, criteria and verification. A Codex fork shares
 no prompt cache with Claude, so its first turn reads the imported slice;
 choose it for needed context, not context hygiene. If the import exceeds the
 source read cap, brief without `--fork`. See the
-[shared brief rules](../plugins/codex/prompts/ultra-codex-protocol.md#writing-a-brief-every-codex-assignment).
+[shared brief rules](../plugins/codex/prompts/protocol/core.md#writing-a-brief-every-codex-assignment).
 
 ### Live view with fugato-live
 

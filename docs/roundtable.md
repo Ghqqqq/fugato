@@ -356,4 +356,4 @@ two consecutive work boundaries without a new fact, discriminating experiment
 or candidate improvement are a soft stopping signal, not proof of success.
 Intensity and persona mappings are starting points for evaluation; more members
 do not guarantee a better result. Full protocol:
-[Roundtable mode](../plugins/codex/prompts/ultra-codex-protocol.md#roundtable-mode).
+[Roundtable mode](../plugins/codex/prompts/protocol/roundtable.md#roundtable-mode) and [core protocol](../plugins/codex/prompts/protocol/core.md).
