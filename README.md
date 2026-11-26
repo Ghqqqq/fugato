@@ -163,7 +163,7 @@ A contested design or high-risk change, pairing a Codex worker against a Claude 
 </td>
 <td>
 <b><a href="docs/roundtable.md">Roundtable</a></b><br>
-Open-ended goals explored by persistent Codex personas in a shared forum, chaired by Claude.<br>
+Open-ended goals explored by persistent Codex or Gemini personas in a shared forum, chaired by Claude.<br>
 <code>/fugato:roundtable &lt;task&gt;</code>
 </td>
 </tr>
@@ -217,14 +217,15 @@ rounds; the Claude participant uses your Claude quota. [More](docs/duel.md).
   <img src="docs/assets/fugato-score-roundtable-light.svg" alt="Roundtable drawn as a score: six persona voices enter alone in a sealed first round, then answer one another in threads; a candidate is followed by another member's finding before Claude decides" width="100%">
 </picture>
 
-Up to six Codex personas (`conjecturer`, `critic`, `steward`, `improver`,
+Up to six personas (`conjecturer`, `critic`, `steward`, `improver`,
 `integrator`, `calibrator`) work toward one goal through a public forum. Each
 first posts an independent record, then members answer one another in threads;
 Claude chairs and accepts a reviewed candidate on evidence. Choose `light`
 (2 seats), `standard` (3), `deep` (5) or `full` (6), or pick any nonempty subset
 with `--roles` (a reviewed final selection needs a finding from a non-author
 member, so use at least two seats for that); redefine a persona's model with
-`fugato setup --persona-model`. [More](docs/roundtable.md).
+`fugato setup --persona-model`, where a `gemini-*` model seats that persona on
+Gemini. [More](docs/roundtable.md).
 
 ## Inside a worker
 
@@ -237,7 +238,7 @@ the checks run and the findings.
   <img src="docs/assets/fugato-showcase-agent-light.svg" alt="A worker's transcript: commands with their status, two file edits with line counts, and the closing report with changed files, checks and findings" width="86%">
 </picture>
 
-In roundtable mode, Codex personas argue a goal out in a shared forum. The live
+In roundtable mode, the personas argue a goal out in a shared forum. The live
 pane shows the posts as an index; press one to read it.
 
 <picture>

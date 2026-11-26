@@ -10,6 +10,35 @@
   to Gemini members only between turns (holding notices during parked
   approvals), and updates `fugato-live` provider/model and mixed-usage labels
   to follow each job's backend.
+- Give Gemini workers read-only `workspace_list`, `workspace_grep` and
+  `workspace_git_read` parent-bridge tools. They stay inside the job's
+  directory, run git without a shell or repository hooks, cap their output and
+  are auto-allowed with argument-free audit entries, so listing, searching and
+  git inspection no longer need an approval each. Codex workers do not get them.
+- Stop denying large approvals. Gemini edit approvals show duplicated diff
+  text once and fit up to 16 KiB inline; larger Gemini and Codex approvals are
+  saved as private SHA-256-named files behind a short card, and the answer is
+  refused if the operation or the file changed. Approval text up to 16 KiB no
+  longer drops the report's `next` command.
+- Broker startup waits until the caller's connect deadline and fails at once
+  when the broker exits; `fugato models` waits 10 s and reports
+  `fallbackReason` when it falls back to the cache.
+- Concurrency admission no longer checks agy processes inside its lock, the
+  roundtable notifier starts no process on idle ticks without room work, and
+  forum polling rewrites `room.json` only when something changed.
+- Count partial Gemini token usage in run journals, `status` and `fugato-live`
+  without treating missing counters as zero, and group totals by backend and
+  model. `fugato models` labels its roleless defaults as such.
+- `fugato cleanup` also removes expired closed roundtable rooms (keeping any
+  room with commits, changed files or an unreadable worktree), dead-owner
+  Antigravity admission locks and staged approval files of deleted jobs.
+- Gemini roundtable members see a one-line unread notice for chair posts and
+  mentions on their tool results, without moving forum cursors; `roundtable
+  status` shows approvals and tokens per member and for the room.
+- Split the orchestration protocol into a shared core and one file per mode,
+  each versioned on its own, so a session reads about half as much protocol
+  text. A docs-sync test now checks setup flags, the role table, model names
+  and protocol links against the code.
 
 ## 1.9.0
 
