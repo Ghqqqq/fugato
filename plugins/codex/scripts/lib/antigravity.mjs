@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID, createHash } from "node:crypto";
+import { randomBytes, randomUUID, createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { AcpClient } from "./acp-client.mjs";
@@ -8,8 +8,10 @@ import { agentMessageActivity, itemActivity, planActivity, snippet } from "./act
 import { executableOnPath } from "./process.mjs";
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { acquireConcurrency } from "./concurrency.mjs";
-import { PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
+import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
+import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES } from "./workspace-read-tools.mjs";
+import { approvalArtifactDir, stageApprovalArtifact, verifyApprovalArtifact } from "./approval-artifacts.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
 export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
@@ -19,9 +21,11 @@ const cancelledOutcome = () => ({ outcome: { outcome: "cancelled" } });
 const notStarted = error => Object.assign(error, { turnStatus: "notStarted", turnEnded: true });
 const binary = (env = process.env) => env.FUGATO_ANTIGRAVITY_BIN || "agy";
 const INSTALL_HELP = "Install Antigravity CLI, check `agy acp --help`, or set FUGATO_ANTIGRAVITY_BIN to its executable path.";
-// ACP's default mode asks about edits and commands. Edit requests repeat the
-// changed text in the arguments and the diff, so they need more than Codex's 800 bytes.
+// ACP's default mode asks about edits and commands. Inline display covers up to
+// 16 KiB raw UTF-8; larger operations stage exact review artifacts under 2 KiB cards.
 const MAX_APPROVAL_BYTES = 16 * 1024;
+const MAX_STAGED_CARD_BYTES = 2 * 1024;
+const UNSAFE_ARTIFACT_PATH = /[\p{Cf}\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const MAX_UNSUPPORTED_BLOCKERS = 8;
 const changedOperation = { code: "operation-changed-before-approval", message: "Antigravity's operation changed or its arguments disagree." };
 
@@ -171,19 +175,63 @@ async function setSelection(client, sessionId, configuration, kind, requested, i
   return selected.value;
 }
 
+export function parentBridgeToolKeys(toolName) {
+  if (toolName === "ask_parent") return new Set([...Object.keys(ASK_PARENT.inputSchema.properties), "toolSummary"]);
+  if (toolName === "forum_read") return new Set(["resource", "after", "thread", "limit", "toolSummary"]);
+  if (toolName === "forum_post") return new Set(["kind", "body", "title", "thread", "reply_to", "label", "refs", "mentions", "toolSummary"]);
+  const workspaceTool = WORKSPACE_READ_TOOLS.find(tool => tool.name === toolName);
+  if (workspaceTool) return new Set([...Object.keys(workspaceTool.inputSchema.properties), "toolSummary"]);
+  return null;
+}
+
+function isPlainObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === null || proto === Object.prototype;
+}
+
+function noEntries(value) {
+  return value == null || (Array.isArray(value) && value.length === 0);
+}
+
+export function autoAllowedParentBridgeTool(call, bridge) {
+  if (!bridge?.serverName || !call?.tool) return null;
+  const tool = call.tool;
+  const listed = [
+    "ask_parent",
+    ...(bridge.roundtable ? ["forum_read", "forum_post"] : []),
+    ...(bridge.backend === "antigravity" ? WORKSPACE_READ_TOOL_NAMES : [])
+  ];
+  const toolName = typeof tool.name === "string"
+    ? listed.find(name => tool.name === `mcp_${bridge.serverName}_${name}`)
+    : null;
+  if (!toolName || tool.kind !== "other") return null;
+  if (!noEntries(tool.locations) || !noEntries(tool.content) || call.diffs?.length) return null;
+  if (!isPlainObject(tool.rawInput) || !isDeepStrictEqual(tool.rawInput, tool.args)) return null;
+  const allowedKeys = parentBridgeToolKeys(toolName);
+  if (!Object.keys(tool.rawInput).every(key => allowedKeys.has(key))) return null;
+  return toolName;
+}
+
 function parentBridgeServers(cwd, options) {
   const bridge = options.parentBridge;
-  if (!bridge) return [];
+  if (!bridge) return { serverName: null, backend: null, roundtable: false, servers: [] };
   const threadId = options.resumeThreadId ?? bridge.threadId;
   const jobId = options.jobId ?? bridge.jobId;
   if (!threadId && !jobId) throw new Error("Antigravity parent bridge requires a Fugato job or session handle.");
+  const executionCwd = path.resolve(options.executionCwd ?? cwd);
+  const serverName = `${PARENT_BRIDGE_SERVER}_${randomBytes(6).toString("hex")}`;
   const env = { [PARENT_BRIDGE_ENV.cwd]: bridge.cwd ?? cwd, CODEX_COMPANION_BRIDGE_BACKEND: "antigravity",
+    [WORKSPACE_EXEC_CWD_ENV]: executionCwd,
     ...(jobId ? { [PARENT_BRIDGE_ENV.jobId]: jobId } : { [PARENT_BRIDGE_ENV.threadId]: threadId }),
     CODEX_COMPANION_HOME: resolveIsolatedCodexHome(), ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) };
-  return [{ name: PARENT_BRIDGE_SERVER, command: process.execPath,
+  return { serverName, backend: "antigravity", roundtable: Boolean(bridge.roundtable), servers: [{ name: serverName, command: process.execPath,
     args: [fileURLToPath(new URL("../parent-bridge-mcp.mjs", import.meta.url))],
-    env: Object.entries(env).map(([name, value]) => ({ name, value: String(value) })) }];
+    env: Object.entries(env).map(([name, value]) => ({ name, value: String(value) })) }] };
 }
+
+export const GEMINI_WORKSPACE_GUIDANCE =
+  "Read files with read_file, and use workspace_list, workspace_grep and workspace_git_read instead of shell commands for directory listing, code search and git inspection. These read-only tools stay inside the job execution directory and run without shell approval.";
 
 function promptContent(options) {
   const prompt = options.prompt?.trim() || options.defaultPrompt?.trim();
@@ -192,7 +240,8 @@ function promptContent(options) {
   // ACP v1 has no portable developer-role or outputSchema field. Forward
   // Fugato's instructions as explicit task context; its existing report parser
   // validates the final response instead of claiming server-enforced output.
-  if (options.developerInstructions) content.push({ type: "text", text: `[Fugato task instructions]\n${options.developerInstructions}` });
+  const instructions = [options.developerInstructions, options.parentBridge ? GEMINI_WORKSPACE_GUIDANCE : null].filter(Boolean).join("\n\n");
+  if (instructions) content.push({ type: "text", text: `[Fugato task instructions]\n${instructions}` });
   content.push({ type: "text", text: prompt });
   if (options.outputSchema) content.push({ type: "text", text: `Return the final answer as one JSON object matching this schema. Do not surround the object with prose or Markdown fences.\n${JSON.stringify(options.outputSchema)}` });
   return content;
@@ -209,7 +258,91 @@ function inputCommand(input) {
   return [input?.CommandLine, input?.command, input].find(value => typeof value === "string" && value.trim());
 }
 
-function permissionReview(tool) {
+function argumentStringRefs(input) {
+  const refs = new Map();
+  if (typeof input === "string") {
+    refs.set(input, "Arguments");
+  } else if (isPlainObject(input)) {
+    for (const [key, value] of Object.entries(input)) {
+      if (typeof value === "string" && !refs.has(value)) {
+        const ref = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? `Arguments.${key}` : `Arguments[${JSON.stringify(key)}]`;
+        refs.set(value, ref);
+      }
+    }
+  }
+  return refs;
+}
+
+function displayOperationDetails(content, input) {
+  if (!Array.isArray(content)) return content;
+  const refs = argumentStringRefs(input);
+  if (!refs.size) return content;
+  return content.map(block => {
+    if (!isPlainObject(block) || block.type !== "diff") return block;
+    let changed = false;
+    const next = { ...block };
+    for (const field of ["oldText", "newText"]) {
+      if (typeof block[field] === "string" && refs.has(block[field])) {
+        next[field] = { sameAs: refs.get(block[field]) };
+        changed = true;
+      }
+    }
+    return changed ? next : block;
+  });
+}
+
+function compactApprovalField(label, value, maxBytes = 256) {
+  const encoded = escapeApprovalControls(JSON.stringify(value));
+  if (Buffer.byteLength(encoded, "utf8") <= maxBytes) return `${label}: ${encoded}`;
+  const text = String(value);
+  let clipped = text.slice(0, Math.max(1, Math.floor(maxBytes / 2)));
+  if (/[\uD800-\uDBFF]$/.test(clipped)) clipped = clipped.slice(0, -1);
+  while (clipped.length > 1 && Buffer.byteLength(escapeApprovalControls(JSON.stringify(`${clipped}…`)), "utf8") > maxBytes) {
+    clipped = clipped.slice(0, Math.floor(clipped.length / 2));
+    if (/[\uD800-\uDBFF]$/.test(clipped)) clipped = clipped.slice(0, -1);
+  }
+  return `${label}: ${escapeApprovalControls(JSON.stringify(`${clipped}…`))}`;
+}
+
+function compactApprovalLocations(paths, maxBytes = 512) {
+  if (!paths.length) return null;
+  const full = escapeApprovalControls(JSON.stringify(paths));
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return `Locations: ${full}`;
+  const kept = [];
+  for (const entry of paths) {
+    const remaining = paths.length - kept.length - 1;
+    const candidate = escapeApprovalControls(JSON.stringify([...kept, entry])) + (remaining > 0 ? ` (+${remaining} more)` : "");
+    if (Buffer.byteLength(candidate, "utf8") > maxBytes) break;
+    kept.push(entry);
+  }
+  if (!kept.length) return `Locations: (${paths.length} path${paths.length === 1 ? "" : "s"}; see exact operation file)`;
+  const omitted = paths.length - kept.length;
+  return `Locations: ${escapeApprovalControls(JSON.stringify(kept))}${omitted > 0 ? ` (+${omitted} more)` : ""}`;
+}
+
+function buildStagedApprovalCard(tool, artifact) {
+  if (UNSAFE_ARTIFACT_PATH.test(artifact.path)) return null;
+  const locations = [...new Set([
+    ...(Array.isArray(tool.locations) ? tool.locations : []),
+    ...toolDiffs(tool)
+  ].map(entry => entry?.path).filter(value => typeof value === "string" && value))];
+  const lines = [
+    "Antigravity requests permission (staged; exceeds 16 KiB inline limit).",
+    compactApprovalField("Tool call ID", tool.toolCallId, 160),
+    ...(tool.name != null ? [compactApprovalField("Name", tool.name, 160)] : []),
+    ...(tool.kind != null ? [compactApprovalField("Kind", tool.kind, 160)] : []),
+    ...(locations.length ? [compactApprovalLocations(locations, 512)] : []),
+    `Size: ${artifact.bytes} bytes`,
+    `SHA-256: ${artifact.sha256}`,
+    `Exact operation: ${artifact.path}`,
+    "Read the exact operation file in full before answering.",
+    "Allow this operation once?"
+  ];
+  const card = lines.join("\n");
+  return Buffer.byteLength(card, "utf8") < MAX_STAGED_CARD_BYTES ? card : null;
+}
+
+function permissionReview(tool, staging = null) {
   if (typeof tool?.toolCallId !== "string" || !tool.toolCallId.trim()) return null;
   const input = tool.rawInput;
   const fields = [["Tool call ID", tool.toolCallId], ["Name", tool.name], ["Kind", tool.kind],
@@ -226,15 +359,25 @@ function permissionReview(tool) {
       (typeof input !== "object" || Object.keys(input).length > 0);
     const hasDiff = toolDiffs(tool).some(diff => typeof diff.oldText === "string" || typeof diff.newText === "string");
     if (!hasInput && !hasDiff) return null;
+    const displayFields = fields.map(([label, value]) =>
+      label === "Operation details" ? [label, displayOperationDetails(value, input)] : [label, value]);
     const lines = ["Antigravity requests permission."];
-    for (const [label, value] of fields) {
-      const json = JSON.stringify(value);
-      if (json.length > MAX_APPROVAL_BYTES) return tooLarge;
-      lines.push(`${label}: ${escapeApprovalControls(json)}`);
+    for (const [label, value] of displayFields) {
+      lines.push(`${label}: ${escapeApprovalControls(JSON.stringify(value))}`);
     }
     lines.push("Allow this operation once?");
     const question = lines.join("\n");
-    if (Buffer.byteLength(JSON.stringify(question)) <= MAX_APPROVAL_BYTES) return { question, fields: structuredClone(fields) };
+    if (Buffer.byteLength(question, "utf8") <= MAX_APPROVAL_BYTES) return { question, fields: structuredClone(fields) };
+    if (staging?.stage === false) return { fields: structuredClone(fields) };
+    if (!staging?.workspaceRoot || !staging?.jobId) return tooLarge;
+    let artifact;
+    try {
+      const dir = approvalArtifactDir(staging.workspaceRoot, staging.jobId, staging.env);
+      if (UNSAFE_ARTIFACT_PATH.test(dir)) return tooLarge;
+      artifact = stageApprovalArtifact(staging.workspaceRoot, staging.jobId, question, staging.env);
+    } catch { return tooLarge; }
+    const card = buildStagedApprovalCard(tool, artifact);
+    if (card) return { question: card, fields: structuredClone(fields), artifact };
   } catch (error) {
     // A deeply nested JSON value can exceed the serializer's stack limit.
     if (!(error instanceof RangeError)) throw error;
@@ -242,7 +385,7 @@ function permissionReview(tool) {
   return tooLarge;
 }
 
-async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call) {
+async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call, bridge, workspaceRoot = null) {
   const choices = Array.isArray(params.options) ? params.options : [];
   const allow = choices.find(value => value?.kind === "allow_once" && typeof value.optionId === "string");
   const controller = new AbortController();
@@ -254,8 +397,18 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
       if (call) call.permission = "denied";
       return cancelledOutcome();
     }
+    const autoAllowedTool = call && binding.turnId && allow ? autoAllowedParentBridgeTool(call, bridge) : null;
+    if (autoAllowedTool) {
+      if (call.permission !== "denied") call.permission = "approved";
+      const message = `parent bridge tool auto-allowed: ${autoAllowedTool}`;
+      report(options, message, "working", {
+        activity: [{ type: "permissionAutoAllowed", lifecycle: "completed", status: "approved", tool: autoAllowedTool, text: message }]
+      });
+      return { outcome: { outcome: "selected", optionId: allow.optionId } };
+    }
     let answer = "deny";
-    let review = call && binding.turnId && allow ? permissionReview(call.tool) : null;
+    const staging = workspaceRoot && options.jobId ? { workspaceRoot, jobId: options.jobId, env: options.env } : null;
+    let review = call && binding.turnId && allow ? permissionReview(call.tool, staging) : null;
     if (review?.question && options.onApprovalRequest) {
       const request = { kind: "acp-permission", question: review.question, options: ["Allow once", "Deny"],
         binding: { ...binding }, signal: controller.signal, toolCall: call.tool };
@@ -263,9 +416,9 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
         Promise.resolve().then(() => options.onApprovalRequest(request)).catch(() => "deny"),
         new Promise(resolve => { onCancelled = () => resolve("deny"); controller.signal.addEventListener("abort", onCancelled, { once: true }); })
       ]);
-      // Bind the answer to the displayed values. Status updates and JSON
-      // object key order do not change the operation.
-      if (!controller.signal.aborted && !isDeepStrictEqual(permissionReview(call.tool)?.fields, review.fields)) {
+      // Bind the answer to the displayed values and any staged artifact.
+      if (!controller.signal.aborted && (!isDeepStrictEqual(permissionReview(call.tool, { stage: false })?.fields, review.fields)
+          || (review.artifact && !verifyApprovalArtifact(review.artifact)))) {
         review = changedOperation;
         answer = "deny";
       }
@@ -407,7 +560,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
   const reservation = await acquireConcurrency({ jobFile: options.jobId ? resolveJobFile(cwd, options.jobId) : null, signal: options.signal,
     onQueued: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "queued", phase: "queued (concurrency limit)" })); report(options, "Queued (concurrency limit).", "queued (concurrency limit)"); },
     onAdmitted: () => { if (options.jobId) updateJob(cwd, options.jobId, () => ({ status: "running", phase: "starting" })); } });
-  let client, releaseAdmission, submitted = false, cleanupConfirmed = false;
+  let client, releaseAdmission, parentBridge = null, submitted = false, cleanupConfirmed = false;
   let threadId = options.resumeThreadId ?? null, turnId = null;
   const configuration = sessionConfiguration(threadId);
   let capture = false, finalMessage = "", messageId = null, toolSinceChunk = false, thought = "", acpUsage = null;
@@ -456,7 +609,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
           // ACP permits ToolCallUpdate here, including only toolCallId. Merge
           // with this session's observed call so approval shows its real scope.
           const call = params.sessionId === threadId && typeof partial?.toolCallId === "string" ? observeTool(tools, partial) : null;
-          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call);
+          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call, parentBridge, cwd);
         }
         if (unsupportedBlockers < MAX_UNSUPPORTED_BLOCKERS) {
           const method = `unrecognized:${createHash("sha256").update(message.method).digest("hex").slice(0, 16)}`;
@@ -518,7 +671,8 @@ export async function runAntigravityTurn(cwd, options = {}) {
     persist({ acpProcessPid: client.pid, acpProcessGroup: true, acpProcessExited: false });
     options.signal?.addEventListener("abort", abort, { once: true });
     const initialized = await initialize(client, options.signal);
-    const params = { cwd: executionCwd, mcpServers: parentBridgeServers(cwd, options) };
+    parentBridge = parentBridgeServers(cwd, options);
+    const params = { cwd: executionCwd, mcpServers: parentBridge.servers };
     if (threadId) {
       if (initialized.agentCapabilities?.loadSession !== true) throw new Error("This Antigravity runtime does not support loading sessions; start a new task instead of continuing this one.");
       const version = initialized.agentInfo?.version;

@@ -71,13 +71,23 @@ export const INTENSITIES = Object.freeze({
 });
 
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+export const GEMINI_EFFORTS = Object.freeze(["low", "medium", "high", "xhigh"]);
+const GEMINI_CLAMP = Object.freeze({ max: "xhigh", ultra: "xhigh", minimal: "low", none: "low" });
 export const shiftEffort = (effort, shift) => {
   const index = EFFORTS.indexOf(effort);
   return index < 0 ? effort : EFFORTS[Math.min(EFFORTS.length - 1, Math.max(0, index + shift))];
 };
 
-function validatePersonaModel(id, model) {
-  if (backendForModel(model) === "antigravity") throw new Error(`Roundtable persona ${id} requires a Codex model. Choose a Codex model instead of ${model}.`);
+export function clampGeminiEffort(effort) {
+  const normalized = typeof effort === "string" ? effort.trim().toLowerCase() : null;
+  if (GEMINI_EFFORTS.includes(normalized)) return normalized;
+  return normalized && Object.hasOwn(GEMINI_CLAMP, normalized) ? GEMINI_CLAMP[normalized] : normalized;
+}
+
+function validateGeminiEffort(id, value) {
+  const effort = typeof value === "string" ? value.trim().toLowerCase() : null;
+  if (!GEMINI_EFFORTS.includes(effort)) throw new Error(`Roundtable persona ${id} Gemini effort must be ${GEMINI_EFFORTS.join(", ")}.`);
+  return effort;
 }
 
 // Resolve the seated members. `roles` (explicit persona ids) overrides the
@@ -85,25 +95,40 @@ function validatePersonaModel(id, model) {
 // `overrides` holds this run's per-persona {model, effort}. Explicit values
 // are never shifted by intensity. roleModels maps role ids to their effective
 // Codex models, including the Codex fallback for an Antigravity role.
-export function resolveRoster({ intensity = "standard", roles = null, mapping = {}, overrides = {}, roleModels = {}, highStakes = false } = {}) {
+export function resolveRoster({ intensity = "standard", roles = null, mapping = {}, overrides = {}, roleModels = {}, highStakes = false, geminiAvailable = true } = {}) {
   const preset = INTENSITIES[intensity];
   if (!preset) throw new Error(`Unknown roundtable intensity: ${intensity}. Use ${Object.keys(INTENSITIES).join(", ")}.`);
   const ids = roles ?? preset.roster;
   if (!Array.isArray(ids) || !ids.length) throw new Error("A roundtable needs at least one persona.");
-  for (const [id, explicit] of Object.entries(overrides)) validatePersonaModel(id, explicit?.model);
+  for (const [id, explicit] of Object.entries(overrides)) {
+    if (explicit?.effort !== undefined && backendForModel(explicit.model) === "antigravity") validateGeminiEffort(id, explicit.effort);
+  }
   const seen = new Set();
-  return ids.map(id => {
+  const members = ids.map(id => {
     const persona = PERSONAS[id];
     if (!persona) throw new Error(`Unknown roundtable persona: ${id}. Use ${PERSONA_IDS.join(", ")}.`);
     if (seen.has(id)) throw new Error(`Persona ${id} is seated twice; each persona sits at most once.`);
     seen.add(id);
     const explicit = overrides[id] ?? {}, saved = mapping[id] ?? {};
-    validatePersonaModel(id, saved.model);
-    const model = explicit.model ?? (highStakes ? HIGH_STAKES.model : saved.model ?? roleModels[persona.role] ?? BUILTIN_ROLES[persona.role].model);
-    const effort = explicit.effort ?? saved.effort
-      ?? (preset.maxFor?.includes(id) ? "max" : shiftEffort(persona.effort, preset.effortShift));
-    return { persona: id, name: id, model, effort };
+    const roleModel = roleModels[persona.role];
+    const codexRoleModel = roleModel && backendForModel(roleModel) === "codex"
+      ? roleModel : BUILTIN_ROLES[persona.role].fallback?.model ?? BUILTIN_ROLES[persona.role].model;
+    const model = explicit.model ?? (highStakes ? HIGH_STAKES.model : saved.model ?? codexRoleModel);
+    const backend = backendForModel(model);
+    // Ignore saved effort when the seat switches backend (codex <-> antigravity).
+    const savedEffort = backend === backendForModel(saved.model) ? saved.effort : undefined;
+    const inherited = preset.maxFor?.includes(id) ? "max" : shiftEffort(persona.effort, preset.effortShift);
+    const effort = backend === "antigravity"
+      ? (explicit.effort !== undefined ? validateGeminiEffort(id, explicit.effort)
+        : savedEffort !== undefined ? validateGeminiEffort(id, savedEffort) : clampGeminiEffort(inherited))
+      : (explicit.effort ?? savedEffort ?? inherited);
+    return { persona: id, name: id, model, effort, backend };
   });
+  if (!geminiAvailable) {
+    const geminiSeats = members.filter(member => member.backend === "antigravity").map(member => member.persona);
+    if (geminiSeats.length) throw new Error(`Gemini roundtable seats (${geminiSeats.join(", ")}) require Antigravity (agy) to be installed and available.`);
+  }
+  return members;
 }
 
 // Developer instructions appended for a seated member.

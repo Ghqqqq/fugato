@@ -159,6 +159,10 @@ export function approveDuet(input, env = process.env) {
       if (backendForModel(model) !== backend) return {};
     } catch { return {}; }
   }
+  if (verb === "task" && flags.has("model") && (flags.has("backend") || !threadSelectors.some(key => flags.get(key)))) {
+    const backend = flags.get("backend") ?? "codex";
+    if (backendForModel(normalizeRequestedModel(flags.get("model"))) !== backend) return {};
+  }
   // Fresh tasks take the configured sandbox. Follow-ups can inherit a recorded one.
   if (verb === "task" && flags.get("backend") === "antigravity" && !threadSelectors.some(key => flags.get(key))) {
     try {
@@ -167,7 +171,7 @@ export function approveDuet(input, env = process.env) {
       acpSetting(options.model, "model");
       acpSetting(options.effort, "effort");
       const sandbox = options.sandbox ?? defaultSandboxSetup({ env }).defaultSandbox;
-      validateAntigravityTask({ options, sandbox, permissionPolicy: null, roundtable: options.roundtable,
+      validateAntigravityTask({ options, sandbox, permissionPolicy: null,
         budget: { maxTokens: options["max-tokens"] } });
     } catch { return {}; }
   }

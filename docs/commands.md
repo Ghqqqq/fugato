@@ -245,7 +245,7 @@ outcomes. See [duel](duel.md) for flows, convergence and quota costs.
 
 ### `/fugato:roundtable`
 
-Persistent Codex personas pursue one goal through experiments, implementation
+Persistent Codex or Gemini personas pursue one goal through experiments, implementation
 and a public forum; Claude chairs and accepts the final candidate on evidence.
 The chair recommends intensity and roster for confirmation unless supplied.
 
@@ -259,7 +259,12 @@ Usage: /fugato:roundtable [on [--intensity light|standard|deep|full] [--roles id
 
 Intensities seat 2/3/5/6 members. `--roles` selects a nonempty unique subset of
 `conjecturer,critic,steward,improver,integrator,calibrator`; invalid intensity or
-persona ids fail before dispatch. There is no token cap; members are Codex-only.
+persona ids fail before dispatch. Role-derived seats use Codex; explicit
+`--persona-model id=gemini-*[:effort]` (per room or via setup) selects Gemini
+seats when `agy` is installed (no read-only Gemini seats). `fugato roundtable start --json`
+returns each member's `backend`, `agentType` (`fugato:codex-native` or
+`fugato:gemini-native`) and `header`, and text output shows the agent type per
+member. There is no token cap; Claude subagents cannot take member seats.
 See [Roundtable](roundtable.md) for the research, mapping, forum and chair.
 
 ### Orchestration controls
@@ -288,9 +293,10 @@ suppresses it for all four mode commands. Ultra/pair/duel reminders name their
 effective role settings. Roundtable names its intensity and roster selection
 and points to role-based persona models.
 Controls do not load protocol text into Claude's context. Tasks use the shared
-[protocol](../plugins/codex/prompts/ultra-codex-protocol.md), selecting shared
-sections plus their own mode section. Its body hash is computed at runtime;
-`status --for-command` reports the current version/path, not a saved literal hash.
+[core protocol](../plugins/codex/prompts/protocol/core.md) plus their active
+mode file (`ultra.md`, `pair.md`, `duel.md` or `roundtable.md`). Each file's
+body hash is computed at runtime; `status --for-command` reports both current
+paths and versions, not saved literal hashes.
 See [state and lifecycle](state-and-retention.md#orchestration-mode-state) for
 schema migration, retained caps, resume/compaction and cleanup.
 
@@ -300,7 +306,7 @@ changed deliverable: scope, complete diff, criteria/evidence, rerun checks,
 assumptions and an explicit verdict. Read-only probes use the lighter evidence
 pass, with adversarial confirmation of decision-driving findings and full
 acceptance for consequential/conflicting claims. Details:
-[acceptance](../plugins/codex/prompts/ultra-codex-protocol.md#accepting-a-result-every-worker-report-no-exceptions).
+[acceptance](../plugins/codex/prompts/protocol/core.md#accepting-a-result-every-worker-report-no-exceptions).
 
 CLI mode controls never take task text or start workers:
 
@@ -334,7 +340,9 @@ command, and `activeMode` reports the actual saved mode/options even if it is
 different. See `fugato models` for the effective role table. Roundtable mode
 status also reports standard persona mappings in `personaModels` with
 per-field values and sources.
-`protocolFile` and `protocolVersion` are always present. Ultra keeps
+`protocolFile` and `protocolVersion` (pointing to the requested mode file) plus
+`protocolCoreFile` and `protocolCoreVersion` (pointing to `core.md`) are always
+present. Ultra keeps
 effective `maxWorkers` (null for unlimited) plus `maxWorkersSetting`. A cross-mode
 `on` adds `replacedMode` and `runningJobs`; `off` reports `wasOn` and running jobs.
 An empty Codex job list says nothing about a duel's Claude participant: Claude
@@ -427,8 +435,8 @@ fresh Claude sessions and `/clear` (default `off`); run it separately from other
 setup changes, with `--dry-run` to preview. See
 [default orchestration mode](configuration.md#default-orchestration-mode).
 
-`fugato setup --persona-model id=model[:effort]` saves a persona mapping;
-repeat the flag for different ids, or use `id=default` to remove both fields.
+`fugato setup --persona-model id=model[:effort]` saves a persona mapping (Codex
+or `gemini-*` model); repeat the flag for different ids, or use `id=default` to remove both fields.
 Run it separately from other setup changes; `--dry-run --json` previews without
 writes. Setup JSON includes `personaModels` with effective model/effort values
 and per-field `saved`/`built-in` sources. Model-only changes clear the saved
@@ -442,6 +450,16 @@ The opt-in settings `--permission-mapping claude|off`,
 `--agent-memory on|off` and `--max-concurrent <n|off>` all default to `off`.
 Each supports `--dry-run`; see [configuration](configuration.md#claude-permission-mapping-opt-in)
 for examples, grouping rules, the permission mode table and limits.
+
+Additional setup flags (all accept `--cwd <dir>`, `--json`, and `--dry-run` where
+previewable; see [Configuration](configuration.md) and [Antigravity](antigravity.md)):
+
+- Backend check: `--backend antigravity` checks ACP and cached Gemini login without a model prompt.
+- Legacy roleless model defaults: `--default-model <model|default>`, `--default-effort <effort|default>` (alongside `--ultra-routine-model <model|default>`).
+- Sandbox and instructions: `--default-sandbox read-only|workspace-write|danger-full-access`, `--project-docs claude-md|agents-only`.
+- Tool sync: `--sync-tools`, `--profile chrome|codex-app`, `--replace-cua`, `--cua-template <file>`, `--chatgpt-resources <dir>`.
+- Browser and transport: `--browser-approval never-ask|ask`, `--allow-browser-origin <origin>`, `--revoke-browser-origin <origin>`, `--list-browser-origins`, `--transport http|websocket|status`.
+- Computer Use apps: `--computer-use-approval mirror|ask`, `--allow-computer-app <bundle-id>`, `--revoke-computer-app <bundle-id>`, `--list-computer-apps`.
 For a desktop-managed CLI, setup includes `codex.warning` with code
 `desktop_managed_codex_runtime` and a message, also shown in human next steps.
 The warning can appear while `ready` is true and never changes the selected pin.
@@ -560,12 +578,12 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | `fugato pair [on\|off\|status]` | Pair session controls; one primary Codex thread |
 | `fugato duel [on\|off\|status]` | Duel session controls; `on --rounds <n>` sets 1–3 total rounds |
 | `fugato roundtable [on\|off\|status]` | Roundtable session mode controls; `on --intensity … --roles …` selects defaults |
-| `fugato roundtable start [--intensity …] [--roles id,id] [--persona-model id=model[:effort]]… [--high-stakes] [--run <runId>] [--json]` | Goal on stdin; returns room, member headers and chair card |
+| `fugato roundtable start [--intensity …] [--roles id,id] [--persona-model id=model[:effort]]… [--high-stakes] [--run <runId>] [--json]` | Goal on stdin; returns room, chair card and member entries with `backend`, `agentType` (`fugato:codex-native` or `fugato:gemini-native`), `header` and `workspace` |
 | `fugato roundtable status <roomId> [--json]` / `pause\|resume <roomId>` | Inspect or control the room |
 | `fugato roundtable close <roomId> [--title t] [--label l] [--selects n] [--unreviewed reason]` | Close the room; with a title, `--selects` or a body on stdin, first records the chair's closing decision under the review gate. Closing does not cancel jobs |
 | `fugato forum read <roomId> [--after n] [--thread n] [--limit n] [--json]` | Chair index/thread reads |
 | `fugato forum post <roomId> --kind <kind> [--thread n] [--reply-to n] [--title t] [--label l] [--ref r]… [--mention m]…` | Chair posts, body on stdin; see [forum](roundtable.md#the-forum) |
-| `fugato cleanup --dry-run --json` / `fugato cleanup --json` | Preview/apply retention with read-only inert workspace reporting; text output includes manual removal hints; `--days N` overrides the period |
+| `fugato cleanup --dry-run --json` / `fugato cleanup --json` | Preview/apply retention (jobs, runs, markers, closed roundtable rooms, stale Antigravity admission locks, staged approval artifacts and threads) with read-only inert workspace and retained-room reporting; text output includes manual removal hints; `--days N` overrides the period |
 | `fugato journal <start\|use\|add\|validate\|close\|show\|list>` | Criteria (including `add withdraw`), verdicts and decisions; `start --switch` selects a new run while leaving the old one open; `use <runId>` selects an existing open run for the session |
 
 Without an active run, journal add/close use the sole open run in the current

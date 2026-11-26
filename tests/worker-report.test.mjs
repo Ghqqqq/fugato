@@ -7,7 +7,7 @@ import { buildWorkerReport, classifyWorkerOutcome, classifyBrowserBlocker, parse
 import { makeTempDir, run, initGitRepo, waitForCondition, readyBroker } from "./helpers.mjs";
 import { buildEnv, installFakeCodex, lifecycleHarness } from "./fake-codex-fixture.mjs";
 import { splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
-import { directReport } from "../plugins/codex/scripts/lib/job-runtime.mjs";
+import { directReport, envelopeBytes } from "../plugins/codex/scripts/lib/job-runtime.mjs";
 import { isC2Report } from "../plugins/codex/scripts/lib/report-delivery.mjs";
 import { readJobFile, resolveStateDir, updateJob } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -27,9 +27,9 @@ test("stale browser claims have a distinct blocker with the owning session ID", 
   assert.equal(classifyBrowserBlocker("a tab is already part of another session"), null);
   assert.equal(classifyBrowserBlocker("Tab 123 is already part of browser session malformed"), null);
 });
-function fixture(behavior) {
+function fixture(behavior, options) {
   const dir = makeTempDir();
-  installFakeCodex(dir, behavior);
+  installFakeCodex(dir, behavior, options);
   const repo = path.join(dir, "repo"); fs.mkdirSync(repo); initGitRepo(repo);
   const env = { ...buildEnv(dir), CLAUDE_PLUGIN_DATA: path.join(dir, "data"), CODEX_COMPANION_HOME: path.join(dir, "isolated") };
   const call = (...args) => run(process.execPath, [script, ...args], { cwd: repo, env });
@@ -48,7 +48,7 @@ function storedFixtureJob(f, id, patch = null) {
 }
 
 function switchingFixture(makeFixture = fixture) {
-  const f = makeFixture("review-ok"), binary = path.join(f.dir, "codex");
+  const f = makeFixture("review-ok", { mutable: true }), binary = path.join(f.dir, "codex");
   const source = fs.readFileSync(binary, "utf8");
   const declaration = 'const BEHAVIOR = "review-ok";';
   const request = 'const message = JSON.parse(line);';
@@ -203,7 +203,7 @@ test("writer-locked follow-ups wait for the busy broker, bound the wait and pres
   const json = (result, status = 0) => { assert.equal(result.status, status, result.stderr + result.stdout); return JSON.parse(result.stdout); };
   const { CodexAppServerClient } = await import("../plugins/codex/scripts/lib/app-server.mjs");
   const { unresolvedTask } = await import("../plugins/codex/scripts/lib/state.mjs");
-  const f = fixture("writer-lock");
+  const f = fixture("writer-lock", { mutable: true });
   f.env.CODEX_COMPANION_BROKER_WAIT_MS = "30000";
   // Inject the later busy rejection deterministically, after thread/resume
   // succeeds. A gate avoids racing a competing peer between individual RPCs.
@@ -355,7 +355,7 @@ test("thread acceptance times out while a held turn acceptance keeps follow-ups 
     return saved;
   };
 
-  const turn = fixture("review-ok");
+  const turn = fixture("review-ok", { mutable: true });
   turn.env.CODEX_COMPANION_ACCEPTANCE_TIMEOUT_MS = "100";
   const gate = path.join(turn.dir, "release-acceptance"), waiting = path.join(turn.dir, "waiting-acceptance");
   patchRuntime(turn, "const state = loadState();\n\n  try {", "let state = loadState();\n\n  try {");
@@ -374,7 +374,7 @@ test("thread acceptance times out while a held turn acceptance keeps follow-ups 
 
   // This independent timeout crosses the same acceptance deadline while the
   // broker still holds turn/start. No sleep or elapsed-time assertion is needed.
-  const start = fixture("review-ok");
+  const start = fixture("review-ok", { mutable: true });
   configure(start);
   patchRuntime(start, 'case "thread/start": {', 'case "thread/start": { return;');
   const startupFailure = await failTask(start, "--fresh");
@@ -394,7 +394,7 @@ test("thread acceptance times out while a held turn acceptance keeps follow-ups 
   const requests = fs.readFileSync(path.join(turn.dir, "fake-codex-state.json.requests.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(requests.filter(request => request.method === "turn/start").length, 1);
 
-  const resume = fixture("review-ok");
+  const resume = fixture("review-ok", { mutable: true });
   configure(resume);
   const seed = resume.call("task", "--report", "--json", "fixture");
   assert.equal(seed.status, 0, seed.stderr);
@@ -733,7 +733,7 @@ test("a --report worker runs with the worker-report schema and the parent reads 
 
 test("declared blockers override completed while failures and essential questions retain their outcomes", () => {
   for (const declaredStatus of ["blocked", "completed"]) {
-    const f = fixture("structured-blocked");
+    const f = fixture("structured-blocked", declaredStatus === "completed" ? { mutable: true } : undefined);
     if (declaredStatus === "completed") {
       const binary = path.join(f.dir, "codex");
       fs.writeFileSync(binary, fs.readFileSync(binary, "utf8").replace('status: "blocked", summary:', 'status: "completed", summary:'));
@@ -790,7 +790,7 @@ test("parseStructuredReport accepts the schema object or a trailing json block a
     ["Blocked unauthorized requests and verified the regression tests passed.", "blocked"],
     ["Fixed the Debugger unattached warning; work remains in an unrelated backlog.", "blocked"]
   ]) {
-    const f = fixture("review-ok"), binary = path.join(f.dir, "codex");
+    const f = fixture("review-ok", { mutable: true }), binary = path.join(f.dir, "codex");
     fs.writeFileSync(binary, fs.readFileSync(binary, "utf8").replace("summary: text,", `summary: ${JSON.stringify(summary)},`));
     const response = f.call("task", "--direct", "--quiet", "fixture");
     assert.equal(response.status, 0, response.stderr || response.stdout);
@@ -1240,7 +1240,7 @@ test("report v2 is decision-first and bounded; result and wait details retain th
   // Lose turn/start's reply, both with and without an actually started turn.
   // Admission attributes visible turns; an invisible submission stays unresolved.
   for (const active of [true, false]) {
-    const lost = fixture("lost-turn:inProgress");
+    const lost = fixture("lost-turn:inProgress", { mutable: true });
     const marker = "const turnId = nextTurnId(state);\n        thread.updatedAt = now();";
     patchRuntime(lost, marker, `${marker}
       if (turnId === "turn_1") {
@@ -1277,7 +1277,7 @@ test("report v2 is decision-first and bounded; result and wait details retain th
   }
 
   // A private retry starts a fresh approval lifetime after a busy shared broker.
-  const retry = fixture("computer-use-requests");
+  const retry = fixture("computer-use-requests", { mutable: true });
   patchRuntime(retry, 'case "turn/start": {', `case "turn/start": {
     if (!state.busyRejected) {
       state.busyRejected = true; saveState(state);
@@ -1950,3 +1950,35 @@ test("direct tasks preserve lease precedence, input forms, run settings and cont
   checkFollow();
 });
 }
+
+test("directReport keeps next for 3.4 KiB action-approval questions while enforcing the 2000-byte envelope elsewhere", () => {
+  const approvalText = "Antigravity requests permission.\n" + "a".repeat(3500) + "\nAllow this operation once?";
+  for (const backend of ["antigravity", "codex"]) {
+    const job = { id: `task-${backend}-3k`, workspaceRoot: process.cwd(),
+      request: { cwd: process.cwd(), ...(backend === "antigravity" ? { backend } : {}) } };
+    const payload = { status: "needs_answer", jobId: job.id,
+      question: { id: "action-approval-1", kind: "action-approval", text: approvalText, options: ["Allow once", "Deny"], expiresAt: Date.now() + 60000 } };
+    const report = directReport(payload, job);
+    assert.equal(report.next, `fugato answer ${job.id} --question 'action-approval-1'`);
+    assert.equal(report.question.text, approvalText);
+    assert.equal(isC2Report(report), true);
+    assert.ok(envelopeBytes(report) <= 2000);
+
+    // Extra envelope fields are still fitted into the 2000-byte budget.
+    const crowded = directReport({ ...payload, blockers: [{ code: "notice", message: "m".repeat(1500) }],
+      keyFindings: Array(10).fill("k".repeat(200)) }, job);
+    assert.equal(crowded.next, `fugato answer ${job.id} --question 'action-approval-1'`);
+    assert.equal(crowded.question.text, approvalText);
+    assert.ok(envelopeBytes(crowded) <= 2000);
+    assert.equal(isC2Report(crowded), true);
+  }
+
+  // Ordinary questions remain strictly inside the 2000-byte envelope.
+  const regular = directReport({ status: "needs_answer", jobId: "task-regular-3k",
+    question: { id: "question-1", kind: "question", text: "q".repeat(3500), options: ["A", "B"], expiresAt: Date.now() + 60000 } },
+  { id: "task-regular-3k", workspaceRoot: process.cwd(), request: { cwd: process.cwd(), backend: "antigravity" } });
+  const { summary, ...envelope } = regular;
+  assert.ok(Buffer.byteLength(JSON.stringify(envelope)) <= 2000);
+  assert.ok(regular.question.text.length < 2000);
+  assert.equal(isC2Report(regular), true);
+});

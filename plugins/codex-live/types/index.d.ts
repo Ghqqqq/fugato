@@ -18,13 +18,15 @@ export type CodexNativeActivity = {
   models?: Record<string, string>;
 };
 
+export type CodexLiveBackend = 'codex' | 'antigravity';
+
 export type CodexLiveUsage = {
-  inputTokens: number;
-  cachedInputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
 };
-export type CodexLiveUsageEntry = { model: string; usage: CodexLiveUsage; sessionId?: string };
+export type CodexLiveUsageEntry = { model: string; usage: CodexLiveUsage; sessionId?: string; backend?: CodexLiveBackend };
 
 export type CodexLiveEvent = {
   seq: number;
@@ -51,6 +53,7 @@ export type CodexLiveEvent = {
 
 export type CodexLiveJob = {
   id: string;
+  backend?: CodexLiveBackend;
   threadId?: string;
   label: string;
   agentName?: string;

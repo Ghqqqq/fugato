@@ -150,6 +150,39 @@ belongs to that session, no live writer holds a claim and the folder is past the
 cutoff. Stale claim temporaries from dead processes are also removed. Partial,
 locked or unreadable job inventories retain every reservation.
 
+Closed roundtable rooms under `duet/roundtables/<roomId>/` whose `room.json`
+records `status: "closed"` and `closedAt` older than the retention cutoff are
+planned for removal. Open or paused rooms, closed rooms newer than the cutoff,
+unparsable/invalid room records and symlinked room directories are never
+removed; unsafe rooms are reported in `roomsRetained` and `errors`. Before
+removing a room, retention checks every member worktree with
+`memberWorkspaceStatus`. Any non-shared member worktree with commits beyond its
+base, dirty/untracked/ignored files or an unknown status retains the entire
+room with a reason naming the member and worktree path; shared workspaces are
+never touched. Clean leftover worktrees are removed with `git worktree remove`
+(without `--force`) from `room.workspaceRoot` before deleting the room
+directory, rechecking under the room lock during apply so rooms reopened or
+modified after planning are kept.
+
+Stale Antigravity session admission locks under
+`duet/antigravity-session-admission/` (`*.lock` directories whose every owner
+marker names a dead PID (`ESRCH`) and is older than the 60-second grace, plus
+dead-PID `*.lock.owner-<pid>-<uuid>` candidate directories past the grace) are
+removed non-recursively after revalidation. Locks with a live owner,
+unrecognized entry or symlink are kept.
+
+Staged approval artifacts under `<stateDir>/approvals/<jobId>/` are removed
+when `<jobId>` is deleted in the same retention pass, or when no job record for
+`<jobId>` exists in that state directory and the directory's newest file mtime
+is older than the cutoff. Directories for existing (active or retained) jobs
+are kept. Only regular `<64 hex>.txt` files and empty directories are removed;
+symlinks or unexpected entries retain the directory and report an error.
+Preview (`fugato cleanup --dry-run` / `--dry-run --json`) lists planned rooms,
+admission locks and approval directories with byte counts plus retained rooms
+and deletes nothing; apply reports `roomsDeleted`, `admissionLocksDeleted` and
+`approvalDirsDeleted` and adds their bytes to `bytesFreed`. Automatic retention
+applies the same plan with no extra throttle.
+
 Every detached session-start prewarm also runs stale-job maintenance, independently
 of the 12-hour age-cleanup interval, under the same retention lock. A pass has a
 five-second budget and at most five exact-turn recovery attempts. Candidates must

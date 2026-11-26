@@ -332,33 +332,89 @@ function listAt(stateDir, env) {
   }).sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.runId.localeCompare(a.runId));
 }
 export function listRuns(cwd, env = process.env) { return listAt(resolveStateDir(cwd, env), env); }
-export function summarizeUsage(jobs) {
-  const keys = ["inputTokens", "cachedInputTokens", "outputTokens", "totalTokens"];
-  const totals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, jobsWithUsage: 0, jobsWithoutUsage: 0 };
-  for (const job of jobs) {
-    const usage = job?.usage ?? job?.report?.usage ?? job?.result?.usage;
-    if (!usage || !keys.every(key => Number.isSafeInteger(usage[key]) && usage[key] >= 0)) { totals.jobsWithoutUsage++; continue; }
-    for (const key of keys) totals[key] += usage[key];
-    totals.jobsWithUsage++;
+const USAGE_KEYS = ["inputTokens", "cachedInputTokens", "outputTokens", "totalTokens"];
+const USAGE_LABELS = ["input", "cached", "output", "total"];
+const isUsageCount = value => Number.isSafeInteger(value) && value >= 0;
+const firstModelText = (...values) => values.find(value => typeof value === "string" && value.trim())?.trim() ?? null;
+function parseUsage(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.reasoningOutputTokens !== undefined && !isUsageCount(value.reasoningOutputTokens)) return null;
+  const parsed = {};
+  let present = 0;
+  for (const key of USAGE_KEYS) {
+    if (value[key] === undefined) continue;
+    if (!isUsageCount(value[key])) return null;
+    parsed[key] = value[key];
+    present++;
   }
-  return totals;
+  return present ? parsed : null;
+}
+export function summarizeUsage(jobs) {
+  const totals = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0, jobsWithUsage: 0, jobsWithoutUsage: 0 };
+  const jobsByKey = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  const groups = new Map();
+  for (const job of jobs) {
+    const usage = parseUsage(job?.usage ?? job?.report?.usage ?? job?.result?.usage);
+    if (!usage) { totals.jobsWithoutUsage++; continue; }
+    totals.jobsWithUsage++;
+    const backend = (job?.request?.backend ?? job?.backend ?? job?.result?.backend ?? job?.report?.backend) === "antigravity" ? "antigravity" : "codex";
+    const model = (backend === "antigravity"
+      ? firstModelText(job?.result?.model, job?.report?.model, job?.selectedModel, job?.model, job?.request?.model)
+      : firstModelText(job?.result?.model, job?.report?.model, job?.model, job?.request?.model)) ?? "unknown";
+    const key = `${backend}\0${model}`;
+    const group = groups.get(key) ?? { backend, model, sums: {}, counts: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 }, jobs: 0 };
+    group.jobs++;
+    for (const field of USAGE_KEYS) {
+      if (usage[field] === undefined) continue;
+      totals[field] += usage[field];
+      jobsByKey[field]++;
+      group.sums[field] = (group.sums[field] ?? 0) + usage[field];
+      group.counts[field]++;
+    }
+    groups.set(key, group);
+  }
+  const partialKeys = totals.jobsWithUsage ? USAGE_KEYS.filter(key => jobsByKey[key] < totals.jobsWithUsage) : [];
+  const byBackendModel = [...groups.values()]
+    .sort((a, b) => a.backend.localeCompare(b.backend) || a.model.localeCompare(b.model))
+    .map(({ backend, model, sums, counts, jobs }) => {
+      const partial = USAGE_KEYS.filter(key => counts[key] > 0 && counts[key] < jobs);
+      return { backend, model, ...sums, jobs, ...(partial.length ? { jobsByKey: counts, partialKeys: partial } : {}) };
+    });
+  return { ...totals, jobsByKey, partialKeys, byBackendModel };
+}
+function formatUsageFields(totals, jobs, counts, omitMissing = false) {
+  return USAGE_KEYS.flatMap((key, i) => {
+    const count = counts ? (counts[key] ?? 0) : (totals[key] === undefined ? 0 : jobs);
+    if (count === 0) return omitMissing ? [] : [`${USAGE_LABELS[i]} unknown`];
+    return [`${USAGE_LABELS[i]} ${totals[key]}${count < jobs ? ` (partial: ${count}/${jobs})` : ""}`];
+  }).join(", ");
 }
 export function renderUsageTotals(totals) {
-  const tokens = totals.jobsWithUsage ? `input ${totals.inputTokens}, cached ${totals.cachedInputTokens}, output ${totals.outputTokens}, total ${totals.totalTokens}` : "unknown";
-  return `Usage totals: ${tokens} (${totals.jobsWithUsage} job(s) with usage; ${totals.jobsWithoutUsage} job(s) without usage).`;
+  const tokens = totals.jobsWithUsage ? formatUsageFields(totals, totals.jobsWithUsage, totals.jobsByKey) : "unknown";
+  const lines = [`Usage totals: ${tokens} (${totals.jobsWithUsage} job(s) with usage; ${totals.jobsWithoutUsage} job(s) without usage).`];
+  for (const group of totals.byBackendModel ?? []) {
+    const model = String(group.model ?? "unknown").replace(/[\p{Cc}\p{Cf}\s]+/gu, " ").trim().slice(0, 120) || "unknown";
+    lines.push(`  ${group.backend} / ${model}: ${formatUsageFields(group, group.jobs, group.jobsByKey, true)} (${group.jobs} job(s))`);
+  }
+  return lines.join("\n");
 }
 export function showRun(cwd, sessionId, runId, env = process.env) {
   const selected = target(resolveStateDir(cwd, env), sessionId, runId, env, true), stateDir = selected.stateDir;
   runId = selected.runId;
-  const reports = new Map();
-  const view = viewAt(stateDir, runId, entries(stateDir, runId, env), env, reports);
+  const reports = new Map(), rows = entries(stateDir, runId, env);
+  const startedModels = new Map(rows.filter(row => row.type === "job_started" && typeof row.model === "string" && row.model.trim()).map(row => [row.jobId, row.model.trim()]));
+  const view = viewAt(stateDir, runId, rows, env, reports);
   const usage = view.jobs.map(job => {
+    const fallbackModel = startedModels.get(job.jobId);
+    const withModel = record => record && typeof record === "object" && !Array.isArray(record) && fallbackModel
+      && !firstModelText(record.result?.model, record.report?.model, record.selectedModel, record.model, record.request?.model)
+      ? { ...record, model: fallbackModel } : record;
     try {
-      if (reports.has(job.report)) return JSON.parse(reports.get(job.report));
+      if (reports.has(job.report)) return withModel(JSON.parse(reports.get(job.report)));
       const jobStateDir = job.workspaceRoot ? resolveStateDirForRoot(job.workspaceRoot, env) : stateDir;
       directory(path.join(jobStateDir, "jobs"), env);
       const live = JSON.parse(read(path.join(jobStateDir, "jobs", `${id(job.jobId, "jobId")}.json`)));
-      if (live.runId === runId && (live.runStateDir ?? jobStateDir) === stateDir) return live;
+      if (live.runId === runId && (live.runStateDir ?? jobStateDir) === stateDir) return withModel(live);
     } catch { /* usage is unknown when the record or saved report is unavailable */ }
     return {};
   });
@@ -520,7 +576,7 @@ export function renderRun(view) {
 }
 export function activeRunContext(cwd, sessionId, env = process.env) {
   const run = readActiveRun(cwd, sessionId, env);
-  return run ? `Active Fugato run ${run.runId}: ${short(run.goal, 80)}. Run node "$CODEX_COMPANION" journal show to recover criteria, verdicts and open work.` : null;
+  return run ? `Active Fugato run ${run.runId}: ${short(run.goal, 80)}. Run fugato journal show to recover criteria, verdicts and open work.` : null;
 }
 
 // Automatic linkage is best effort (storage failures and an ambiguous choice

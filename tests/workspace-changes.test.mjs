@@ -156,7 +156,7 @@ test("task reports warn about overlapping writable workers without attributing t
     assert.deepEqual(shared.changedFilesSharedWith, [{ worker: peer.agentName, jobId: peer.id }]);
   }
 
-  const bin = makeTempDir(); installFakeCodex(bin, "dirty-workspace-task");
+  const bin = makeTempDir(); installFakeCodex(bin, "dirty-workspace-task", { mutable: true });
   const binary = path.join(bin, "codex");
   fs.writeFileSync(binary, fs.readFileSync(binary, "utf8").replace('if (BEHAVIOR === "dirty-workspace-task") {',
     'if (BEHAVIOR === "dirty-workspace-task" && prompt.startsWith("Shared:")) {'));

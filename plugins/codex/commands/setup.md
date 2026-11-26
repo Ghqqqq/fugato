@@ -1,6 +1,6 @@
 ---
 description: Check Codex readiness and explicitly configure isolated tools, sandbox and browser access
-argument-hint: '[--sync-tools [--profile chrome|codex-app] [--replace-cua] [--cua-template <file>] [--dry-run]] [--enable-review-gate|--disable-review-gate] [--default-sandbox read-only|workspace-write|danger-full-access] [--default-mode off|ultra|pair|duel] [--default-model <model|default>] [--default-effort <effort|default>] [--ultra-routine-model <model|default>] [--role-model <id>=<model>[:<effort>]|<id>=default]… [--browser-approval never-ask|ask] [--transport http|websocket|status] [--allow-browser-origin <origin>|--revoke-browser-origin <origin>|--list-browser-origins] [--computer-use-approval mirror|ask] [--allow-computer-app <bundle-id>|--revoke-computer-app <bundle-id>|--list-computer-apps] [--project-docs claude-md|agents-only] [--permission-mapping claude|off] [--default-max-minutes <n|off>] [--default-max-tokens <n|off>] [--agent-memory on|off] [--max-concurrent <n|off>]'
+argument-hint: '[--backend antigravity] [--sync-tools [--profile chrome|codex-app] [--replace-cua] [--cua-template <file>] [--chatgpt-resources <dir>] [--dry-run]] [--enable-review-gate|--disable-review-gate] [--default-sandbox read-only|workspace-write|danger-full-access] [--default-mode off|ultra|pair|duel|roundtable] [--dispatch auto|native|bash|default] [--default-model <model|default>] [--default-effort <effort|default>] [--ultra-routine-model <model|default>] [--role-model <id>=<model>[:<effort>]|<id>=default]… [--persona-model <id>=<model>[:<effort>]|<id>=default]… [--browser-approval never-ask|ask] [--transport http|websocket|status] [--allow-browser-origin <origin>|--revoke-browser-origin <origin>|--list-browser-origins] [--computer-use-approval mirror|ask] [--allow-computer-app <bundle-id>|--revoke-computer-app <bundle-id>|--list-computer-apps] [--project-docs claude-md|agents-only] [--permission-mapping claude|off] [--default-max-minutes <n|off>] [--default-max-tokens <n|off>] [--agent-memory on|off] [--max-concurrent <n|off>] [--cwd <dir>] [--json]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
@@ -13,6 +13,14 @@ The legacy `--ultra-routine-model` shortcut supplies a saved Codex model for
 `scan`, `implement`, `investigate` and `review`. A role-specific model takes
 precedence. These roles inherit only the model from the shortcut. Clear it
 with `--ultra-routine-model default`.
+
+Use `--backend antigravity` (optionally with `--cwd` and `--json`) to check
+Antigravity ACP and cached Gemini login without submitting a model prompt. Use
+repeatable `--persona-model id=model[:effort]` (or `id=default`) to save
+roundtable persona overrides, `--default-mode off|ultra|pair|duel|roundtable`
+for fresh-session orchestration mode, and `--dispatch auto|native|bash|default`
+for worker dispatch guidance. Run each of these separately from other setup
+changes; `--dry-run` previews without writing.
 
 Run:
 

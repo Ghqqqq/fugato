@@ -10,11 +10,14 @@ import { randomUUID } from "node:crypto";
 import { createJsonLineReader } from "./lib/app-server.mjs";
 import { jobBackend } from "./lib/backends.mjs";
 import { ACTIVE, ASK_PARENT, PARENT_BRIDGE_ENV, recordedThreadJobs, askParentQuestion } from "./lib/job-runtime.mjs";
-import { readRoom, assertChair, readIndex, readThread, readResource, postEvent, renderForum, EVENT_KINDS } from "./lib/forum.mjs";
+import { readRoom, assertChair, readIndex, readThread, readResource, postEvent, renderForum, unreadFooter, EVENT_KINDS } from "./lib/forum.mjs";
 import { readJobFile, resolveJobFile } from "./lib/state.mjs";
+import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, resolveWorkspaceExecRoot, callWorkspaceReadTool } from "./lib/workspace-read-tools.mjs";
 
 const cwd = process.env[PARENT_BRIDGE_ENV.cwd], envThread = process.env[PARENT_BRIDGE_ENV.threadId], envJob = process.env[PARENT_BRIDGE_ENV.jobId];
 const backend = process.env.CODEX_COMPANION_BRIDGE_BACKEND ?? "codex";
+const workspaceRoot = backend === "antigravity" ? resolveWorkspaceExecRoot(process.env[WORKSPACE_EXEC_CWD_ENV]) : null;
+const workspaceTools = workspaceRoot ? WORKSPACE_READ_TOOLS : [];
 const caller = { pid: process.pid, nonce: randomUUID() };
 const validThread = id => typeof id === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(id);
 // Match the job filename alphabet used by retention, with a bounded length.
@@ -114,6 +117,24 @@ const valid = args => args && typeof args === "object" && typeof args.question =
   Object.keys(args).every(k => ["question", "options"].includes(k)) &&
   (args.options === undefined || (Array.isArray(args.options) && args.options.length <= 6 && args.options.every(o => typeof o === "string" && o.length <= 160)));
 
+function footerJobForError() {
+  try {
+    const candidate = listingJob();
+    return candidate && ACTIVE.has(candidate.status) ? candidate : null;
+  } catch { return null; }
+}
+function withUnreadFooter(payload, toolName, job) {
+  if (!payload || !Array.isArray(payload.content) || toolName === "forum_read" || backend !== "antigravity" || !job?.request?.roundtable) return payload;
+  try {
+    if (jobBackend(job) !== "antigravity") return payload;
+    const { roomId, persona } = job.request.roundtable;
+    const footer = unreadFooter(roomId, persona, process.env, { sessionId: job.sessionId });
+    return footer ? { ...payload, content: [...payload.content, { type: "text", text: footer }] } : payload;
+  } catch {
+    return payload;
+  }
+}
+
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", createJsonLineReader(async line => {
   if (!line.trim()) return;
@@ -122,6 +143,7 @@ process.stdin.on("data", createJsonLineReader(async line => {
   if (!message || typeof message !== "object" || Array.isArray(message)) return;
   boundThread();
   if (message.id === undefined) return; // notifications need no reply
+  let activeJob = null;
   try {
     switch (message.method) {
       case "initialize":
@@ -131,18 +153,27 @@ process.stdin.on("data", createJsonLineReader(async line => {
         send({ id: message.id, result: {} });
         break;
       case "tools/list":
-        send({ id: message.id, result: { tools: [TOOL, ...(listingJob()?.request?.roundtable ? FORUM_TOOLS : [])] } });
+        send({ id: message.id, result: { tools: [TOOL, ...(listingJob()?.request?.roundtable ? FORUM_TOOLS : []), ...workspaceTools] } });
         break;
       case "tools/call": {
         const { name, arguments: args, _meta } = message.params ?? {};
         const forumTool = FORUM_TOOLS.some(tool => tool.name === name);
-        if (name !== TOOL.name && !forumTool) { send({ id: message.id, error: { code: -32602, message: "Unknown tool" } }); break; }
-        if (!forumTool && !valid(args)) { send({ id: message.id, result: { ...result("Invalid ask_parent arguments: question (<=1000 chars) and up to 6 options (<=160 chars) are accepted."), isError: true } }); break; }
+        const workspaceTool = workspaceTools.some(tool => tool.name === name);
+        if (name !== TOOL.name && !forumTool && !workspaceTool) { send({ id: message.id, error: { code: -32602, message: "Unknown tool" } }); break; }
+        if (!forumTool && !workspaceTool && !valid(args)) {
+          send({ id: message.id, result: withUnreadFooter({ ...result("Invalid ask_parent arguments: question (<=1000 chars) and up to 6 options (<=160 chars) are accepted."), isError: true }, name, footerJobForError()) });
+          break;
+        }
         const threadId = boundThread();
         const turnId = _meta?.["x-codex-turn-metadata"]?.turn_id;
         const job = threadId && !(typeof _meta?.threadId === "string" && _meta.threadId !== threadId)
           ? await jobForTurn(threadId, validTurn(turnId) ? turnId : null) : null;
         if (!job) { send({ id: message.id, result: { ...result("No Fugato task is listening on this thread right now. Proceed on a conservative assumption within the authorized scope and report it."), isError: true } }); break; }
+        activeJob = job;
+        if (workspaceTool) {
+          send({ id: message.id, result: withUnreadFooter(await callWorkspaceReadTool(name, args === undefined ? {} : args, workspaceRoot), name, job) });
+          break;
+        }
         if (forumTool) {
           if (!job.request?.roundtable) throw new Error("Forum tools are available only to roundtable jobs.");
           forumArgs(name, args ?? {});
@@ -155,20 +186,23 @@ process.stdin.on("data", createJsonLineReader(async line => {
             send({ id: message.id, result: result(renderForum(view)) });
           } else {
             const event = postEvent(roomId, author, args);
-            send({ id: message.id, result: result(`Posted #${event.seq} ${event.kind} as ${event.author.name} in thread #${event.thread}${event.initial ? "; your first round is now unsealed" : ""}.`) });
+            send({ id: message.id, result: withUnreadFooter(result(`Posted #${event.seq} ${event.kind} as ${event.author.name} in thread #${event.thread}${event.initial ? "; your first round is now unsealed" : ""}.`), name, job) });
           }
           break;
         }
         const callId = typeof _meta?.callId === "string" && /^[A-Za-z0-9_-]{1,120}$/.test(_meta.callId) ? _meta.callId : null;
         const { text } = await askParentQuestion(job.workspaceRoot, job.id, { question: args.question, options: args.options ?? [], callId }, { caller, turnId: job.turnId });
-        send({ id: message.id, result: result(text) });
+        send({ id: message.id, result: withUnreadFooter(result(text), name, job) });
         break;
       }
       default:
         send({ id: message.id, error: { code: -32601, message: "Method not found" } });
     }
   } catch (error) {
-    send({ id: message.id, result: { ...result(`${message.params?.name?.startsWith("forum_") ? "Roundtable forum" : "Parent question"} unavailable (${error instanceof Error ? error.message : String(error)}). Proceed conservatively and report missing essential input.`), isError: true } });
+    const label = message.params?.name?.startsWith("forum_") ? "Roundtable forum"
+      : message.params?.name?.startsWith("workspace_") ? "Workspace read tool" : "Parent question";
+    const payload = { ...result(`${label} unavailable (${error instanceof Error ? error.message : String(error)}). Proceed conservatively and report missing essential input.`), isError: true };
+    send({ id: message.id, result: message.method === "tools/call" ? withUnreadFooter(payload, message.params?.name, activeJob) : payload });
   }
 }));
 process.stdin.on("end", () => process.exit(0));

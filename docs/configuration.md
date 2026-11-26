@@ -125,8 +125,15 @@ Claude mode cannot be applied to a live turn: it is stopped before continuing.
 Supported Codex command/file approval requests become parent questions with
 `question.kind: "action-approval"` and choices `Allow once` / `Deny`. Only the
 exact answer `Allow once` approves that action; numbers, prose, timeout and stale
-answers deny it. Requests whose operation cannot be displayed exactly within
-the size limit, malformed requests and persistent root grants are refused.
+answers deny it. Operations up to 16 KiB raw UTF-8 bytes are shown inline
+(exempt from the 2000-byte report envelope); file-change items are retained up
+to 1 MiB. Larger operations are staged verbatim as `0600` files under
+`<stateDir>/approvals/<jobId>/<sha256>.txt` and presented as a compact card
+under 2 KiB with their `SHA-256` digest and `Exact operation` path to read in
+full before answering. Pending file-change approvals still cancel if the patch
+changes, and staged approvals verify the artifact hash before accepting.
+Requests that cannot be staged or displayed safely, malformed requests and
+persistent root grants are refused.
 
 This maps sandbox and approval requests only. Claude allow/deny rules, the
 auto-mode classifier and PreToolUse do not apply to Codex actions. With mapping

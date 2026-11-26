@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { cleanDisplayText } from "./display-text.mjs";
+import { approvalArtifactDir, stageApprovalArtifact } from "./approval-artifacts.mjs";
 
 const methods = new Set([
   "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/tool/requestUserInput",
@@ -96,7 +98,78 @@ export const isActionApproval = message => ["item/commandExecution/requestApprov
 const operationText = value => cleanDisplayText(JSON.stringify(value).replace(/[\u007f-\u009f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g,
   char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`));
 
-export function actionApprovalRequest(message, context, policy, item) {
+const MAX_ACTION_APPROVAL_BYTES = 16 * 1024;
+const MAX_STAGED_CARD_BYTES = 2 * 1024;
+const UNSAFE_ARTIFACT_PATH = /[\p{Cf}\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+function compactOperationField(label, value, maxBytes = 256) {
+  const encoded = operationText(value);
+  if (Buffer.byteLength(encoded, "utf8") <= maxBytes) return `${label}: ${encoded}`;
+  const text = String(value);
+  let clipped = text.slice(0, Math.max(1, Math.floor(maxBytes / 2)));
+  if (/[\uD800-\uDBFF]$/.test(clipped)) clipped = clipped.slice(0, -1);
+  while (clipped.length > 1 && Buffer.byteLength(operationText(`${clipped}…`), "utf8") > maxBytes) {
+    clipped = clipped.slice(0, Math.floor(clipped.length / 2));
+    if (/[\uD800-\uDBFF]$/.test(clipped)) clipped = clipped.slice(0, -1);
+  }
+  return `${label}: ${operationText(`${clipped}…`)}`;
+}
+
+function compactOperationLocations(paths, maxBytes = 512) {
+  if (!paths.length) return null;
+  const full = operationText(paths);
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return `Locations: ${full}`;
+  const kept = [];
+  for (const entry of paths) {
+    const remaining = paths.length - kept.length - 1;
+    const candidate = operationText([...kept, entry]) + (remaining > 0 ? ` (+${remaining} more)` : "");
+    if (Buffer.byteLength(candidate, "utf8") > maxBytes) break;
+    kept.push(entry);
+  }
+  if (!kept.length) return `Locations: (${paths.length} path${paths.length === 1 ? "" : "s"}; see exact operation file)`;
+  const omitted = paths.length - kept.length;
+  return `Locations: ${operationText(kept)}${omitted > 0 ? ` (+${omitted} more)` : ""}`;
+}
+
+function stagedActionApproval(message, policy, item, exactQuestion, staging = {}) {
+  const workspaceRoot = staging.workspaceRoot ?? policy.workspaceRoot ?? policy.cwd;
+  const jobId = staging.jobId ?? policy.jobId;
+  if (!workspaceRoot || !jobId) return null;
+  const env = staging.env ?? process.env;
+  let artifact;
+  try {
+    const dir = approvalArtifactDir(workspaceRoot, jobId, env);
+    if (UNSAFE_ARTIFACT_PATH.test(dir)) return null;
+    if (staging.stage === false) {
+      const buffer = Buffer.from(exactQuestion, "utf8");
+      const sha256 = createHash("sha256").update(buffer).digest("hex");
+      artifact = { path: path.join(dir, `${sha256}.txt`), sha256, bytes: buffer.length };
+    } else {
+      artifact = stageApprovalArtifact(workspaceRoot, jobId, exactQuestion, env);
+    }
+  } catch { return null; }
+  if (UNSAFE_ARTIFACT_PATH.test(artifact.path)) return null;
+  const isCommand = message.method === "item/commandExecution/requestApproval";
+  const cwd = isCommand ? message.params.cwd : policy.cwd;
+  const paths = isCommand ? [] : [...new Set((item?.changes ?? []).map(change => change.path).filter(Boolean))];
+  const lines = [
+    `Codex ${isCommand ? "command" : "file-change"} approval (staged; exceeds 16 KiB inline limit).`,
+    compactOperationField("Item ID", message.params.itemId, 160),
+    `Method: ${operationText(message.method)}`,
+    compactOperationField("Cwd", cwd, 256),
+    ...(paths.length ? [compactOperationLocations(paths, 512)] : []),
+    `Size: ${artifact.bytes} bytes`,
+    `SHA-256: ${artifact.sha256}`,
+    `Exact operation: ${artifact.path}`,
+    "Read the exact operation file in full before answering.",
+    "Allow this operation once?"
+  ];
+  const card = lines.join("\n");
+  if (Buffer.byteLength(card, "utf8") >= MAX_STAGED_CARD_BYTES) return null;
+  return { question: card, artifact };
+}
+
+export function actionApprovalRequest(message, context, policy, item, staging = {}) {
   if (!policy || !isActionApproval(message)) return null;
   const p = message.params;
   const summary = { method: message.method, requestId: Number.isSafeInteger(message.id) ? message.id : `sha256:${hash(message.id)}`,
@@ -131,9 +204,14 @@ export function actionApprovalRequest(message, context, policy, item) {
   if (p.availableDecisions != null && (!Array.isArray(p.availableDecisions) || !p.availableDecisions.includes("accept"))) {
     summary.reason = "accept-unavailable"; return denied;
   }
-  if (Buffer.byteLength(JSON.stringify(question)) > 800) { summary.reason = "operation-too-large-to-display-exactly"; return denied; }
+  let staged = null;
+  if (Buffer.byteLength(question, "utf8") > MAX_ACTION_APPROVAL_BYTES) {
+    staged = stagedActionApproval(message, policy, item, question, staging);
+    if (!staged) { summary.reason = "operation-too-large-to-display-exactly"; return denied; }
+  }
   summary.decision = "pending"; summary.reason = "ask-parent";
-  return { ...denied, request: { kind: "action-approval", question,
+  return { ...denied, request: { kind: "action-approval", question: staged ? staged.question : question,
+    ...(staged ? { artifact: staged.artifact } : {}),
     binding: { threadId: p.threadId, turnId: p.turnId, requestId: message.id, itemId: p.itemId, approvalId: p.approvalId ?? null, method: message.method } } };
 }
 

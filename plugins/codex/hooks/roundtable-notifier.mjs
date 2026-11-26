@@ -130,6 +130,72 @@ async function observed($, lease, action) {
   try { return await action(); }
   finally { await check($, lease); }
 }
+const ROOM_ID = /^rt-[a-z0-9]+-[a-z0-9-]+$/, MAX_ROOM_BYTES = 64 * 1024;
+const isMissing = error => error?.code === 'ENOENT' || /\bENOENT\b|no such file/i.test(error?.message || '');
+async function safeFs($, lease, action) {
+  await check($, lease);
+  try { return { ok: true, value: await action() }; }
+  catch (error) { return { ok: false, error }; }
+  finally { await check($, lease); }
+}
+async function roundtablesDir($, lease) {
+  const override = await safeFs($, lease, () => $.env.get('CODEX_COMPANION_HOME'));
+  const homeEnv = override.ok && override.value ? null : await safeFs($, lease, () => $.env.get('HOME'));
+  const profileEnv = (override.ok && override.value) || (homeEnv?.ok && homeEnv.value)
+    ? null : await safeFs($, lease, () => $.env.get('USERPROFILE'));
+  const base = (override.ok && override.value) || (homeEnv?.ok && homeEnv.value) || (profileEnv?.ok && profileEnv.value) || null;
+  if (!base) return null;
+  let home = `${base.replace(/[\\/]+$/, '')}${override.ok && override.value ? '' : '/.claude/codex-isolated'}`;
+  const exists = await safeFs($, lease, () => $.fs.exists(home));
+  if (exists.ok && exists.value) {
+    const stat = await safeFs($, lease, () => $.fs.stat(home, { resolve: true }));
+    if (stat.ok && stat.value?.realPath) home = stat.value.realPath.replace(/[\\/]+$/, '');
+  }
+  return `${home}/duet/roundtables`;
+}
+async function hasTimerWork($, context, loop, lease) {
+  const dir = await roundtablesDir($, lease);
+  if (!dir) return true;
+  const present = await safeFs($, lease, () => $.fs.exists(dir));
+  if (!present.ok) return true;
+  if (!present.value) return false;
+  const listed = await safeFs($, lease, () => $.fs.list(dir));
+  if (!listed.ok) return !isMissing(listed.error);
+  const ids = listed.value.filter(entry => entry?.kind === 'dir' && typeof entry.name === 'string'
+    && entry.name.length <= 128 && ROOM_ID.test(entry.name)).map(entry => entry.name);
+  if (!ids.length) { loop.roomMeta?.clear(); return false; }
+  const cache = loop.roomMeta ||= new Map(), current = new Set(ids), closedRooms = new Set();
+  for (const id of cache.keys()) if (!current.has(id)) cache.delete(id);
+  for (const id of ids) {
+    const file = `${dir}/${id}/room.json`, stat = await safeFs($, lease, () => $.fs.stat(file));
+    if (!stat.ok) { if (!isMissing(stat.error)) return true; cache.delete(id); continue; }
+    const stampable = Number.isFinite(stat.value?.mtimeMs) && Number.isFinite(stat.value?.size);
+    const prev = stampable ? cache.get(id) : null;
+    if (prev && prev.mtimeMs === stat.value.mtimeMs && prev.size === stat.value.size) {
+      if (prev.sessionId === context.session && prev.status === 'open') return true;
+      if (prev.sessionId === context.session && prev.status === 'closed') closedRooms.add(id);
+      continue;
+    }
+    if (stat.value?.kind !== 'file' || (Number.isFinite(stat.value.size) && stat.value.size > MAX_ROOM_BYTES)) return true;
+    const text = await safeFs($, lease, () => $.fs.read(file));
+    if (!text.ok) { if (!isMissing(text.error)) return true; continue; }
+    try {
+      const room = JSON.parse(text.value);
+      if (typeof room?.sessionId !== 'string' || typeof room?.status !== 'string') return true;
+      if (stampable) cache.set(id, { mtimeMs: stat.value.mtimeMs, size: stat.value.size, sessionId: room.sessionId, status: room.status });
+      if (room.sessionId === context.session && room.status === 'open') return true;
+      if (room.sessionId === context.session && room.status === 'closed') closedRooms.add(id);
+    } catch { return true; }
+  }
+  const prefix = `${PREFIX}${context.session}:`, stoppedPrefix = `${STOPPED}${context.session}:`;
+  for (const key of await observed($, lease, () => $.store.keys())) {
+    if (key.startsWith(stoppedPrefix)) {
+      const record = await read($, key, lease);
+      if (!record.synced || closedRooms.has(record.roomId)) return true;
+    } else if (key.startsWith(prefix) && closedRooms.has(key.slice(prefix.length).split(':')[0])) return true;
+  }
+  return false;
+}
 async function run($, state, args, { input = '', timeoutMs = 5000, deadline, lease } = {}) {
   const timing = { timeoutMs, deadline };
   let request;
@@ -170,6 +236,7 @@ async function syncStop($, record, deadline, lease) {
 }
 
 async function resolveMember($, entry, session, lease) {
+  if (!entry.jobIds?.length) return null;
   const candidates = [];
   for (const agent of await observed($, lease, () => $.agent.list())) {
     const state = await observed($, lease, () => $.store.get(keyFor(session, agent.id)));
@@ -177,8 +244,9 @@ async function resolveMember($, entry, session, lease) {
         || await observed($, lease, () => $.store.get(bindingFailedKey(session, agent.id)))) continue;
     if (!isNativeType(agent.type) && !(isNativeType(state.type) && sameRoom(state.roundtable, entry))) continue;
     if (state.roundtable && !sameRoom(state.roundtable, entry)) continue;
-    if ((state.jobId && entry.jobIds?.includes(state.jobId)) || (state.threadId && state.threadId === entry.threadId)
-        || sameRoom(state.roundtable, entry) || agent.name === entry.name) candidates.push({ agent, state });
+    if (!state.jobId || !entry.jobIds.includes(state.jobId) || entry.abandonedJobIds?.includes(state.jobId)
+        || (entry.threadId && state.threadId && state.threadId !== entry.threadId)) continue;
+    candidates.push({ agent, state });
   }
   // The host stops listing an agent once its run ends, which is exactly when a
   // wake is needed. Fall back to this session's durable native bindings, which
@@ -191,13 +259,13 @@ async function resolveMember($, entry, session, lease) {
       const state = await observed($, lease, () => $.store.get(key));
       if (!state || state.session !== session || !state.agentId || key !== keyFor(session, state.agentId)
           || state.bindingPending || !state.cwd || !isNativeType(state.type) || !sameRoom(state.roundtable, entry)
-          || !entry.jobIds?.includes(state.jobId) || (entry.threadId && state.threadId !== entry.threadId)
+          || !state.jobId || !entry.jobIds.includes(state.jobId) || entry.abandonedJobIds?.includes(state.jobId)
+          || (entry.threadId && state.threadId !== entry.threadId)
           || await observed($, lease, () => $.store.get(bindingFailedKey(session, state.agentId)))) continue;
       candidates.push({ agent: { id: state.agentId, name: state.name, type: state.type }, state });
     }
   }
-  // An exact id/thread and a second matching name are still ambiguous. Never
-  // choose whichever entry $.agent.list happened to return first.
+  // Multiple bindings claiming the same current job remain ambiguous.
   return candidates.length === 1 ? candidates[0] : null;
 }
 
@@ -219,7 +287,7 @@ async function workspaceAvailable($, state, entry, key, lease) {
   return true;
 }
 
-async function deliverMember($, context, entry, deadline, lease, wake = false) {
+async function deliverMember($, context, entry, deadline, lease, wake = false, roomStatus) {
   if (!PERSONA_IDS.includes(entry.name) || entry.persona !== entry.name || entry.roomStatus !== 'open') return;
   const key = `${PREFIX}${context.session}:${entry.roomId}:${entry.name}`;
   let record = await read($, key, lease);
@@ -236,17 +304,18 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
   const match = await resolveMember($, entry, context.session, lease);
   if (!match) return;
   const { agent, state } = match;
-  const room = await run($, context, ['roundtable', 'status', entry.roomId, '--json'], { deadline, lease });
+  const room = await roomStatus(entry.roomId, { deadline, lease });
   const member = room.members?.find(member => member.name === entry.name && member.persona === entry.persona);
   if (room.sessionId !== context.session || room.status !== 'open' || !member) return;
   if (!sameRoom(state.roundtable, entry) && !member.jobIds?.includes(state.jobId)
       && !(state.threadId && state.threadId === member.threadId)) return;
   if (member.status === 'stopped') { await finish(maxSeq); return; }
+  if (!state.jobId || !member.jobIds?.includes(state.jobId) || member.abandonedJobIds?.includes(state.jobId)) return;
   if (agent.status === 'killed' || stopped(state) || (await read($, stopKey(state), lease)).roomId) {
     await stopRoundtableMember($, { ...state, roundtable: { roomId: entry.roomId, persona: entry.persona } }, lease);
     await finish(maxSeq); return;
   }
-  if (state.incoming || !state.jobId || !member.jobIds?.includes(state.jobId)) return;
+  if (state.incoming) return;
   if (!await workspaceAvailable($, state, entry, key, lease)) return;
   const { job, recovery } = await run($, state, ['status', state.jobId, '--json'], { deadline, lease });
   if (job?.id !== state.jobId || job.sessionId !== context.session || !sameRoom(job.request?.roundtable, entry)
@@ -261,6 +330,10 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
   if (job.pendingQuestion && job.pendingQuestion.answer === undefined) return;
   if (state.status === 'needs_answer' || state.answer?.status === 'needs_answer') return;
   let attempt = record.attempt;
+  if (attempt && member.abandonedJobIds?.includes(attempt.jobId)) {
+    record = await change($, key, current => ({ ...current, attempt: undefined, receipt: undefined }), lease);
+    attempt = undefined;
+  }
   // A newer job proves the member moved on (woken by this notice or continued
   // by hand), so an uncertain older notice is settled instead of blocking all
   // later ones. Otherwise reconcile a recipient receipt or retry the idle wake.
@@ -288,6 +361,7 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
     attempt = { ...attempt, phase: 'idle', retried: true };
   }
   if (!attempt) {
+    if (job.request?.backend === 'antigravity' && active(job)) return;
     if (!active(job) && !ended(job, state)) return;
     if (!active(job) && !entry.wake) { await finish(maxSeq); return; }
     const text = entry.text;
@@ -322,11 +396,12 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
   // Recheck after discovery/steering: stop, pause and questions can arrive
   // while awaiting I/O. The adapter also refuses concurrent assignments.
   const latest = await resolveMember($, entry, context.session, lease);
-  const current = await run($, context, ['roundtable', 'status', entry.roomId, '--json'], { deadline, lease });
+  const current = await roomStatus(entry.roomId, { deadline, lease, fresh: true });
   const latestMember = current.members?.find(member => member.name === entry.name && member.persona === entry.persona);
   if (!latest || latest.agent.id !== agent.id || latest.agent.status === 'killed' || stopped(latest.state)
       || (await read($, stopKey(state), lease)).roomId || current.sessionId !== context.session || current.status !== 'open'
-      || !latestMember || latestMember.status === 'stopped' || !latestMember.jobIds?.includes(attempt.jobId)) return;
+      || !latestMember || latestMember.status === 'stopped' || !latestMember.jobIds?.includes(attempt.jobId)
+      || latestMember.abandonedJobIds?.includes(attempt.jobId)) return;
   if (latest.state.incoming || latest.state.jobId !== attempt.jobId
       || !sameRoom(latest.state.roundtable, entry)
       || latest.state.status === 'needs_answer' || latest.state.answer?.status === 'needs_answer') return;
@@ -339,17 +414,25 @@ async function deliverMember($, context, entry, deadline, lease, wake = false) {
       || active(fresh.job) || !ended({ ...fresh.job, recovery: fresh.recovery }, latest.state)) return;
   const sentAt = await observed($, lease, () => $.clock.now());
   await change($, key, current => ({ ...current, attempt: { ...attempt, phase: 'wake', sentAt } }), lease);
-  await observed($, lease, () => $.session.send({ to: latest.agent.id, text: attempt.text }));
+  const sent = await observed($, lease, () => $.session.send({ to: latest.agent.id, text: attempt.text }));
+  if (sent?.isDelivered === false || sent?.deny !== undefined) {
+    const { sentAt: _sentAt, ...ready } = attempt;
+    await change($, key, current => current.attempt?.deliveryId === attempt.deliveryId
+      && current.attempt.phase === 'wake' && current.attempt.sentAt === sentAt
+      && !(current.receipt?.deliveryId === attempt.deliveryId && current.receipt.status === 'accepted')
+      ? { ...current, attempt: ready } : current, lease);
+    return;
+  }
   // Queuing alone is insufficient: only the recipient can accept the notice.
   record = await read($, key, lease);
   if (record.receipt?.deliveryId === attempt.deliveryId && record.receipt.status === 'accepted') await finish(attempt.maxSeq);
 }
 
-async function chairNotice($, context, entry, deadline, lease) {
+async function chairNotice($, context, entry, deadline, lease, roomStatus) {
   const key = memberKey(context.session, entry.roomId, 'chair'), record = await read($, key, lease);
   const events = entry.events.filter(event => Number.isSafeInteger(event.seq) && event.seq > (record.upto || 0));
   if (!events.length) return;
-  const room = await run($, context, ['roundtable', 'status', entry.roomId, '--json'], { deadline, lease });
+  const room = await roomStatus(entry.roomId, { deadline, lease });
   if (room.status !== 'open' || room.sessionId !== context.session) return;
   const batch = events.slice(0, 20), upto = Math.max(...batch.map(event => event.seq));
   const text = `Roundtable ${entry.roomId}: ${batch.map(event => `#${event.seq} ${event.kind} ${JSON.stringify(event.title || event.delta || '')}`).join('; ')}. Read the forum to address these chair updates.`;
@@ -363,7 +446,7 @@ const rotate = (entries, cursor) => {
   const start = Math.max(0, entries.findIndex(entry => entryKey(entry) === cursor));
   return [...entries.slice(start), ...entries.slice(0, start)];
 };
-async function pruneRecords($, context, loop, deadline, lease) {
+async function pruneRecords($, context, loop, deadline, lease, roomStatus) {
   const keys = (await observed($, lease, () => $.store.keys())).filter(key => owned(key) && key.startsWith(key.startsWith(PREFIX)
     ? `${PREFIX}${context.session}:` : `${STOPPED}${context.session}:`));
   const rooms = [];
@@ -377,7 +460,7 @@ async function pruneRecords($, context, loop, deadline, lease) {
   for (const room of ordered.slice(0, 2)) {
     if (await observed($, lease, () => $.clock.now()) >= deadline) break;
     loop.pruneCursor = entryKey(rooms[(rooms.findIndex(value => value.roomId === room.roomId) + 1) % rooms.length]);
-    const current = await run($, context, ['roundtable', 'status', room.roomId, '--json'], { timeoutMs: 1000, deadline, lease });
+    const current = await roomStatus(room.roomId, { timeoutMs: 1000, deadline, lease });
     if (current.sessionId !== context.session || current.status !== 'closed') continue;
     for (const key of keys) if (key.startsWith(memberKey(context.session, room.roomId, ''))
         || (key.startsWith(STOPPED) && (await read($, key, lease)).roomId === room.roomId)) await observed($, lease, () => $.store.delete(key));
@@ -401,7 +484,7 @@ async function deliveryPass($, loop, wake = false, token) {
         if (state.session === context.session && state.roundtable && isNativeType(state.type)) { bound = true; break; }
       }
       if (!bound) return;
-    }
+    } else if (!await hasTimerWork($, context, loop, lease)) return;
     const start = await observed($, lease, () => $.clock.now());
     if (wake && start - (loop.lastDeliveryAt ?? -Infinity) < DELIVERY_INTERVAL_MS) return;
     if (wake) loop.lastDeliveryAt = start;
@@ -409,19 +492,26 @@ async function deliveryPass($, loop, wake = false, token) {
     lease.deadline = deadline - 2000;
     const entries = await run($, context, ['forum', 'pending', '--json'], { deadline: start + 5000, lease });
     if (!Array.isArray(entries)) return;
+    const roomStatuses = new Map();
+    const roomStatus = async (roomId, options) => {
+      if (!options?.fresh && roomStatuses.has(roomId)) return roomStatuses.get(roomId);
+      const room = await run($, context, ['roundtable', 'status', roomId, '--json'], options);
+      roomStatuses.set(roomId, room);
+      return room;
+    };
     const chairs = rotate(entries.filter(entry => entry.name === 'chair' && entry.roomStatus === 'open'), loop.chairCursor);
     // Commit each completed room immediately, rotate after every attempt,
     // and reserve at least 18 seconds for members even with slow chairs.
     for (const entry of (wake ? [] : chairs.slice(0, 2))) {
       if (await observed($, lease, () => $.clock.now()) >= start + 10000) break;
       loop.chairCursor = entryKey(chairs[(chairs.indexOf(entry) + 1) % chairs.length]);
-      try { await chairNotice($, context, entry, start + 10000, lease); } catch { /* Next room/tick. */ }
+      try { await chairNotice($, context, entry, start + 10000, lease, roomStatus); } catch { /* Next room/tick. */ }
     }
     const members = rotate(entries.filter(entry => entry.name !== 'chair'), loop.memberCursor);
     for (const entry of (wake ? members.slice(0, 6) : members)) {
       if (await observed($, lease, () => $.clock.now()) >= deadline - 2000) break;
       loop.memberCursor = entryKey(members[(members.indexOf(entry) + 1) % members.length]);
-      try { await deliverMember($, context, entry, deadline - 2000, lease, wake); }
+      try { await deliverMember($, context, entry, deadline - 2000, lease, wake, roomStatus); }
       catch { /* Uncertain outcomes retain their claims and remain unacked. */ }
     }
     if (wake) return;
@@ -436,7 +526,7 @@ async function deliveryPass($, loop, wake = false, token) {
       stops++;
       try { await syncStop($, record, deadline, lease); } catch { /* Retry next tick. */ }
     }
-    await pruneRecords($, context, loop, deadline, lease);
+    await pruneRecords($, context, loop, deadline, lease, roomStatus);
   } catch { /* Discovery outages and invalidated callbacks never start replacement work. */ }
   finally { if (loop.busy === lease) loop.busy = false; }
 }

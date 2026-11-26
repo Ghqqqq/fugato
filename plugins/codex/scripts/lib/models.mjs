@@ -65,10 +65,16 @@ export function cachedReasoningEfforts(env = process.env) {
   return new Set(readModelCache(env)?.models.flatMap(model => model.efforts) ?? []);
 }
 
-export async function listModels({ env = process.env, cwd = process.cwd(), all = false, timeoutMs = 5000 } = {}) {
+function classifyModelFallback(error) {
+  if (error?.code === "ETIMEDOUT") return "timeout";
+  if (error?.code === "INVALID_MODEL_CATALOG" || error?.data?.line !== undefined) return "invalid";
+  return "unavailable";
+}
+
+export async function listModels({ env = process.env, cwd = process.cwd(), all = false, timeoutMs = 10000 } = {}) {
   // Validate isolation before even attempting runtime startup or cache fallback.
   resolveIsolatedCodexHome(env);
-  let client, catalog;
+  let client, catalog, fallbackReason;
   const deadline = Date.now() + timeoutMs;
   try {
     const { CodexAppServerClient } = await import("./app-server.mjs");
@@ -78,11 +84,11 @@ export async function listModels({ env = process.env, cwd = process.cwd(), all =
     let cursor = null;
     do {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error("Model listing timed out.");
+      if (remaining <= 0) throw Object.assign(new Error("Model listing timed out."), { code: "ETIMEDOUT" });
       // Codex 0.146.0 exposes this API; the local dispatch-only method map omits it.
       const page = await client.request(/** @type {any} */ ("model/list"), { cursor, limit: 100, includeHidden: true }, { timeoutMs: remaining });
-      if (!Array.isArray(page?.data)) throw new Error("Invalid model list.");
-      if (page.data.length > MAX_MODELS - processed) throw new Error("Model catalog exceeds the entry limit.");
+      if (!Array.isArray(page?.data)) throw Object.assign(new Error("Invalid model list."), { code: "INVALID_MODEL_CATALOG" });
+      if (page.data.length > MAX_MODELS - processed) throw Object.assign(new Error("Model catalog exceeds the entry limit."), { code: "INVALID_MODEL_CATALOG" });
       processed += page.data.length;
       for (const item of page.data) {
         const model = normalizeModel(item, "app-server");
@@ -90,16 +96,20 @@ export async function listModels({ env = process.env, cwd = process.cwd(), all =
         else droppedInvalid++;
       }
       cursor = page.nextCursor ?? null;
-      if (cursor !== null && (typeof cursor !== "string" || cursors.has(cursor))) throw new Error("Invalid model cursor.");
+      if (cursor !== null && (typeof cursor !== "string" || cursors.has(cursor))) throw Object.assign(new Error("Invalid model cursor."), { code: "INVALID_MODEL_CATALOG" });
       cursors.add(cursor);
     } while (cursor !== null);
     catalog = { source: "app-server", fetchedAt: new Date().toISOString(), models, droppedInvalid };
-  } catch {
+  } catch (error) {
     // Errors can contain runtime diagnostics/account details. Never print them here.
+    fallbackReason = classifyModelFallback(error);
   } finally {
     if (client) await client.close();
   }
-  catalog ??= readModelCache(env);
+  if (!catalog) {
+    const cached = readModelCache(env);
+    if (cached) catalog = { ...cached, fallbackReason };
+  }
   if (!catalog) throw new Error("Codex models are unavailable from the app-server and isolated model cache. Run /fugato:setup to check the runtime and sign in, then retry fugato models.");
   return { ...catalog, models: catalog.models.filter(model => all || model.visibility !== "hide") };
 }
@@ -111,5 +121,5 @@ export function renderModels(report) {
   const { strong, effort, routine } = report.tiers;
   return [`Models source: ${clean(report.source)}; fetched: ${clean(report.fetchedAt)}; invalid entries dropped: ${clean(report.droppedInvalid)}`,
     "Slug | Display name | Supported efforts | Default effort | Context window | In use | Description", ...rows,
-    `Fugato tiers: strong ${clean(strong.value)}/${clean(effort.value)} (model: ${clean(strong.source)}, effort: ${clean(effort.source)}); routine ${clean(routine.value)} (${clean(routine.source)})`, ""].join("\n");
+    `Roleless defaults: model ${clean(strong.value)}/${clean(effort.value)} (model: ${clean(strong.source)}, effort: ${clean(effort.source)}); ultra routine model ${clean(routine.value)} (${clean(routine.source)})`, ""].join("\n");
 }

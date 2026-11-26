@@ -40,7 +40,7 @@ handle `needs_answer` with the report's `next` command verbatim, or one backgrou
 single-quoted `DUET_ANSWER` heredoc. A bare `fugato answer <worker>` can answer a
 newer pending question. Native agents already pin the displayed question through
 SendMessage and handle waits themselves. Never parse output files or run two
-waits. See the [dispatch protocol](../prompts/ultra-codex-protocol.md#dispatch).
+waits. See the [dispatch protocol](../prompts/protocol/core.md#dispatch).
 
 Orphaned means no renewal for half the lease in direct mode (900 s by default),
 or the smaller of 65 s and half the lease otherwise. With explicit user consent,

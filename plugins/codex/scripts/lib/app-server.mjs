@@ -17,6 +17,7 @@ import { isolatedCodexArgs, isolatedCodexEnv, resolveCodexBinary, resolveCodexRu
 import { stopOwnedProcessGroup } from "./process.mjs";
 import { isParentQuestion } from "./job-runtime.mjs";
 import { decideServerRequest, actionApprovalRequest, isActionApproval, logServerRequest, normalizeBrowserOrigins, normalizeBundleIds } from "./server-requests.mjs";
+import { verifyApprovalArtifact } from "./approval-artifacts.mjs";
 import { bestEffortDiagnostic } from "./tracked-jobs.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
@@ -298,6 +299,10 @@ class AppServerClientBase {
 
   approvalItemKey(p) { return JSON.stringify([p?.threadId, p?.turnId, p?.itemId]); }
 
+  approvalStagingContext(stage = true) {
+    return { workspaceRoot: this.cwd, jobId: this.options.jobId, env: this.options.env, stage };
+  }
+
   rememberApprovalItem(p, patch) {
     const context = this.serverRequestPolicy;
     if (p?.threadId !== context.threadId || typeof p?.turnId !== "string" || !p.turnId || (context.turnId && p.turnId !== context.turnId)) return;
@@ -305,7 +310,7 @@ class AppServerClientBase {
     const previous = this.approvalItems.get(key);
     const item = patch ? previous && { ...previous, changes: p.changes } : { ...p.item, threadId: p.threadId, turnId: p.turnId };
     this.approvalItems.delete(key);
-    if (item && Buffer.byteLength(JSON.stringify(item)) <= 16000) {
+    if (item && Buffer.byteLength(JSON.stringify(item)) <= 1024 * 1024) {
       if (this.approvalItems.size >= 32) this.approvalItems.delete(this.approvalItems.keys().next().value);
       this.approvalItems.set(key, item);
     }
@@ -331,16 +336,22 @@ class AppServerClientBase {
 
   invalidateChangedApprovals() {
     for (const approval of this.actionApprovals.values()) {
-      if (approval.finished || !approval.request || approval.message.method !== "item/fileChange/requestApproval") continue;
+      if (approval.finished || !approval.request) continue;
+      if (approval.request.artifact && !verifyApprovalArtifact(approval.request.artifact)) {
+        this.finishActionApproval(approval, false, "operation-changed-before-approval");
+        continue;
+      }
+      if (approval.message.method !== "item/fileChange/requestApproval") continue;
       const current = actionApprovalRequest(approval.message, this.serverRequestPolicy, this.options.permissionPolicy,
-        this.approvalItems.get(this.approvalItemKey(approval.message.params)));
+        this.approvalItems.get(this.approvalItemKey(approval.message.params)), this.approvalStagingContext(false));
       if (current?.request?.question !== approval.request.question) this.finishActionApproval(approval, false, "operation-changed");
     }
   }
 
   handleServerRequest(message, pendingApproval = null) {
     if (this.serverRequestHandler) { this.serverRequestHandler(message); return; }
-    const action = actionApprovalRequest(message, this.serverRequestPolicy, this.options.permissionPolicy, this.approvalItems.get(this.approvalItemKey(message.params)));
+    const action = actionApprovalRequest(message, this.serverRequestPolicy, this.options.permissionPolicy,
+      this.approvalItems.get(this.approvalItemKey(message.params)), this.approvalStagingContext(true));
     if (action) {
       const approval = pendingApproval ?? this.trackActionApproval(message);
       if (!approval || approval.finished) return;
@@ -640,7 +651,7 @@ export class CodexAppServerClient {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env, connectDeadline: options.connectDeadline });
+        const brokerSession = await ensureBrokerSession(cwd, { env: options.env, connectDeadline: options.connectDeadline, signal: options.signal });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }

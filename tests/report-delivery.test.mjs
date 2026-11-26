@@ -749,3 +749,19 @@ test("later owner answer and adopted-session wait notifications attach reports w
     assert.deepEqual(readJob().deliveryBindings, job.deliveryBindings);
   }
 });
+
+test("isC2Report exempts action-approval text up to 16 KiB raw for both Codex and Antigravity", () => {
+  const base = {
+    status: "needs_answer", worker: "Ada", jobId: "task-approval-c2", summary: "",
+    question: { id: "action-approval-1", kind: "action-approval", text: "x".repeat(4000), options: ["Allow once", "Deny"], expiresInSec: 900 },
+    next: "fugato answer Ada --question 'action-approval-1'", details: "fugato result 'task-approval-c2' --details"
+  };
+  const antigravity = { ...base, backend: "antigravity", provider: "Google Antigravity" };
+  for (const report of [base, antigravity]) {
+    assert.equal(isC2Report(report), true);
+    assert.equal(isC2Report({ ...report, question: { ...report.question, text: "é".repeat(8192) } }), true);
+    assert.equal(isC2Report({ ...report, question: { ...report.question, text: "é".repeat(8192) + "x" } }), false);
+    assert.equal(isC2Report({ ...report, question: { ...report.question, kind: "question" } }), false);
+    assert.equal(isC2Report({ ...report, next: "x".repeat(2001) }), false);
+  }
+});

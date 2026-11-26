@@ -1703,3 +1703,78 @@ test('roundtable discovery caches unchanged and foreign metadata while advancing
   expect(roomReads().length).toBe(before + 1);
   expect(f.latest()?.forumRooms?.map(room => room.roomId)).toEqual(['rt-079-old', 'rt-000-old']);
 });
+
+test('mixed Codex and Gemini usage groups by backend and model while preserving legacy caches', async () => {
+  const f = scrollFixture();
+  const codexUsage = { inputTokens: 200, cachedInputTokens: 50, outputTokens: 30, totalTokens: 230 };
+  const geminiUsage = { inputTokens: 400, cachedInputTokens: 100, outputTokens: 60, totalTokens: 460 };
+  f.add('codex-seat', -2);
+  patchJob(f.files, 'codex-seat', { status: 'completed', completedAt: created(epoch),
+    request: { model: 'gpt-6-astra', roundtable: { persona: 'improver' } }, result: { usage: codexUsage } });
+  f.add('gemini-seat', -1);
+  patchJob(f.files, 'gemini-seat', { status: 'completed', completedAt: created(epoch),
+    request: { backend: 'antigravity', model: 'gemini-4-neon', effort: 'high', roundtable: { persona: 'critic' } },
+    result: { model: 'gemini-4-neon', effort: 'high', usage: geminiUsage } });
+  await f.poll(true);
+  const entries = f.latest().usageByJob!;
+  expect(entries['codex-seat']?.backend).toBe('codex');
+  expect(entries['gemini-seat']?.backend).toBe('antigravity');
+  expect(usageLines(entries)).toEqual([
+    'Antigravity session total (provider: Google Antigravity, model gemini-4-neon): 400 input · 100 cached · 60 output · 460 total',
+    'Codex session total (provider: OpenAI Codex, model gpt-6-astra): 200 input · 50 cached · 30 output · 230 total',
+  ]);
+  expect(usageLines({
+    legacyCodex: { model: 'unknown', usage: codexUsage },
+    explicitCodex: { backend: 'codex', model: 'unknown', usage: codexUsage },
+    antigravityUnknown: { backend: 'antigravity', model: 'unknown', usage: geminiUsage },
+  })).toEqual([
+    'Codex session total (provider: OpenAI Codex, model unknown): 400 input · 100 cached · 60 output · 460 total',
+    'Antigravity session total (provider: Google Antigravity, model unknown): 400 input · 100 cached · 60 output · 460 total',
+  ]);
+  expect(validView(f.latest())).toBe(true);
+  expect(f.forbidden).toEqual([]);
+});
+
+test('partial Gemini usage is retained across polls without fabricating zero counters', async () => {
+  const f = scrollFixture();
+  const codexUsage = { inputTokens: 200, cachedInputTokens: 50, outputTokens: 30, totalTokens: 230 };
+  const geminiPartial = { inputTokens: 400, outputTokens: 60, totalTokens: 460 };
+  const geminiNoTotal = { inputTokens: 150, outputTokens: 25 };
+  f.add('codex-full', -4);
+  patchJob(f.files, 'codex-full', { status: 'completed', completedAt: created(epoch),
+    request: { model: 'gpt-6-astra' }, result: { usage: codexUsage } });
+  f.add('gemini-partial', -3);
+  patchJob(f.files, 'gemini-partial', { status: 'completed', completedAt: created(epoch),
+    request: { backend: 'antigravity', model: 'gemini-4-neon' },
+    result: { model: 'gemini-4-neon', usage: geminiPartial } });
+  f.add('gemini-no-total', -2);
+  patchJob(f.files, 'gemini-no-total', { status: 'completed', completedAt: created(epoch),
+    request: { backend: 'antigravity', model: 'gemini-3.8-flash' },
+    result: { model: 'gemini-3.8-flash', usage: geminiNoTotal } });
+  f.add('gemini-invalid', -1);
+  patchJob(f.files, 'gemini-invalid', { status: 'completed', completedAt: created(epoch),
+    request: { backend: 'antigravity', model: 'gemini-4-neon' },
+    result: { model: 'gemini-4-neon', usage: { inputTokens: 100, cachedInputTokens: -1 } } });
+  await f.poll(true);
+  const entries = f.latest().usageByJob!;
+  expect(Object.keys(entries).sort()).toEqual(['codex-full', 'gemini-no-total', 'gemini-partial']);
+  expect(entries['gemini-partial']?.usage).toEqual(geminiPartial);
+  expect('cachedInputTokens' in entries['gemini-partial']!.usage).toBe(false);
+  expect(usageLines(entries)).toEqual([
+    'Antigravity session total (provider: Google Antigravity, model gemini-3.8-flash): 150 input · 25 output',
+    'Antigravity session total (provider: Google Antigravity, model gemini-4-neon): 400 input · 60 output · 460 total',
+    'Codex session total (provider: OpenAI Codex, model gpt-6-astra): 200 input · 50 cached · 30 output · 230 total',
+  ]);
+  expect(usageLines({
+    a: { backend: 'antigravity', model: 'gemini-4-neon', usage: { inputTokens: 400, cachedInputTokens: 100, outputTokens: 60, totalTokens: 460 } },
+    b: { backend: 'antigravity', model: 'gemini-4-neon', usage: { inputTokens: 200, outputTokens: 30, totalTokens: 230 } },
+  })).toEqual([
+    'Antigravity session total (provider: Google Antigravity, model gemini-4-neon): 600 input · 100 cached (partial: 1/2) · 90 output · 690 total',
+  ]);
+  const noTotalJob = f.latest().jobs.find(job => job.id === 'gemini-no-total')!;
+  const partialJob = f.latest().jobs.find(job => job.id === 'gemini-partial')!;
+  expect(footerLayout(noTotalJob, f.latest(), 100, true, 0).right).toBe('');
+  expect(footerLayout(partialJob, f.latest(), 100, true, 0).right).toBe('460 tokens');
+  expect(validView(f.latest())).toBe(true);
+  expect(f.forbidden).toEqual([]);
+});

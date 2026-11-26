@@ -1,5 +1,5 @@
 import { limitChars } from './text';
-import type { CodexLiveEvent, CodexLiveJob, CodexLiveMarker, CodexLiveSession, CodexLiveState, CodexLiveUsage, CodexLiveUsageEntry, ForumRoom } from '../types';
+import type { CodexLiveBackend, CodexLiveEvent, CodexLiveJob, CodexLiveMarker, CodexLiveSession, CodexLiveState, CodexLiveUsage, CodexLiveUsageEntry, ForumRoom } from '../types';
 
 export const EXPANDED_ID_LIMIT = 5000;
 const EXPANDED_ID_LENGTH = 200;
@@ -16,25 +16,64 @@ const number = (value: unknown): number | undefined =>
 const validBlockerCode = (value: unknown): value is string =>
   typeof value === 'string' && /^[a-z0-9_.:-]{1,64}$/i.test(value);
 const usageKeys = ['inputTokens', 'cachedInputTokens', 'outputTokens', 'totalTokens'] as const;
+const usageLabels = ['input', 'cached', 'output', 'total'] as const;
+const isUsageCount = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 export function usageView(value: unknown): CodexLiveUsage | undefined {
-  const usage = object(value);
-  return usageKeys.every(key => Number.isSafeInteger(usage[key]) && (usage[key] as number) >= 0)
-    ? Object.fromEntries(usageKeys.map(key => [key, usage[key]])) as CodexLiveUsage : undefined;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const usage = value as Record<string, unknown>;
+  if (usage.reasoningOutputTokens !== undefined && !isUsageCount(usage.reasoningOutputTokens)) return undefined;
+  const result: CodexLiveUsage = {};
+  let present = 0;
+  for (const key of usageKeys) {
+    if (usage[key] === undefined) continue;
+    if (!isUsageCount(usage[key])) return undefined;
+    result[key] = usage[key];
+    present++;
+  }
+  return present ? result : undefined;
+}
+export function jobBackend(value: { backend?: CodexLiveBackend }): CodexLiveBackend {
+  return value.backend === 'antigravity' ? 'antigravity' : 'codex';
+}
+export function providerLabel(backend?: CodexLiveBackend): string {
+  return backend === 'antigravity' ? 'Google Antigravity' : 'OpenAI Codex';
+}
+export function runtimeLabel(backend?: CodexLiveBackend): string {
+  return backend === 'antigravity' ? 'Antigravity' : 'Codex';
 }
 export function usageSnapshots(previous: CodexLiveState['usageByJob'], jobs: readonly CodexLiveJob[]) {
   const snapshots = { ...previous };
-  for (const job of jobs) if (job.usage) snapshots[job.id] = { model: job.model || 'unknown', usage: job.usage, sessionId: sessionId(job) };
+  for (const job of jobs) if (job.usage) snapshots[job.id] = {
+    model: job.model || 'unknown', usage: job.usage, sessionId: sessionId(job),
+    ...(job.backend ? { backend: job.backend } : {}),
+  };
   return snapshots;
 }
-export function usageLines(entries: Record<string, CodexLiveUsageEntry>, label = 'Codex session total'): string[] {
-  const models = new Map<string, CodexLiveUsage>();
+export function usageLines(entries: Record<string, CodexLiveUsageEntry>, label?: string): string[] {
+  const groups = new Map<string, { backend: CodexLiveBackend; model: string; jobs: number;
+    usage: Record<typeof usageKeys[number], number>; counts: Record<typeof usageKeys[number], number> }>();
   for (const entry of Object.values(entries)) {
-    const sum = models.get(entry.model) ?? { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 };
-    for (const key of usageKeys) sum[key] += entry.usage[key];
-    models.set(entry.model, sum);
+    const parsed = usageView(entry.usage);
+    if (!parsed) continue;
+    const backend = jobBackend(entry);
+    const key = `${backend}\0${entry.model}`;
+    const group = groups.get(key) ?? { backend, model: entry.model, jobs: 0,
+      usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      counts: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, totalTokens: 0 } };
+    group.jobs++;
+    for (const field of usageKeys) {
+      const value = parsed[field];
+      if (value === undefined) continue;
+      group.usage[field] += value;
+      group.counts[field]++;
+    }
+    groups.set(key, group);
   }
-  return [...models].map(([model, usage]) => `${label} (provider: OpenAI Codex, model ${model}): ` +
-    usageKeys.map((key, i) => `${usage[key].toLocaleString('en-US')} ${['input', 'cached', 'output', 'total'][i]}`).join(' · '));
+  return [...groups.values()].map(({ backend, model, jobs, usage, counts }) =>
+    `${label ?? `${runtimeLabel(backend)} session total`} (provider: ${providerLabel(backend)}, model ${model}): ` +
+    usageKeys.flatMap((key, i) => counts[key] === 0 ? []
+      : [`${usage[key].toLocaleString('en-US')} ${usageLabels[i]}${counts[key] < jobs ? ` (partial: ${counts[key]}/${jobs})` : ''}`]).join(' · '));
 }
 
 // Persisted atoms can contain valid JSON with an invalid shape. Check every
@@ -52,9 +91,11 @@ export function validView(value: unknown): value is CodexLiveState {
   const event = (v: unknown) => record(v) && finite(v.seq) && text(v.type) &&
     optional(v, ['at', 'status', 'lifecycle', 'text', 'body', 'command', 'path', 'kind', 'server', 'tool', 'questionText', 'answer'], text) &&
     optional(v, ['exitCode', 'durationMs', 'added', 'removed'], finite) && optional(v, ['steps', 'statuses'], strings);
+  const validBackend = (v: unknown) => v === 'codex' || v === 'antigravity';
   const job = (v: unknown) => record(v) &&
     ['id', 'label', 'status', 'createdAt', 'startedAt', 'completedAt', 'model', 'effort', 'sandbox', 'finalStatus'].every(key => text(v[key])) &&
     ['active', 'finished', 'fast', 'detailsUnavailable'].every(key => bool(v[key])) &&
+    optional(v, ['backend'], validBackend) &&
     optional(v, ['threadId', 'agentName', 'role', 'homeDir', 'cwd', 'workspaceRoot', 'prompt', 'currentOperation', 'lastActivityAt', 'terminalQuestion'], text) &&
     optional(v, ['blockerCode'], validBlockerCode) &&
     optional(v, ['unresolved', 'notStarted', 'promptReport', 'detailsLoaded', 'detailsOmitted'], bool) &&
@@ -83,7 +124,7 @@ export function validView(value: unknown): value is CodexLiveState {
       (ids as string[]).length <= 2000) &&
     optional(value, ['turnCounts', 'firstEndedAtMs'], v => dictionary(v, finite)) &&
     optional(value, ['usagePartial'], bool) &&
-    optional(value, ['usageByJob'], v => dictionary(v, entry => record(entry) && text(entry.model) && optional(entry, ['sessionId'], text) && usageView(entry.usage) !== undefined)) &&
+    optional(value, ['usageByJob'], v => dictionary(v, entry => record(entry) && text(entry.model) && optional(entry, ['sessionId'], text) && optional(entry, ['backend'], validBackend) && usageView(entry.usage) !== undefined)) &&
     optional(value, ['feeds'], v => dictionary(v, feed));
 }
 
@@ -277,7 +318,7 @@ export function jobView(value: unknown, marker: CodexLiveMarker, details = true,
   const request = object(job.request);
   const report = object(job.report);
   const result = object(job.result);
-  const gemini = (request.backend ?? job.backend ?? result.backend) === 'antigravity';
+  const gemini = (request.backend ?? job.backend ?? result.backend ?? report.backend) === 'antigravity';
   const model = gemini ? result.model || job.selectedModel || request.model : request.model;
   const effort = gemini ? result.effort || (job.selectedEffort !== undefined ? job.selectedEffort : request.effort) : request.effort;
   const blockers = Array.isArray(report.blockers) && report.blockers.length ? report.blockers : result.blockers;
@@ -334,7 +375,8 @@ export function jobView(value: unknown, marker: CodexLiveMarker, details = true,
           ? { answer: limitChars(clean(question.answer), 2000) } : {}) } : {}) };
   }) : [];
   return {
-    id: marker.jobId, label: taskText(marker.summary || job.summary || marker.title) || 'Codex Task', status,
+    id: marker.jobId, backend: gemini ? 'antigravity' : 'codex',
+    label: taskText(marker.summary || job.summary || marker.title) || (gemini ? 'Gemini Task' : 'Codex Task'), status,
     threadId: string(job.threadId).trim() || undefined,
     agentName: limitChars(clean(job.agentName), 100) || marker.name,
     role: limitChars(clean(object(job.roundtable).persona || object(request.roundtable).persona || request.persona || job.agentType || request.agentType || job.agent_type || job.preset || request.preset), 100) || undefined,
@@ -432,7 +474,11 @@ export function statusLine(jobs: readonly CodexLiveJob[], attentionOmitted = 0):
   const active = jobs.filter(job => jobLifecycle(job).active);
   const name = active.length === 1 ? active[0]?.agentName
     : !active.length && waiting.length === 1 && !attentionOmitted ? waiting[0]?.agentName : undefined;
-  return parts.length ? `${name || 'Codex'} · ${parts.join(' · ')}` : undefined;
+  const shown = jobs.filter(job => jobLifecycle(job).active || attention(job));
+  const backends = new Set(shown.map(jobBackend));
+  const fallback = backends.has('antigravity')
+    ? (backends.size === 1 && !attentionOmitted ? 'Google Antigravity' : 'Fugato') : 'Codex';
+  return parts.length ? `${name || fallback} · ${parts.join(' · ')}` : undefined;
 }
 
 export function sessionId(job: CodexLiveJob): string {

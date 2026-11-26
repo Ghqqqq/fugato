@@ -4,9 +4,13 @@ import { randomUUID } from "node:crypto";
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { withJournalLock, resolveStateDirForRoot, readJobFile } from "./state.mjs";
 import { PERSONA_IDS, INTENSITIES } from "./roundtable-personas.mjs";
+import { backendForModel } from "./roles.mjs";
 import { createMemberWorkspaces, rollbackMemberWorkspaces, memberWorkspaceStatus, candidateWorkspaceDiff } from "./roundtable-workspaces.mjs";
+import { summarizeUsage } from "./run-journal.mjs";
 
 export const EVENT_KINDS = Object.freeze(["idea", "finding", "question", "request", "intent", "candidate", "decision"]);
+const BACKENDS = ["codex", "antigravity"];
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted", "blocked"]);
 const NOTIFICATION_WINDOW_MS = 30000;
 const READ_EVENT_LIMIT = 25;
 const READ_EVENT_BYTES = 128 * 1024;
@@ -59,10 +63,14 @@ function load(dir, roomId) {
       !Array.isArray(room.members) || !room.members.length || room.members.length > 6 ||
       new Set(room.members.map(member => member?.name)).size !== room.members.length || room.members.some(member =>
         !member || !PERSONA_IDS.includes(member.persona) || member.name !== member.persona || typeof member.model !== "string" || !member.model ||
-        typeof member.effort !== "string" || !member.effort || !["seated", "active", "stopped"].includes(member.status) ||
+        typeof member.effort !== "string" || !member.effort || (member.backend !== undefined && !BACKENDS.includes(member.backend)) ||
+        !["seated", "active", "stopped"].includes(member.status) ||
         (member.workspace !== undefined && (!member.workspace || typeof member.workspace.path !== "string" || !path.isAbsolute(member.workspace.path) ||
           typeof member.workspace.shared !== "boolean" || (member.workspace.shared ? member.workspace.base !== null : !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(member.workspace.base)))) ||
-        !Array.isArray(member.jobIds) || member.jobIds.some(id => !identifier(id)) || (member.threadId !== null && !identifier(member.threadId)) ||
+        !Array.isArray(member.jobIds) || member.jobIds.some(id => !identifier(id)) ||
+        (member.abandonedJobIds !== undefined && (!Array.isArray(member.abandonedJobIds) || member.abandonedJobIds.some(id => !identifier(id)))) ||
+        (member.claimedAt !== undefined && (typeof member.claimedAt !== "string" || !Number.isFinite(Date.parse(member.claimedAt)))) ||
+        (member.threadId !== null && !identifier(member.threadId)) ||
         (member.initialSeq !== null && (!Number.isSafeInteger(member.initialSeq) || member.initialSeq < 1)) ||
         !Number.isSafeInteger(member.indexCursor) || member.indexCursor < 0 || !Number.isSafeInteger(member.notifiedSeq) || member.notifiedSeq < 0 ||
         (member.firstPendingAt !== null && !Number.isFinite(Date.parse(member.firstPendingAt))) ||
@@ -94,6 +102,7 @@ function load(dir, roomId) {
   if (events.length > 5000) throw new Error("Invalid roundtable event count (maximum 5000).");
   room.nextSeq = events.length + 1;
   for (const member of room.members) {
+    member.backend ??= "codex";
     const initial = events.find(event => event.author.kind === "member" && event.author.name === member.name);
     if (initial && member.initialSeq === null) { member.initialSeq = initial.seq; member.indexCursor = 0; }
     if ((member.initialSeq !== null && member.initialSeq !== initial?.seq) || member.notifiedSeq > events.length) throw new Error("Invalid roundtable member cursors.");
@@ -163,23 +172,71 @@ function selection(events) {
   return { seq: candidate.seq, resource: `candidate/${candidate.seq}`, decision: decision.seq,
     reviewed: reviewed(candidate, events.filter(event => event.seq < decision.seq)), unreviewed: decision.unreviewed ?? null };
 }
+function readMemberJob(room, member, jobId, env) {
+  for (const root of new Set([member.workspace?.path, room.workspaceRoot].filter(Boolean))) {
+    try {
+      const dir = directory(resolveStateDirForRoot(root, env), env), file = path.join(dir, "jobs", `${jobId}.json`);
+      directory(path.dirname(file), env); regular(file);
+      const job = readJobFile(file);
+      if (job.id !== jobId || job.sessionId !== room.sessionId) throw new Error("Job does not belong to this roundtable session.");
+      return job;
+    } catch (error) { if (error.code !== "ENOENT") throw error; }
+  }
+  return null;
+}
+function isNotStartedTerminalJob(job) {
+  if (!job || !TERMINAL_JOB_STATUSES.has(job.status)) return false;
+  if ((job.pendingQuestion && job.pendingQuestion.answer === undefined) || job.phase === "needs_answer") return false;
+  return [job.turnResolution, job.result?.turnStatus, job.recovery?.turnStatus].includes("notStarted");
+}
+function summarizeMemberJob(jobId, job) {
+  const report = job?.report ?? job?.result?.structured;
+  const summary = report?.summary ?? job?.result?.structured?.summary ?? job?.summary ?? report?.keyFindings?.join(" ") ?? "";
+  const status = (job?.pendingQuestion && job.pendingQuestion.answer === undefined) || job?.phase === "needs_answer" ? "needs_answer" : job?.status ?? "unknown";
+  return { jobId, status, reportStatus: report?.status ?? null, summary: typeof summary === "string" ? summary.slice(0, 600) : "",
+    details: `fugato result ${jobId} --details` };
+}
 function memberJobs(room, member, env, jobIds = member.jobIds) {
-  return jobIds.map(jobId => {
-    let job = null;
-    for (const root of new Set([member.workspace?.path, room.workspaceRoot].filter(Boolean))) {
-      try {
-        const dir = directory(resolveStateDirForRoot(root, env), env), file = path.join(dir, "jobs", `${jobId}.json`);
-        directory(path.dirname(file), env); regular(file);
-        job = readJobFile(file);
-        if (job.id !== jobId || job.sessionId !== room.sessionId) throw new Error("Job does not belong to this roundtable session.");
-        break;
-      } catch (error) { if (error.code !== "ENOENT") throw error; }
+  return jobIds.map(jobId => summarizeMemberJob(jobId, readMemberJob(room, member, jobId, env)));
+}
+function countJobApprovals(jobs) {
+  let pending = 0, answered = 0;
+  for (const job of jobs) {
+    if (job?.pendingQuestion?.kind === "action-approval" && job.pendingQuestion.answer == null) pending++;
+    if (Array.isArray(job?.questionHistory)) {
+      for (const entry of job.questionHistory) {
+        if (entry?.kind === "action-approval" && entry.answer != null) answered++;
+      }
     }
-    const report = job?.report ?? job?.result?.structured;
-    const summary = report?.summary ?? job?.result?.structured?.summary ?? job?.summary ?? report?.keyFindings?.join(" ") ?? "";
-    const status = (job?.pendingQuestion && job.pendingQuestion.answer === undefined) || job?.phase === "needs_answer" ? "needs_answer" : job?.status ?? "unknown";
-    return { jobId, status, reportStatus: report?.status ?? null, summary: typeof summary === "string" ? summary.slice(0, 600) : "",
-      details: `fugato result ${jobId} --details` };
+  }
+  return { pending, answered };
+}
+const UNREAD_FOOTER_MAX_CHARS = 240;
+const UNREAD_FOOTER_MAX_REFS = 3;
+function formatUnreadRef(event) {
+  return event.author.kind === "chair" ? `#${event.seq} chair ${event.kind}` : `#${event.seq} ${event.kind} mention`;
+}
+export function unreadFooter(roomId, persona, env = process.env, options = null) {
+  return locked(roomId, env, ({ room, events }) => {
+    if (options && Object.hasOwn(options, "sessionId")) assertChair(room, options.sessionId);
+    if (room.status !== "open") return null;
+    const name = typeof persona === "string" ? persona : persona?.persona ?? persona?.name;
+    const member = room.members.find(value => value.name === name);
+    if (!member || member.status === "stopped") return null;
+    const cursor = Math.max(member.indexCursor, member.notifiedSeq);
+    const unread = events.filter(event => event.seq > cursor && event.author.name !== member.name && visible(event, member) &&
+      (event.author.kind === "chair" || event.mentions.includes(member.name)));
+    if (!unread.length) return null;
+    const prefix = `Roundtable ${room.roomId}: ${unread.length} unread for you`;
+    const suffix = " — call forum_read.";
+    const refs = unread.slice(0, UNREAD_FOOTER_MAX_REFS).map(formatUnreadRef);
+    for (let count = refs.length; count >= 0; count--) {
+      const omitted = unread.length - count;
+      const detail = count ? ` (${refs.slice(0, count).join(", ")}${omitted > 0 ? `, +${omitted} more` : ""})` : "";
+      const line = `${prefix}${detail}${suffix}`;
+      if (line.length <= UNREAD_FOOTER_MAX_CHARS) return line;
+    }
+    return `${prefix}${suffix}`.slice(0, UNREAD_FOOTER_MAX_CHARS);
   });
 }
 
@@ -191,9 +248,11 @@ export function createRoom({ sessionId, workspaceRoot, goal, intensity = "standa
   if (!Object.hasOwn(INTENSITIES, intensity)) throw new Error("Unknown roundtable intensity.");
   if (runId !== null && !identifier(runId)) throw new Error("Invalid roundtable runId.");
   if (!Array.isArray(members) || !members.length || members.length > 6 || new Set(members.map(member => member.persona)).size !== members.length) throw new Error("Roundtable needs 1–6 distinct personas.");
-  const roster = members.map(({ persona, name = persona, model, effort }) => {
+  const roster = members.map(({ persona, name = persona, model, effort, backend }) => {
     if (!PERSONA_IDS.includes(persona) || name !== persona || typeof model !== "string" || !model || typeof effort !== "string" || !effort) throw new Error("Invalid roundtable roster member.");
-    return { persona, name, model, effort, status: "seated", jobIds: [], threadId: null, initialSeq: null, indexCursor: 0, expanded: {}, notifiedSeq: 0, firstPendingAt: null };
+    const resolvedBackend = backend === undefined ? backendForModel(model) : backend;
+    if (!BACKENDS.includes(resolvedBackend)) throw new Error("Invalid roundtable roster member.");
+    return { persona, name, model, effort, backend: resolvedBackend, status: "seated", jobIds: [], threadId: null, initialSeq: null, indexCursor: 0, expanded: {}, notifiedSeq: 0, firstPendingAt: null };
   });
   const roomId = `rt-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const room = { version: 1, roomId, runId, sessionId, workspaceRoot, goal, intensity, status: "open", createdAt: iso(), closedAt: null, nextSeq: 1, members: roster };
@@ -341,7 +400,7 @@ export function readResource(roomId, reader, resource, env = process.env, { afte
   if (kind === "member" && target) {
     const jobs = target.jobIds.slice().reverse().slice(after, after + limit);
     const workspace = memberWorkspaceStatus(room, target, env, { commitAfter: after, commitLimit: limit });
-    view.member = { name: target.name, persona: target.persona, status: target.status, threadId: target.threadId,
+    view.member = { name: target.name, persona: target.persona, backend: target.backend, model: target.model, status: target.status, threadId: target.threadId,
       jobs: memberJobs(room, target, env, jobs), jobCount: target.jobIds.length, jobsOmitted: target.jobIds.length - jobs.length, workspace };
     view.next = Math.max(target.jobIds.length, workspace.commitCount ?? 0) > after + limit ? { resource, after: after + limit, limit } : null;
   } else if (kind === "candidate" && target && target.workspace && !target.workspace.shared) {
@@ -356,11 +415,16 @@ export function pending(roomId, { now = Date.now(), windowMs = NOTIFICATION_WIND
   return locked(roomId, env, ({ room, events, dir }) => {
     if (room.status !== "open") return [];
     const notices = [];
+    let changed = false;
     for (const member of room.members) {
       if (member.status === "stopped") continue;
       const relevant = memberUpdates(events, member);
-      if (!relevant.length) { member.firstPendingAt = null; continue; }
-      member.firstPendingAt = relevant[0].at;
+      const nextFirstPendingAt = relevant.length ? relevant[0].at : null;
+      if (member.firstPendingAt !== nextFirstPendingAt) {
+        member.firstPendingAt = nextFirstPendingAt;
+        changed = true;
+      }
+      if (!relevant.length) continue;
       if (!relevant.some(event => event.author.kind === "chair" && wakes(event, member))
           && time - Date.parse(member.firstPendingAt) < windowMs) continue;
       const summaries = relevant.map(event => ({ seq: event.seq, kind: event.kind, author: event.author, ...(event.title ? { title: short(event.title) } : { delta: `${event.thread === event.seq ? event.kind : "reply"} in thread #${event.thread}` }) }));
@@ -368,7 +432,7 @@ export function pending(roomId, { now = Date.now(), windowMs = NOTIFICATION_WIND
       notices.push({ persona: member.persona, name: member.name, threadId: member.threadId, jobIds: member.jobIds, wake: relevant.some(event => wakes(event, member)), events: summaries,
         text: `Roundtable ${roomId}: ${relevant.length} updates for you — ${preview}${relevant.length > 5 ? "; …" : ""}. Call forum_read to see them.` });
     }
-    save(dir, room);
+    if (changed) save(dir, room);
     return notices;
   });
 }
@@ -401,9 +465,19 @@ export function updateMember(roomId, name, patch, env = process.env) {
     if (patch.claim) {
       // A fresh dispatch seats a member once, atomically; later work continues
       // its thread, so two launches can never act as the same member.
+      if (room.status === "closed") throw new Error("Roundtable is closed.");
+      if (member.status === "stopped") throw new Error("A stopped roundtable member cannot be restarted.");
       if (member.threadId) throw new Error(`Roundtable member ${member.name} already has a thread; continue it with SendMessage.`);
-      if (member.jobIds.length || member.claimedAt) throw new Error(`Roundtable member ${member.name} was already dispatched; continue it with SendMessage instead of a second fresh launch.`);
-      member.claimedAt = new Date().toISOString();
+      if (member.jobIds.length || member.claimedAt) {
+        const reclaimable = member.initialSeq === null && member.jobIds.length > 0 &&
+          member.jobIds.every(jobId => isNotStartedTerminalJob(readMemberJob(room, member, jobId, env)));
+        if (!reclaimable) throw new Error(`Roundtable member ${member.name} was already dispatched; continue it with SendMessage instead of a second fresh launch.`);
+        member.abandonedJobIds = [...new Set([...(member.abandonedJobIds ?? []), ...member.jobIds])];
+        member.jobIds = [];
+        member.status = "seated";
+      }
+      const previous = member.claimedAt ? Date.parse(member.claimedAt) : NaN, now = Date.now();
+      member.claimedAt = new Date(Number.isFinite(previous) && now <= previous ? previous + 1 : now).toISOString();
     }
     if (patch.status !== undefined) {
       if (!["seated", "active", "stopped"].includes(patch.status)) throw new Error("Invalid roundtable member status.");
@@ -424,6 +498,18 @@ export function updateMember(roomId, name, patch, env = process.env) {
     return member;
   });
 }
+export function releaseMemberClaim(roomId, persona, { claimedAt } = {}, env = process.env) {
+  return locked(roomId, env, ({ room, dir }) => {
+    const { member } = identity(room, persona, env);
+    if (!member) throw new Error("Forum releaseMemberClaim requires a member.");
+    if (typeof claimedAt !== "string" || !claimedAt || member.claimedAt !== claimedAt || member.jobIds.length || member.threadId !== null) {
+      return { released: false };
+    }
+    delete member.claimedAt;
+    save(dir, room);
+    return { released: true };
+  });
+}
 export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs = NOTIFICATION_WINDOW_MS } = {}, env = process.env) {
   const selected = roomId ?? listRooms(sessionId, env)[0]?.roomId;
   if (!selected) return null;
@@ -432,7 +518,15 @@ export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs
     return { room, events };
   });
   const items = open(events), attention = [];
-  const members = room.members.map(member => ({ ...member, jobs: memberJobs(room, member, env), workspace: memberWorkspaceStatus(room, member, env) }));
+  const allUsageRecords = [];
+  const members = room.members.map(member => {
+    const records = member.jobIds.map(jobId => ({ jobId, job: readMemberJob(room, member, jobId, env) }));
+    const rawJobs = records.map(({ job }) => job);
+    const usageRecords = rawJobs.map(job => job ? { backend: member.backend, model: member.model, ...job } : null);
+    allUsageRecords.push(...usageRecords);
+    return { ...member, jobs: records.map(({ jobId, job }) => summarizeMemberJob(jobId, job)),
+      workspace: memberWorkspaceStatus(room, member, env), approvals: countJobApprovals(rawJobs), usage: summarizeUsage(usageRecords) };
+  });
   for (const event of items) if (event.mentions.includes("chair") || (!event.mentions.length && now - Date.parse(event.at) >= windowMs)) {
     attention.push({ kind: "open_item", seq: event.seq, resource: `post/${event.seq}`, summary: `#${event.seq} ${event.kind} from ${event.author.name}: ${delta(event)}` });
   }
@@ -455,17 +549,33 @@ export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs
   for (const event of events) if (event.kind === "candidate" && !reviewed(event, events)) {
     attention.push({ kind: "unreviewed_candidate", seq: event.seq, resource: `candidate/${event.seq}`, summary: `Candidate #${event.seq} from ${event.author.name} needs a non-author finding.` });
   }
+  const totals = {
+    approvals: members.reduce((sum, member) => ({ pending: sum.pending + member.approvals.pending, answered: sum.answered + member.approvals.answered }), { pending: 0, answered: 0 }),
+    usage: summarizeUsage(allUsageRecords)
+  };
   return { attention, ...room, members, selectedCandidate: selection(events), openItems: items,
-    counts: { events: events.length, threads: events.filter(event => event.seq === event.thread).length, openItems: items.length } };
+    counts: { events: events.length, threads: events.filter(event => event.seq === event.thread).length, openItems: items.length },
+    totals };
+}
+function formatStatusTokens(usage) {
+  if (!usage || !usage.jobsWithUsage) return "unknown";
+  if (usage.jobsByKey && usage.jobsByKey.totalTokens === 0) return "unknown";
+  return String(usage.totalTokens);
 }
 export function renderAttention(room) {
   return `${room.attention.length ? `Needs the chair (${room.attention.length}):\n${room.attention.map(item => `- ${item.summary} → ${item.resource}`).join("\n")}` : "Nothing needs the chair."}\n`;
 }
 export function renderRoundtableStatus(room) {
+  const approvals = room.totals?.approvals ?? { pending: 0, answered: 0 };
+  const usage = room.totals?.usage ?? { jobsWithUsage: 0, totalTokens: 0 };
   return renderAttention(room) +
     `Roundtable ${room.roomId} (${room.status}, ${room.intensity})\n` +
     `Counts: ${room.counts.events} posts, ${room.counts.threads} threads, ${room.counts.openItems} open items\n` +
-    room.members.map(member => `${member.name}: ${member.status}; jobs ${member.jobs.map(job => `${job.jobId}:${job.status}`).join(", ") || "none"}; workspace ${member.workspace.path}`).join("\n") + "\n";
+    `Approvals: ${approvals.pending} pending, ${approvals.answered} answered; tokens: ${formatStatusTokens(usage)} (${usage.jobsWithUsage} job(s) with usage)\n` +
+    room.members.map(member => {
+      const mApprovals = member.approvals ?? { pending: 0, answered: 0 };
+      return `${member.name}: ${member.status}; ${member.backend ?? "codex"} ${member.model}; jobs ${member.jobs.map(job => `${job.jobId}:${job.status}`).join(", ") || "none"}; workspace ${member.workspace.path}; approvals ${mApprovals.pending}/${mApprovals.answered}; tokens ${formatStatusTokens(member.usage)}`;
+    }).join("\n") + "\n";
 }
 export function validateMember(roomId, persona, sessionId, env = process.env) {
   const room = readRoom(roomId, env);
@@ -483,7 +593,7 @@ export function renderForum(view) {
   if (view.resource) lines.push(`Resource: ${view.resource}`);
   if (view.member) {
     const member = view.member, workspace = member.workspace;
-    lines.push(`${member.name} (${member.persona}): ${member.status}; thread ${member.threadId ?? "none"}`);
+    lines.push(`${member.name} (${member.persona}): ${member.status}; ${member.backend} ${member.model}; thread ${member.threadId ?? "none"}`);
     for (const job of member.jobs) lines.push(`Job ${job.jobId}: ${job.status}${job.reportStatus ? ` (${job.reportStatus})` : ""}${job.summary ? ` — ${job.summary}` : ""}; details: ${job.details}`);
     if (member.jobsOmitted) lines.push(`${member.jobsOmitted} jobs omitted (${member.jobCount} total).`);
     lines.push(`Workspace: ${workspace.path}; base ${workspace.base ?? "none"}; head ${workspace.head ?? "unknown"}; commits since base: ${workspace.commits.join(", ") || "none"}; dirty files: ${workspace.dirtyFiles ?? "unknown"}${workspace.reason ? `; ${workspace.reason}` : ""}`);

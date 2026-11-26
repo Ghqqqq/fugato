@@ -233,7 +233,8 @@ export function createPoller($: EngineInterface, diagnostics?: {
             if (!belongsHere(indexed, entry)) return;
             // A task's missing private result normally means its outcome is
             // unresolved. An index omits that result for every task by design.
-            const job = jobView({ ...indexed, jobClass: undefined },
+            const indexedBackend = indexed.backend ?? (indexed.request && typeof indexed.request === 'object' ? (indexed.request as Record<string, unknown>).backend : undefined) ?? entry.job.backend;
+            const job = jobView({ ...indexed, ...(indexedBackend ? { backend: indexedBackend } : {}), jobClass: undefined },
               { ...entry.marker, summary: clean(indexed.summary).slice(0, 1000) || entry.marker.summary }, false, now);
             if (sessionId(entry.job) !== sessionId(job) && previouslyKnown.has(job.id)) joinedThreads.add(job.id);
             const updated = Date.parse(typeof indexed.updatedAt === 'string' ? indexed.updatedAt : '');
