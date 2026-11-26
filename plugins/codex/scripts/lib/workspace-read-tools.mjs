@@ -165,6 +165,7 @@ function validateGlob(value) {
 }
 
 function sanitizedGitEnv(baseEnv = process.env) {
+  /** @type {Record<string, string | undefined>} */
   const env = { ...baseEnv, GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat", PAGER: "cat" };
   delete env.GIT_EXTERNAL_DIFF;
   delete env.GIT_DIFF_OPTS;
