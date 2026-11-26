@@ -216,10 +216,23 @@ parent. [Question handling](../plugins/codex/scripts/lib/job-runtime.mjs)
 
 Each question shows separately labelled, JSON-quoted fields for the supplied
 arguments, locations and operation details, with control and bidirectional
-formatting characters escaped. A serialized question over 16 KiB is denied
-with `operation-too-large-to-display-exactly`. A request of kind `other` with
-reviewable input can reach Claude. An execution request without a command
-line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/scripts/lib/antigravity.mjs)
+formatting characters escaped. When a diff string in `Operation details` is
+identical to a string value in `Arguments`, the display replaces the duplicate
+with an explicit reference such as `{"sameAs":"Arguments.Content"}` so changed
+text appears once while the binding check still compares the full original
+fields. Questions up to 16 KiB raw UTF-8 bytes are shown inline. Larger
+operations are staged verbatim as `0600` files under
+`<stateDir>/approvals/<jobId>/<sha256>.txt` and presented as a compact card
+under 2 KiB containing the metadata, byte size, `SHA-256` digest and
+`Exact operation` path to read in full before answering. At answer time,
+`Allow once` proceeds only if the original fields are unchanged and the staged
+file still hashes to its recorded SHA-256; otherwise Fugato denies with
+`operation-changed-before-approval`. Operations that cannot be staged or
+represented safely are denied with `operation-too-large-to-display-exactly`. A
+request of kind `other` with reviewable input can reach Claude. An execution
+request without a command line is denied. [`permissionReview` and
+`permissionDecision`](../plugins/codex/scripts/lib/antigravity.mjs) ·
+[Approval artifacts](../plugins/codex/scripts/lib/approval-artifacts.mjs)
 
 Every Gemini worker's parent bridge also exposes three read-only workspace
 tools—`workspace_list`, `workspace_grep` and `workspace_git_read`—scoped to

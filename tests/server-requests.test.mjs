@@ -4,7 +4,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseArgs } from "../plugins/codex/scripts/lib/args.mjs";
 import { CodexAppServerClient } from "../plugins/codex/scripts/lib/app-server.mjs";
-import { normalizeBrowserOrigin, normalizeBrowserOrigins, normalizeBundleId, normalizeBundleIds, decideServerRequest, parseApprovalAnswer, ServerRequestRelay } from "../plugins/codex/scripts/lib/server-requests.mjs";
+import { normalizeBrowserOrigin, normalizeBrowserOrigins, normalizeBundleId, normalizeBundleIds, decideServerRequest, actionApprovalRequest, parseApprovalAnswer, ServerRequestRelay } from "../plugins/codex/scripts/lib/server-requests.mjs";
+import { verifyApprovalArtifact } from "../plugins/codex/scripts/lib/approval-artifacts.mjs";
 import { makeTempDir, initGitRepo, run, requireLocalSockets, readyBroker } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 
@@ -319,4 +320,27 @@ test("a parent's approval answer maps to one of four choices and denies by defau
   for (const answer of ["Allow for this task, not always", "Do not allow this app", "Never allow this app", "allow always", "not always", "always except Chrome", "call or task", "2 but only once", "3 deny", "1.", "task.", "Allow this call..", "ok", "approve", "allow"]) {
     assert.equal(parseApprovalAnswer(answer), "deny", answer);
   }
+});
+
+test("actionApprovalRequest displays up to 16 KiB raw inline and stages larger operations", t => {
+  const dir = makeTempDir("sr-stage-"), repo = path.join(dir, "repo");
+  fs.mkdirSync(repo, { recursive: true }); initGitRepo(repo);
+  const env = { ...process.env, CODEX_COMPANION_HOME: path.join(dir, "isolated") };
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const ctx = { threadId: "t1", turnId: "u1" };
+  const mapped = { mapping: "claude", mode: "default", sandbox: "workspace-write", approvalPolicy: "untrusted", forwardActions: true, cwd: repo };
+  const cmdReq = command => ({ id: "c1", method: "item/commandExecution/requestApproval", params: { ...ctx, itemId: "item-c", startedAtMs: 1, command, cwd: repo } });
+  const inline = actionApprovalRequest(cmdReq("echo " + "a".repeat(3000)), ctx, mapped, null, { workspaceRoot: repo, jobId: "task-sr", env });
+  assert.ok(inline.request && !inline.request.artifact);
+  assert.ok(Buffer.byteLength(inline.request.question, "utf8") <= 16 * 1024);
+  const noJob = actionApprovalRequest(cmdReq("echo " + "b".repeat(20 * 1024)), ctx, mapped);
+  assert.equal(noJob.request, null);
+  assert.equal(noJob.summary.reason, "operation-too-large-to-display-exactly");
+  const staged = actionApprovalRequest(cmdReq("echo " + "b".repeat(20 * 1024)), ctx, mapped, null, { workspaceRoot: repo, jobId: "task-sr", env });
+  assert.ok(staged.request?.artifact);
+  assert.ok(Buffer.byteLength(staged.request.question, "utf8") < 2 * 1024);
+  assert.ok(staged.request.question.includes(`SHA-256: ${staged.request.artifact.sha256}`));
+  assert.ok(staged.request.question.includes(`Exact operation: ${staged.request.artifact.path}`));
+  assert.equal(verifyApprovalArtifact(staged.request.artifact), true);
+  assert.equal(fs.readFileSync(staged.request.artifact.path, "utf8").includes("b".repeat(20 * 1024)), true);
 });

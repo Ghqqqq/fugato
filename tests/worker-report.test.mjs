@@ -7,7 +7,7 @@ import { buildWorkerReport, classifyWorkerOutcome, classifyBrowserBlocker, parse
 import { makeTempDir, run, initGitRepo, waitForCondition, readyBroker } from "./helpers.mjs";
 import { buildEnv, installFakeCodex, lifecycleHarness } from "./fake-codex-fixture.mjs";
 import { splitRawArgumentString } from "../plugins/codex/scripts/lib/args.mjs";
-import { directReport } from "../plugins/codex/scripts/lib/job-runtime.mjs";
+import { directReport, envelopeBytes } from "../plugins/codex/scripts/lib/job-runtime.mjs";
 import { isC2Report } from "../plugins/codex/scripts/lib/report-delivery.mjs";
 import { readJobFile, resolveStateDir, updateJob } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -1950,3 +1950,35 @@ test("direct tasks preserve lease precedence, input forms, run settings and cont
   checkFollow();
 });
 }
+
+test("directReport keeps next for 3.4 KiB action-approval questions while enforcing the 2000-byte envelope elsewhere", () => {
+  const approvalText = "Antigravity requests permission.\n" + "a".repeat(3500) + "\nAllow this operation once?";
+  for (const backend of ["antigravity", "codex"]) {
+    const job = { id: `task-${backend}-3k`, workspaceRoot: process.cwd(),
+      request: { cwd: process.cwd(), ...(backend === "antigravity" ? { backend } : {}) } };
+    const payload = { status: "needs_answer", jobId: job.id,
+      question: { id: "action-approval-1", kind: "action-approval", text: approvalText, options: ["Allow once", "Deny"], expiresAt: Date.now() + 60000 } };
+    const report = directReport(payload, job);
+    assert.equal(report.next, `fugato answer ${job.id} --question 'action-approval-1'`);
+    assert.equal(report.question.text, approvalText);
+    assert.equal(isC2Report(report), true);
+    assert.ok(envelopeBytes(report) <= 2000);
+
+    // Extra envelope fields are still fitted into the 2000-byte budget.
+    const crowded = directReport({ ...payload, blockers: [{ code: "notice", message: "m".repeat(1500) }],
+      keyFindings: Array(10).fill("k".repeat(200)) }, job);
+    assert.equal(crowded.next, `fugato answer ${job.id} --question 'action-approval-1'`);
+    assert.equal(crowded.question.text, approvalText);
+    assert.ok(envelopeBytes(crowded) <= 2000);
+    assert.equal(isC2Report(crowded), true);
+  }
+
+  // Ordinary questions remain strictly inside the 2000-byte envelope.
+  const regular = directReport({ status: "needs_answer", jobId: "task-regular-3k",
+    question: { id: "question-1", kind: "question", text: "q".repeat(3500), options: ["A", "B"], expiresAt: Date.now() + 60000 } },
+  { id: "task-regular-3k", workspaceRoot: process.cwd(), request: { cwd: process.cwd(), backend: "antigravity" } });
+  const { summary, ...envelope } = regular;
+  assert.ok(Buffer.byteLength(JSON.stringify(envelope)) <= 2000);
+  assert.ok(regular.question.text.length < 2000);
+  assert.equal(isC2Report(regular), true);
+});

@@ -11,6 +11,7 @@ import { acquireConcurrency } from "./concurrency.mjs";
 import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
 import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES } from "./workspace-read-tools.mjs";
+import { approvalArtifactDir, stageApprovalArtifact, verifyApprovalArtifact } from "./approval-artifacts.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
 export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
@@ -20,9 +21,11 @@ const cancelledOutcome = () => ({ outcome: { outcome: "cancelled" } });
 const notStarted = error => Object.assign(error, { turnStatus: "notStarted", turnEnded: true });
 const binary = (env = process.env) => env.FUGATO_ANTIGRAVITY_BIN || "agy";
 const INSTALL_HELP = "Install Antigravity CLI, check `agy acp --help`, or set FUGATO_ANTIGRAVITY_BIN to its executable path.";
-// ACP's default mode asks about edits and commands. Edit requests repeat the
-// changed text in the arguments and the diff, so they need more than Codex's 800 bytes.
+// ACP's default mode asks about edits and commands. Inline display covers up to
+// 16 KiB raw UTF-8; larger operations stage exact review artifacts under 2 KiB cards.
 const MAX_APPROVAL_BYTES = 16 * 1024;
+const MAX_STAGED_CARD_BYTES = 2 * 1024;
+const UNSAFE_ARTIFACT_PATH = /[\p{Cf}\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const MAX_UNSUPPORTED_BLOCKERS = 8;
 const changedOperation = { code: "operation-changed-before-approval", message: "Antigravity's operation changed or its arguments disagree." };
 
@@ -255,7 +258,91 @@ function inputCommand(input) {
   return [input?.CommandLine, input?.command, input].find(value => typeof value === "string" && value.trim());
 }
 
-function permissionReview(tool) {
+function argumentStringRefs(input) {
+  const refs = new Map();
+  if (typeof input === "string") {
+    refs.set(input, "Arguments");
+  } else if (isPlainObject(input)) {
+    for (const [key, value] of Object.entries(input)) {
+      if (typeof value === "string" && !refs.has(value)) {
+        const ref = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? `Arguments.${key}` : `Arguments[${JSON.stringify(key)}]`;
+        refs.set(value, ref);
+      }
+    }
+  }
+  return refs;
+}
+
+function displayOperationDetails(content, input) {
+  if (!Array.isArray(content)) return content;
+  const refs = argumentStringRefs(input);
+  if (!refs.size) return content;
+  return content.map(block => {
+    if (!isPlainObject(block) || block.type !== "diff") return block;
+    let changed = false;
+    const next = { ...block };
+    for (const field of ["oldText", "newText"]) {
+      if (typeof block[field] === "string" && refs.has(block[field])) {
+        next[field] = { sameAs: refs.get(block[field]) };
+        changed = true;
+      }
+    }
+    return changed ? next : block;
+  });
+}
+
+function compactApprovalField(label, value, maxBytes = 256) {
+  const encoded = escapeApprovalControls(JSON.stringify(value));
+  if (Buffer.byteLength(encoded, "utf8") <= maxBytes) return `${label}: ${encoded}`;
+  const text = String(value);
+  let clipped = text.slice(0, Math.max(1, Math.floor(maxBytes / 2)));
+  if (/[\uD800-\uDBFF]$/.test(clipped)) clipped = clipped.slice(0, -1);
+  while (clipped.length > 1 && Buffer.byteLength(escapeApprovalControls(JSON.stringify(`${clipped}…`)), "utf8") > maxBytes) {
+    clipped = clipped.slice(0, Math.floor(clipped.length / 2));
+    if (/[\uD800-\uDBFF]$/.test(clipped)) clipped = clipped.slice(0, -1);
+  }
+  return `${label}: ${escapeApprovalControls(JSON.stringify(`${clipped}…`))}`;
+}
+
+function compactApprovalLocations(paths, maxBytes = 512) {
+  if (!paths.length) return null;
+  const full = escapeApprovalControls(JSON.stringify(paths));
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return `Locations: ${full}`;
+  const kept = [];
+  for (const entry of paths) {
+    const remaining = paths.length - kept.length - 1;
+    const candidate = escapeApprovalControls(JSON.stringify([...kept, entry])) + (remaining > 0 ? ` (+${remaining} more)` : "");
+    if (Buffer.byteLength(candidate, "utf8") > maxBytes) break;
+    kept.push(entry);
+  }
+  if (!kept.length) return `Locations: (${paths.length} path${paths.length === 1 ? "" : "s"}; see exact operation file)`;
+  const omitted = paths.length - kept.length;
+  return `Locations: ${escapeApprovalControls(JSON.stringify(kept))}${omitted > 0 ? ` (+${omitted} more)` : ""}`;
+}
+
+function buildStagedApprovalCard(tool, artifact) {
+  if (UNSAFE_ARTIFACT_PATH.test(artifact.path)) return null;
+  const locations = [...new Set([
+    ...(Array.isArray(tool.locations) ? tool.locations : []),
+    ...toolDiffs(tool)
+  ].map(entry => entry?.path).filter(value => typeof value === "string" && value))];
+  const lines = [
+    "Antigravity requests permission (staged; exceeds 16 KiB inline limit).",
+    compactApprovalField("Tool call ID", tool.toolCallId, 160),
+    ...(tool.name != null ? [compactApprovalField("Name", tool.name, 160)] : []),
+    ...(tool.kind != null ? [compactApprovalField("Kind", tool.kind, 160)] : []),
+    ...(locations.length ? [compactApprovalLocations(locations, 512)] : []),
+    `Size: ${artifact.bytes} bytes`,
+    `SHA-256: ${artifact.sha256}`,
+    `Exact operation: ${artifact.path}`,
+    "Read the exact operation file in full before answering.",
+    "Allow this operation once?"
+  ];
+  const card = lines.join("\n");
+  return Buffer.byteLength(card, "utf8") < MAX_STAGED_CARD_BYTES ? card : null;
+}
+
+function permissionReview(tool, staging = null) {
   if (typeof tool?.toolCallId !== "string" || !tool.toolCallId.trim()) return null;
   const input = tool.rawInput;
   const fields = [["Tool call ID", tool.toolCallId], ["Name", tool.name], ["Kind", tool.kind],
@@ -272,15 +359,25 @@ function permissionReview(tool) {
       (typeof input !== "object" || Object.keys(input).length > 0);
     const hasDiff = toolDiffs(tool).some(diff => typeof diff.oldText === "string" || typeof diff.newText === "string");
     if (!hasInput && !hasDiff) return null;
+    const displayFields = fields.map(([label, value]) =>
+      label === "Operation details" ? [label, displayOperationDetails(value, input)] : [label, value]);
     const lines = ["Antigravity requests permission."];
-    for (const [label, value] of fields) {
-      const json = JSON.stringify(value);
-      if (json.length > MAX_APPROVAL_BYTES) return tooLarge;
-      lines.push(`${label}: ${escapeApprovalControls(json)}`);
+    for (const [label, value] of displayFields) {
+      lines.push(`${label}: ${escapeApprovalControls(JSON.stringify(value))}`);
     }
     lines.push("Allow this operation once?");
     const question = lines.join("\n");
-    if (Buffer.byteLength(JSON.stringify(question)) <= MAX_APPROVAL_BYTES) return { question, fields: structuredClone(fields) };
+    if (Buffer.byteLength(question, "utf8") <= MAX_APPROVAL_BYTES) return { question, fields: structuredClone(fields) };
+    if (staging?.stage === false) return { fields: structuredClone(fields) };
+    if (!staging?.workspaceRoot || !staging?.jobId) return tooLarge;
+    let artifact;
+    try {
+      const dir = approvalArtifactDir(staging.workspaceRoot, staging.jobId, staging.env);
+      if (UNSAFE_ARTIFACT_PATH.test(dir)) return tooLarge;
+      artifact = stageApprovalArtifact(staging.workspaceRoot, staging.jobId, question, staging.env);
+    } catch { return tooLarge; }
+    const card = buildStagedApprovalCard(tool, artifact);
+    if (card) return { question: card, fields: structuredClone(fields), artifact };
   } catch (error) {
     // A deeply nested JSON value can exceed the serializer's stack limit.
     if (!(error instanceof RangeError)) throw error;
@@ -288,7 +385,7 @@ function permissionReview(tool) {
   return tooLarge;
 }
 
-async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call, bridge) {
+async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call, bridge, workspaceRoot = null) {
   const choices = Array.isArray(params.options) ? params.options : [];
   const allow = choices.find(value => value?.kind === "allow_once" && typeof value.optionId === "string");
   const controller = new AbortController();
@@ -310,7 +407,8 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
       return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
     let answer = "deny";
-    let review = call && binding.turnId && allow ? permissionReview(call.tool) : null;
+    const staging = workspaceRoot && options.jobId ? { workspaceRoot, jobId: options.jobId, env: options.env } : null;
+    let review = call && binding.turnId && allow ? permissionReview(call.tool, staging) : null;
     if (review?.question && options.onApprovalRequest) {
       const request = { kind: "acp-permission", question: review.question, options: ["Allow once", "Deny"],
         binding: { ...binding }, signal: controller.signal, toolCall: call.tool };
@@ -318,9 +416,9 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
         Promise.resolve().then(() => options.onApprovalRequest(request)).catch(() => "deny"),
         new Promise(resolve => { onCancelled = () => resolve("deny"); controller.signal.addEventListener("abort", onCancelled, { once: true }); })
       ]);
-      // Bind the answer to the displayed values. Status updates and JSON
-      // object key order do not change the operation.
-      if (!controller.signal.aborted && !isDeepStrictEqual(permissionReview(call.tool)?.fields, review.fields)) {
+      // Bind the answer to the displayed values and any staged artifact.
+      if (!controller.signal.aborted && (!isDeepStrictEqual(permissionReview(call.tool, { stage: false })?.fields, review.fields)
+          || (review.artifact && !verifyApprovalArtifact(review.artifact)))) {
         review = changedOperation;
         answer = "deny";
       }
@@ -511,7 +609,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
           // ACP permits ToolCallUpdate here, including only toolCallId. Merge
           // with this session's observed call so approval shows its real scope.
           const call = params.sessionId === threadId && typeof partial?.toolCallId === "string" ? observeTool(tools, partial) : null;
-          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call, parentBridge);
+          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call, parentBridge, cwd);
         }
         if (unsupportedBlockers < MAX_UNSUPPORTED_BLOCKERS) {
           const method = `unrecognized:${createHash("sha256").update(message.method).digest("hex").slice(0, 16)}`;

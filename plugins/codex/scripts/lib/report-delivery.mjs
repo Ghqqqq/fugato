@@ -219,7 +219,7 @@ export function isC2Report(value) {
         || !(q.expiresInSec === null || count(q.expiresInSec))) return false;
   }
   const { summary, ...envelope } = value;
-  if (value.backend === "antigravity" && envelope.question?.kind === "action-approval") {
+  if (envelope.question?.kind === "action-approval") {
     if (Buffer.byteLength(envelope.question.text) > 16 * 1024) return false;
     envelope.question = { ...envelope.question, text: "" };
   }

@@ -332,8 +332,15 @@ function truncate(text, limit) {
   return text.slice(0, end >= 0xd800 && end <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? limit - 1 : limit);
 }
 
+const MAX_ACTION_APPROVAL_BYTES = 16 * 1024;
 const duetTarget = value => /^[\w.-]+$/.test(value) ? value : quote(value);
-export const envelopeBytes = ({ summary, ...envelope }) => Buffer.byteLength(JSON.stringify(envelope));
+export function envelopeBytes({ summary, ...envelope }) {
+  if (envelope.question?.kind === "action-approval" && typeof envelope.question.text === "string"
+      && Buffer.byteLength(envelope.question.text) <= MAX_ACTION_APPROVAL_BYTES) {
+    envelope.question = { ...envelope.question, text: "" };
+  }
+  return Buffer.byteLength(JSON.stringify(envelope));
+}
 const brief = value => truncate(redactActivity(value).replace(/\s+/g, " ").trim(), 240);
 const capturedCheckText = c => `${c.command ?? "command"}: exit ${c.exitCode ?? "unknown"}, ${c.status ?? "unknown"}`;
 const capturedCheckFailed = c => (typeof c.exitCode === "number" && c.exitCode !== 0) || c.status === "failed";
