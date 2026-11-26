@@ -293,9 +293,10 @@ suppresses it for all four mode commands. Ultra/pair/duel reminders name their
 effective role settings. Roundtable names its intensity and roster selection
 and points to role-based persona models.
 Controls do not load protocol text into Claude's context. Tasks use the shared
-[protocol](../plugins/codex/prompts/ultra-codex-protocol.md), selecting shared
-sections plus their own mode section. Its body hash is computed at runtime;
-`status --for-command` reports the current version/path, not a saved literal hash.
+[core protocol](../plugins/codex/prompts/protocol/core.md) plus their active
+mode file (`ultra.md`, `pair.md`, `duel.md` or `roundtable.md`). Each file's
+body hash is computed at runtime; `status --for-command` reports both current
+paths and versions, not saved literal hashes.
 See [state and lifecycle](state-and-retention.md#orchestration-mode-state) for
 schema migration, retained caps, resume/compaction and cleanup.
 
@@ -305,7 +306,7 @@ changed deliverable: scope, complete diff, criteria/evidence, rerun checks,
 assumptions and an explicit verdict. Read-only probes use the lighter evidence
 pass, with adversarial confirmation of decision-driving findings and full
 acceptance for consequential/conflicting claims. Details:
-[acceptance](../plugins/codex/prompts/ultra-codex-protocol.md#accepting-a-result-every-worker-report-no-exceptions).
+[acceptance](../plugins/codex/prompts/protocol/core.md#accepting-a-result-every-worker-report-no-exceptions).
 
 CLI mode controls never take task text or start workers:
 
@@ -339,7 +340,9 @@ command, and `activeMode` reports the actual saved mode/options even if it is
 different. See `fugato models` for the effective role table. Roundtable mode
 status also reports standard persona mappings in `personaModels` with
 per-field values and sources.
-`protocolFile` and `protocolVersion` are always present. Ultra keeps
+`protocolFile` and `protocolVersion` (pointing to the requested mode file) plus
+`protocolCoreFile` and `protocolCoreVersion` (pointing to `core.md`) are always
+present. Ultra keeps
 effective `maxWorkers` (null for unlimited) plus `maxWorkersSetting`. A cross-mode
 `on` adds `replacedMode` and `runningJobs`; `off` reports `wasOn` and running jobs.
 An empty Codex job list says nothing about a duel's Claude participant: Claude
@@ -447,6 +450,16 @@ The opt-in settings `--permission-mapping claude|off`,
 `--agent-memory on|off` and `--max-concurrent <n|off>` all default to `off`.
 Each supports `--dry-run`; see [configuration](configuration.md#claude-permission-mapping-opt-in)
 for examples, grouping rules, the permission mode table and limits.
+
+Additional setup flags (all accept `--cwd <dir>`, `--json`, and `--dry-run` where
+previewable; see [Configuration](configuration.md) and [Antigravity](antigravity.md)):
+
+- Backend check: `--backend antigravity` checks ACP and cached Gemini login without a model prompt.
+- Legacy roleless model defaults: `--default-model <model|default>`, `--default-effort <effort|default>` (alongside `--ultra-routine-model <model|default>`).
+- Sandbox and instructions: `--default-sandbox read-only|workspace-write|danger-full-access`, `--project-docs claude-md|agents-only`.
+- Tool sync: `--sync-tools`, `--profile chrome|codex-app`, `--replace-cua`, `--cua-template <file>`, `--chatgpt-resources <dir>`.
+- Browser and transport: `--browser-approval never-ask|ask`, `--allow-browser-origin <origin>`, `--revoke-browser-origin <origin>`, `--list-browser-origins`, `--transport http|websocket|status`.
+- Computer Use apps: `--computer-use-approval mirror|ask`, `--allow-computer-app <bundle-id>`, `--revoke-computer-app <bundle-id>`, `--list-computer-apps`.
 For a desktop-managed CLI, setup includes `codex.warning` with code
 `desktop_managed_codex_runtime` and a message, also shown in human next steps.
 The warning can appear while `ready` is true and never changes the selected pin.

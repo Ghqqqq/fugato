@@ -30,7 +30,7 @@ import { startRun, useRun, addEntry, closeRun, showRun, listRuns, renderRun, val
 import { recordFinishedJob, recordedThreadJobs, uniqueTurnAttribution } from "./lib/job-runtime.mjs";
 import { listSessionJobs, updateJob, unresolvedTask, withoutPrivateActivity } from "./lib/state.mjs";
 import { markReportEmitted } from "./lib/report-delivery.mjs";
-import { clearMode, effectiveMaxWorkers, formatRoleSummary, modeFile, PAIR_MAX_REWORK_ROUNDS, PROTOCOL_PATH, protocolVersion, readMode, setMode, validateRoundtableOptions } from "./lib/ultra-codex-mode.mjs";
+import { clearMode, effectiveMaxWorkers, formatRoleSummary, modeFile, PAIR_MAX_REWORK_ROUNDS, protocolParts, readMode, setMode, validateRoundtableOptions } from "./lib/ultra-codex-mode.mjs";
 import { snapshotWorkspace, compareWorkspaceSnapshots, workspaceChangeAttribution } from "./lib/workspace-changes.mjs";
 import fs from "node:fs";
 import path from "node:path";
@@ -3430,11 +3430,20 @@ function renderOrchestrationMode(activeMode, requestedName) {
 function modeSummary(mode) {
   return mode ? { name: mode.name, options: mode.options, since: mode.since } : null;
 }
+function protocolPayloadFields(modeName) {
+  const [core, modePart] = protocolParts(modeName);
+  return {
+    protocolFile: modePart.file,
+    protocolVersion: modePart.version,
+    protocolCoreFile: core.file,
+    protocolCoreVersion: core.version
+  };
+}
 function modePayload(activeMode, requestedName, sessionId) {
   const selected = activeMode?.name === requestedName;
   return {
     mode: selected ? "on" : "off", modeName: requestedName, sessionId, activeMode: modeSummary(activeMode),
-    protocolFile: PROTOCOL_PATH, protocolVersion: protocolVersion(),
+    ...protocolPayloadFields(requestedName),
     ...(selected ? { since: activeMode.since } : {}),
     ...(selected && requestedName === "ultra" ? { scale: activeMode.options.scale, maxWorkers: effectiveMaxWorkers(activeMode.options.maxWorkers), maxWorkersSetting: activeMode.options.maxWorkers } : {})
   };
@@ -3473,7 +3482,7 @@ async function handleOrchestrationMode(argv, modeName) {
     const payload = { ...modePayload(mode, modeName, sessionId), defaultMode, models, ...(personaModels ? { personaModels } : {}),
       ...(modeName === "roundtable" && !options["for-command"] ? { latestRoom, attentionCount: latestRoom?.attention.length ?? 0 } : {}) };
     const preamble = options["for-command"]
-      ? `Usage: /fugato:${verb} ${usage}\nIf the arguments describe a task, Read ${PROTOCOL_PATH} (protocol v${payload.protocolVersion}) before orchestrating; otherwise do not read it.\nFor this task, apply the shared sections and "${heading}" only. Task-prefix options override saved options; a one-shot task leaves the session mode unchanged.\n`
+      ? `Usage: /fugato:${verb} ${usage}\nIf the arguments describe a task, Read both ${payload.protocolCoreFile} (core v${payload.protocolCoreVersion}) and ${payload.protocolFile} (${modeName} v${payload.protocolVersion}) before orchestrating; otherwise do not read them.\nFor this task, apply the core protocol and "${heading}". Task-prefix options override saved options; a one-shot task leaves the session mode unchanged.\n`
       : "";
     const defaultLine = defaultMode === "off" ? "" : `default mode: ${defaultMode} (fugato setup --default-mode)\n`;
     const modelLine = personaModels ? `persona models: ${Object.entries(personaModels).map(([id, entry]) => `${id} ${entry.model.value}/${entry.effort.value}`).join(", ")}`
@@ -3516,7 +3525,7 @@ async function handleOrchestrationMode(argv, modeName) {
   const wasOn = previous?.name === modeName && clearMode(workspaceRoot, sessionId);
   const activeMode = wasOn ? null : previous;
   const running = modeRunningJobs(workspaceRoot, sessionId);
-  const payload = { mode: "off", modeName, sessionId, wasOn, activeMode: modeSummary(activeMode), protocolFile: PROTOCOL_PATH, protocolVersion: protocolVersion(), runningJobs: running };
+  const payload = { mode: "off", modeName, sessionId, wasOn, activeMode: modeSummary(activeMode), ...protocolPayloadFields(modeName), runningJobs: running };
   const lines = [
     ...(activeMode ? [`${label} mode was already off for this session. Active mode ${activeMode.name} is unchanged.`, renderOrchestrationMode(activeMode, activeMode.name)] : [
       wasOn ? `${label} mode: off. Orchestration has ended for this session.` : `${label} mode was already off for this session.`,

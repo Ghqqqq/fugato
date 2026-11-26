@@ -8,12 +8,18 @@ import { INTENSITIES, PERSONA_IDS } from "./roundtable-personas.mjs";
 
 // One orchestration mode per Claude session, shared across workspaces. Keep
 // the ultra-codex directory and module path for compatibility with old sessions.
-export const PROTOCOL_PATH = fileURLToPath(new URL("../../prompts/ultra-codex-protocol.md", import.meta.url));
+export const PROTOCOL_DIR = fileURLToPath(new URL("../../prompts/protocol", import.meta.url));
 export const ULTRA_SCALES = ["auto", "quick", "thorough"];
 export const DEFAULT_MAX_WORKERS = "auto";
 export const PAIR_MAX_REWORK_ROUNDS = 2;
 export const DEFAULT_DUEL_ROUNDS = 3;
 export const MODE_NAMES = ["ultra", "pair", "duel", "roundtable"];
+export const PROTOCOL_PARTS = ["core", ...MODE_NAMES];
+export function protocolFile(part = "core", dir = PROTOCOL_DIR) {
+  if (!PROTOCOL_PARTS.includes(part)) throw new Error(`Protocol part must be one of: ${PROTOCOL_PARTS.join(", ")}.`);
+  return path.join(dir, `${part}.md`);
+}
+export const PROTOCOL_PATH = protocolFile("core");
 const MODE_DIR = "ultra-codex";
 const SESSION_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
 const COMMAND_PROMPT = /^\s*\/(?:fugato:)?(?:ultra-codex|pair|duel|roundtable)(?=\s|$)/;
@@ -163,9 +169,22 @@ export function isModeCommandPrompt(prompt) {
 
 // Exclude only the version line to avoid a self-referential hash. Tests pin the
 // checked-in header to the body; runtime callers always hash the current text.
+const PROTOCOL_HEADER = /^<!-- (?:Fugato protocol (?:core|ultra|pair|duel|roundtable)|Ultra-codex protocol) v[0-9a-f]{8} -->\r?\n/;
+export function protocolHeader(part, version) {
+  if (!PROTOCOL_PARTS.includes(part)) throw new Error(`Protocol part must be one of: ${PROTOCOL_PARTS.join(", ")}.`);
+  return `<!-- Fugato protocol ${part} v${version} -->`;
+}
 export function protocolVersion(text = fs.readFileSync(PROTOCOL_PATH, "utf8")) {
-  const body = text.replace(/^<!-- Ultra-codex protocol v[0-9a-f]{8} -->\r?\n/, "");
+  const body = text.replace(PROTOCOL_HEADER, "");
   return createHash("sha256").update(body).digest("hex").slice(0, 8);
+}
+export function protocolParts(modeName, dir = PROTOCOL_DIR) {
+  if (!MODE_NAMES.includes(modeName)) throw new Error("Mode must be ultra, pair, duel or roundtable.");
+  return ["core", modeName].map(part => {
+    const file = protocolFile(part, dir);
+    const version = protocolVersion(fs.readFileSync(file, "utf8"));
+    return { part, file, version, header: protocolHeader(part, version) };
+  });
 }
 
 export const BUILTIN_WORKER_DEFAULTS = Object.freeze({ model: "gpt-6-astra", effort: "xhigh", routineModel: "gpt-6.1-sol" });
@@ -200,10 +219,10 @@ export function formatRoleSummary(table) {
 // What the UserPromptSubmit hook adds to the prompt while the mode is on.
 // Short on purpose: it is paid on every prompt. The protocol itself is read
 // only when its current version is absent (including after compaction).
-export function reminderText(mode, protocolPath = PROTOCOL_PATH, table) {
-  const version = protocolVersion(fs.readFileSync(protocolPath, "utf8"));
+export function reminderText(mode, protocolDir = PROTOCOL_DIR, table) {
   const name = mode.name ?? "ultra", options = mode.options ?? mode;
-  const suffix = `v${version} to substantive tasks; re-read ${protocolPath} unless its full text (first line: <!-- Ultra-codex protocol v${version} -->) is already in context from an earlier Read. Reminder/preamble version mentions do not count.`;
+  const [core, active] = protocolParts(name, protocolDir);
+  const suffix = `core v${core.version} + ${active.part} v${active.version} to substantive tasks; re-read ${core.file} (first line: ${core.header}) and ${active.file} (first line: ${active.header}) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.`;
   if (name === "roundtable") return `Roundtable mode on (intensity ${options.intensity}, roles ${options.roles?.join(",") ?? "recommend roster for confirmation"}; persona models from role table with room and saved persona overrides). Apply Roundtable mode protocol ${suffix}`;
   if (name === "pair" || name === "duel") {
     const ids = name === "pair" ? ["implement", "verify"] : ["implement", "verify", "architect"];
