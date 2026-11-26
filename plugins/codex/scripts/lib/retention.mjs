@@ -2,8 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
-import { resolveStateRoot, resolveStateDirForRoot, removeJobsFromState, unresolvedTask } from "./state.mjs";
+import { resolveStateRoot, resolveStateDirForRoot, removeJobsFromState, unresolvedTask, withJournalLock } from "./state.mjs";
 import { spawnOwned } from "./process.mjs";
 import { inertIndexlessWorkspace } from "./indexless-state.mjs";
 import { resolveSessionMarkersRoot, planSessionMarkers, pruneSessionMarkers } from "./session-markers.mjs";
@@ -13,6 +14,8 @@ import { ensureBrokerSession } from "./broker-lifecycle.mjs";
 import { CLAUDE_MEMORY_DIR, planClaudeSnapshots, pruneClaudeSnapshots } from "./claude-memory.mjs";
 import { planClaudeImports, sweepClaudeImports } from "./claude-session-transfer.mjs";
 import { planAgentNames, pruneAgentNames } from "./agent-names.mjs";
+import { memberWorkspaceStatus } from "./roundtable-workspaces.mjs";
+import { PERSONA_IDS } from "./roundtable-personas.mjs";
 
 const DAY = 86400000;
 const INTERVAL = 12 * 60 * 60 * 1000;
@@ -20,15 +23,28 @@ const RECONCILE_LIMIT = 5;
 const MAINTENANCE_BUDGET_MS = 5000;
 const LOST_TURN_GRACE_MS = 30 * 60 * 1000;
 const LEASE_MARGIN_MS = 60 * 1000;
+const ADMISSION_LOCK_GRACE_MS = 60 * 1000;
+const ROOM_LOCK_TIMEOUT_MS = 200;
+const GIT_TIMEOUT_MS = 10000;
 const CONTEXT = Symbol("retentionContext");
 const active = job => ["queued", "running"].includes(job.status);
 const safeId = id => typeof id === "string" && /^[A-Za-z0-9_-]+$/.test(id);
+const ROOM_ID_PATTERN = /^rt-[a-z0-9]+-[a-z0-9-]+$/;
+const LOCK_OWNER_PATTERN = /^owner-(\d+)-[a-f0-9-]+$/;
+const ADMISSION_LOCK_PATTERN = /^[^.].*\.lock$/;
+const ADMISSION_CANDIDATE_PATTERN = /^([^.].*\.lock)\.(owner-(\d+)-[a-f0-9-]+)$/;
+const APPROVAL_JOB_ID_PATTERN = /^[A-Za-z0-9_-]{1,120}$/;
+const APPROVAL_FILE_PATTERN = /^[0-9a-f]{64}\.txt$/;
 const errorEntry = (scope, error) => ({ ...scope, message: error instanceof Error ? error.message : String(error) });
 const RETAIN_ARTIFACT_PATHS = "RETAIN_ARTIFACT_PATHS";
 const artifactPathRetention = () => Object.assign(new Error("Noncanonical artifact paths; retaining job."), { code: RETAIN_ARTIFACT_PATHS });
 function alive(pid) {
   if (!Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; } catch (error) { return error.code !== "ESRCH"; }
+}
+function deadPid(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return false; } catch (error) { return error.code === "ESRCH"; }
 }
 function integer(value) {
   if (!["string", "number"].includes(typeof value) || String(value).trim() === "") return null;
@@ -460,6 +476,392 @@ function inspectThreads(env, cutoff, referenced) {
   return { threads, errors };
 }
 
+function recordRoomRetention(retained, roomId, roomDir, reason) {
+  if (!reason) return;
+  const existing = retained.find(item => item.roomId === roomId && item.path === roomDir);
+  if (existing) existing.reason = reason;
+  else retained.push({ roomId, path: roomDir, reason });
+}
+function validateRoom(room, roomId) {
+  if (!room || typeof room !== "object" || Array.isArray(room) || room.version !== 1 || room.roomId !== roomId ||
+      typeof room.workspaceRoot !== "string" || !path.isAbsolute(room.workspaceRoot) ||
+      !["open", "paused", "closed"].includes(room.status) ||
+      !Array.isArray(room.members) || !room.members.length || room.members.length > 6 ||
+      new Set(room.members.map(member => member?.name)).size !== room.members.length) {
+    throw new Error("Invalid roundtable room record.");
+  }
+  if (room.status === "closed" ? (typeof room.closedAt !== "string" || !Number.isFinite(Date.parse(room.closedAt)))
+      : (room.closedAt !== null && (typeof room.closedAt !== "string" || !Number.isFinite(Date.parse(room.closedAt))))) {
+    throw new Error("Invalid roundtable closedAt timestamp.");
+  }
+  for (const member of room.members) {
+    if (!member || typeof member !== "object" || !PERSONA_IDS.includes(member.persona) || member.name !== member.persona) {
+      throw new Error("Invalid roundtable member record.");
+    }
+    if (member.workspace !== undefined) {
+      const ws = member.workspace;
+      if (!ws || typeof ws !== "object" || typeof ws.path !== "string" || !path.isAbsolute(ws.path) ||
+          typeof ws.shared !== "boolean" || (ws.shared ? ws.base !== null : typeof ws.base !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(ws.base))) {
+        throw new Error("Invalid roundtable member workspace record.");
+      }
+    }
+  }
+  return room;
+}
+function hasLiveLock(lockDir) {
+  const stat = fs.lstatSync(lockDir, { throwIfNoEntry: false });
+  if (!stat) return false;
+  if (!stat.isDirectory()) throw new Error(`Roundtable lock must not be a symlink: ${lockDir}`);
+  for (const name of fs.readdirSync(lockDir)) {
+    const match = LOCK_OWNER_PATTERN.exec(name);
+    if (!match || !deadPid(Number(match[1]))) return true;
+  }
+  return false;
+}
+function treeBytes(directory) {
+  let bytes = 0;
+  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    const target = path.join(directory, entry.name);
+    if (entry.isSymbolicLink()) continue;
+    if (entry.isDirectory()) bytes += treeBytes(target);
+    else if (entry.isFile()) bytes += fs.lstatSync(target).size;
+  }
+  return bytes;
+}
+function worktreeRetentionReason(member, status) {
+  const details = [];
+  if (status.commits?.length) details.push(`${status.commits.length} commit(s) beyond base`);
+  if (status.dirtyFiles > 0) details.push(`${status.dirtyFiles} dirty/untracked/ignored file(s)`);
+  if (!details.length) details.push(status.hasChanges === true ? "changes beyond base" : `unknown status${status.reason ? ` (${status.reason})` : ""}`);
+  return `member ${member.name} worktree ${status.path} has ${details.join(" and ")}`;
+}
+function inspectRoom(roomDir, roomId, cutoff, env, { locked = false } = {}) {
+  realDirectory(roomDir);
+  if (!locked && hasLiveLock(path.join(roomDir, ".state-lock"))) return { status: "locked", reason: "room is locked" };
+  for (const entry of fs.readdirSync(roomDir, { withFileTypes: true })) {
+    const target = path.join(roomDir, entry.name);
+    if (entry.isSymbolicLink()) throw new Error(`Unsafe symlink in roundtable room: ${target}`);
+    if (entry.isDirectory() && !["worktrees", ".state-lock"].includes(entry.name)) throw new Error(`Unexpected directory in roundtable room: ${target}`);
+  }
+  const room = readJson(path.join(roomDir, "room.json"));
+  if (!room) throw new Error("Missing roundtable room.json.");
+  validateRoom(room, roomId);
+  if (room.status !== "closed" || Date.parse(room.closedAt) >= cutoff) return { status: "keep", room, reason: null };
+  regularStat(path.join(roomDir, "events.jsonl"));
+  const worktreesDir = path.join(roomDir, "worktrees");
+  if (fs.lstatSync(worktreesDir, { throwIfNoEntry: false })) {
+    realDirectory(worktreesDir);
+    const owned = new Set(room.members.filter(member => member.workspace && !member.workspace.shared).map(member => member.persona));
+    for (const entry of fs.readdirSync(worktreesDir, { withFileTypes: true })) {
+      const entryPath = path.join(worktreesDir, entry.name);
+      if (entry.isSymbolicLink() || !entry.isDirectory()) {
+        const member = room.members.find(item => item.persona === entry.name);
+        if (member) return { status: "retain", room, reason: `member ${member.name} worktree ${entryPath} is unsafe (symlink or not a directory)` };
+        throw new Error(`Unsafe entry in roundtable worktrees: ${entryPath}`);
+      }
+      if (!owned.has(entry.name)) throw new Error(`Unexpected worktree directory in roundtable room: ${entryPath}`);
+    }
+  }
+  const cleanWorktrees = [];
+  for (const member of room.members) {
+    const status = memberWorkspaceStatus(room, member, env);
+    if (status.shared || status.missing) continue;
+    if (status.hasChanges !== false) return { status: "retain", room, reason: worktreeRetentionReason(member, status) };
+    cleanWorktrees.push({ member, path: status.path });
+  }
+  let bytes = 0;
+  for (const entry of fs.readdirSync(roomDir, { withFileTypes: true })) {
+    if (entry.name === ".state-lock") continue;
+    const target = path.join(roomDir, entry.name);
+    if (entry.isDirectory()) bytes += treeBytes(target);
+    else if (entry.isFile()) bytes += fs.lstatSync(target).size;
+  }
+  return { status: "eligible", room, bytes, cleanWorktrees };
+}
+function planRooms(cutoff, { env = process.env } = {}) {
+  const rooms = [], roomsRetained = [], errors = [];
+  const root = path.join(resolveIsolatedCodexHome(env), "duet", "roundtables");
+  try {
+    if (!fs.lstatSync(root, { throwIfNoEntry: false })) return { rooms, roomsRetained, errors };
+    realDirectory(root);
+    for (const entry of fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const roomDir = path.join(root, entry.name);
+      try {
+        if (entry.isSymbolicLink() || !entry.isDirectory()) throw new Error(`Unsafe roundtable room directory (symlink or not a directory): ${roomDir}`);
+        if (entry.name.length > 128 || !ROOM_ID_PATTERN.test(entry.name)) throw new Error(`Invalid roundtable room directory name: ${entry.name}`);
+        const inspected = inspectRoom(roomDir, entry.name, cutoff, env);
+        if (inspected.status === "eligible") rooms.push({ roomId: entry.name, path: roomDir, closedAt: inspected.room.closedAt, bytes: inspected.bytes });
+        else if (inspected.status === "retain") recordRoomRetention(roomsRetained, entry.name, roomDir, inspected.reason);
+        else if (inspected.status === "locked") {
+          recordRoomRetention(roomsRetained, entry.name, roomDir, inspected.reason);
+          errors.push(errorEntry({ scope: "roundtables", roomId: entry.name, path: roomDir }, new Error("Roundtable room is locked; skipping.")));
+        }
+      } catch (error) {
+        recordRoomRetention(roomsRetained, entry.name, roomDir, error.message);
+        errors.push(errorEntry({ scope: "roundtables", roomId: entry.name, path: roomDir }, error));
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") errors.push(errorEntry({ scope: "roundtables", path: root }, error));
+  }
+  return { rooms, roomsRetained, errors };
+}
+function removeCleanWorktree(workspaceRoot, worktreePath, env) {
+  // No --force: Git refuses dirty, untracked or locked worktrees.
+  const result = spawnSync("git", ["worktree", "remove", "--", worktreePath], {
+    cwd: workspaceRoot, env: { ...env, GIT_OPTIONAL_LOCKS: "0" },
+    encoding: "utf8", shell: false, windowsHide: true,
+    maxBuffer: 8 * 1024 * 1024, timeout: GIT_TIMEOUT_MS, killSignal: "SIGKILL"
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`git worktree remove failed: ${(result.stderr || result.stdout || "").trim() || `exit ${result.status}`}`);
+}
+function pruneRooms(candidates, cutoff, { env = process.env } = {}) {
+  const report = { roomsDeleted: 0, bytesFreed: 0, roomsRetained: [], errors: [] };
+  if (!candidates.length) return report;
+  const root = path.join(resolveIsolatedCodexHome(env), "duet", "roundtables");
+  for (const candidate of candidates) {
+    const roomId = candidate.roomId, roomDir = candidate.path;
+    try {
+      realDirectory(root);
+      if (typeof roomId !== "string" || roomId.length > 128 || !ROOM_ID_PATTERN.test(roomId) || path.dirname(roomDir) !== root || path.basename(roomDir) !== roomId) {
+        throw new Error("Roundtable room is outside the roundtables root.");
+      }
+      if (!fs.lstatSync(roomDir, { throwIfNoEntry: false })) continue;
+      realDirectory(roomDir);
+      const lockStat = fs.lstatSync(path.join(roomDir, ".state-lock"), { throwIfNoEntry: false });
+      if (lockStat && !lockStat.isDirectory()) throw new Error("Roundtable lock must not be a symlink.");
+      withJournalLock(roomDir, () => {
+        const inspected = inspectRoom(roomDir, roomId, cutoff, env, { locked: true });
+        if (inspected.status === "keep") {
+          if (inspected.room.status !== "closed") recordRoomRetention(report.roomsRetained, roomId, roomDir, `room status changed to ${inspected.room.status}`);
+          return;
+        }
+        if (inspected.status === "retain") {
+          recordRoomRetention(report.roomsRetained, roomId, roomDir, inspected.reason);
+          return;
+        }
+        for (const worktree of inspected.cleanWorktrees) {
+          try { removeCleanWorktree(inspected.room.workspaceRoot, worktree.path, env); }
+          catch (error) {
+            const reason = `member ${worktree.member.name} worktree ${worktree.path} removal failed (${error.message})`;
+            recordRoomRetention(report.roomsRetained, roomId, roomDir, reason);
+            report.errors.push(errorEntry({ scope: "roundtables", roomId, path: roomDir }, new Error(reason)));
+            return;
+          }
+        }
+        const worktreesDir = path.join(roomDir, "worktrees");
+        if (fs.lstatSync(worktreesDir, { throwIfNoEntry: false })) fs.rmdirSync(worktreesDir);
+        fs.rmSync(roomDir, { recursive: true });
+        report.roomsDeleted += 1;
+        report.bytesFreed += inspected.bytes;
+      }, { lockTimeoutMs: ROOM_LOCK_TIMEOUT_MS });
+    } catch (error) {
+      if (error.code === "ENOENT") continue;
+      recordRoomRetention(report.roomsRetained, roomId, roomDir, error.message);
+      report.errors.push(errorEntry({ scope: "roundtables", roomId, path: roomDir }, error));
+    }
+  }
+  return report;
+}
+function inspectAdmissionEntry(target, name, graceCutoff) {
+  const isLock = ADMISSION_LOCK_PATTERN.test(name);
+  const candidateMatch = isLock ? null : ADMISSION_CANDIDATE_PATTERN.exec(name);
+  if (!isLock && !candidateMatch) return null;
+  const stat = fs.lstatSync(target, { throwIfNoEntry: false });
+  if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return null;
+  if (fs.realpathSync(target) !== target) return null;
+  if (candidateMatch && !deadPid(Number(candidateMatch[3]))) return null;
+  const entries = fs.readdirSync(target, { withFileTypes: true });
+  const markers = [];
+  let bytes = 0;
+  for (const entry of entries) {
+    const match = LOCK_OWNER_PATTERN.exec(entry.name);
+    if (!match || !deadPid(Number(match[1]))) return null;
+    const file = path.join(target, entry.name);
+    const fileStat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!fileStat || fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.mtimeMs >= graceCutoff) return null;
+    bytes += fileStat.size;
+    markers.push({ path: file, bytes: fileStat.size });
+  }
+  if (!entries.length && stat.mtimeMs >= graceCutoff) return null;
+  return { path: target, kind: isLock ? "lock" : "candidate", bytes, markers };
+}
+function planAdmissionLocks(now, { env = process.env } = {}) {
+  const admissionLocks = [], errors = [];
+  const root = path.join(resolveIsolatedCodexHome(env), "duet", "antigravity-session-admission");
+  const graceCutoff = now - ADMISSION_LOCK_GRACE_MS;
+  try {
+    if (!fs.lstatSync(root, { throwIfNoEntry: false })) return { admissionLocks, errors };
+    realDirectory(root);
+    for (const entry of fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const target = path.join(root, entry.name);
+      try {
+        const inspected = inspectAdmissionEntry(target, entry.name, graceCutoff);
+        if (inspected) admissionLocks.push({ path: inspected.path, kind: inspected.kind, bytes: inspected.bytes });
+      } catch (error) {
+        if (error.code !== "ENOENT") errors.push(errorEntry({ scope: "antigravity-session-admission", path: target }, error));
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") errors.push(errorEntry({ scope: "antigravity-session-admission", path: root }, error));
+  }
+  return { admissionLocks, errors };
+}
+function pruneAdmissionLocks(candidates, now, { env = process.env } = {}) {
+  const report = { admissionLocksDeleted: 0, bytesFreed: 0, errors: [] };
+  if (!candidates.length) return report;
+  const root = path.join(resolveIsolatedCodexHome(env), "duet", "antigravity-session-admission");
+  const graceCutoff = now - ADMISSION_LOCK_GRACE_MS;
+  for (const candidate of candidates) {
+    const target = candidate.path, name = path.basename(target);
+    try {
+      realDirectory(root);
+      if (path.dirname(target) !== root) throw new Error("Admission lock is outside antigravity-session-admission.");
+      const inspected = inspectAdmissionEntry(target, name, graceCutoff);
+      if (!inspected) continue;
+      let freed = 0;
+      for (const marker of inspected.markers) {
+        try {
+          const stat = fs.lstatSync(marker.path);
+          if (!stat.isFile() || stat.mtimeMs >= graceCutoff) continue;
+          fs.unlinkSync(marker.path);
+          freed += stat.size;
+        } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      try {
+        fs.rmdirSync(target);
+        report.admissionLocksDeleted += 1;
+        report.bytesFreed += freed;
+      } catch (error) {
+        report.bytesFreed += freed;
+        if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) throw error;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") report.errors.push(errorEntry({ scope: "antigravity-session-admission", path: target }, error));
+    }
+  }
+  return report;
+}
+function workspaceJobIds(workspace, { cache = null } = {}) {
+  realDirectory(workspace);
+  if (fs.existsSync(path.join(workspace, ".state-lock"))) return null;
+  const migration = readJson(path.join(workspace, ".legacy-migration.json"));
+  if (migration?.pending?.length) return null;
+  if (fs.lstatSync(path.join(workspace, "state.json"), { throwIfNoEntry: false })) {
+    return new Set(workspaceRecords(workspace, { cache }).keys());
+  }
+  const ids = new Set();
+  const jobsDir = path.join(workspace, "jobs");
+  try {
+    realDirectory(jobsDir);
+    for (const entry of fs.readdirSync(jobsDir, { withFileTypes: true })) {
+      if (!entry.name.endsWith(".json") || entry.name.endsWith(".result.json") || entry.name.endsWith(".steering.json")) continue;
+      const id = entry.name.slice(0, -5);
+      if (safeId(id)) ids.add(id);
+    }
+  } catch (error) { if (error.code !== "ENOENT") return null; }
+  return ids;
+}
+function inspectApprovalJobDir(jobDir, cutoff, deletedByPass) {
+  realDirectory(jobDir);
+  const dirStat = fs.lstatSync(jobDir);
+  const files = [];
+  let bytes = 0, newest = null;
+  for (const entry of fs.readdirSync(jobDir, { withFileTypes: true })) {
+    const file = path.join(jobDir, entry.name);
+    if (!APPROVAL_FILE_PATTERN.test(entry.name)) throw new Error(`Unexpected entry in approval artifacts directory: ${file}`);
+    const stat = fs.lstatSync(file);
+    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Unsafe entry in approval artifacts directory: ${file}`);
+    bytes += stat.size;
+    newest = newest === null ? stat.mtimeMs : Math.max(newest, stat.mtimeMs);
+    files.push({ path: file, bytes: stat.size, mtimeMs: stat.mtimeMs });
+  }
+  if (!deletedByPass && (newest ?? dirStat.mtimeMs) >= cutoff) return null;
+  return { files, bytes };
+}
+function planApprovalDirs(cutoff, plannedJobs, { env = process.env, cache = null } = {}) {
+  const approvalDirs = [], errors = [], plannedByWorkspace = new Map();
+  for (const job of plannedJobs) {
+    const set = plannedByWorkspace.get(job.workspace) ?? new Set();
+    set.add(job.jobId); plannedByWorkspace.set(job.workspace, set);
+  }
+  const root = resolveStateRoot(env);
+  try {
+    if (!fs.lstatSync(root, { throwIfNoEntry: false })) return { approvalDirs, errors };
+    realDirectory(root);
+    for (const entry of fs.readdirSync(root, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      if ([RUN_SESSIONS_DIR, CLAUDE_MEMORY_DIR].includes(entry.name) || entry.isSymbolicLink() || !entry.isDirectory()) continue;
+      const workspace = path.join(root, entry.name), approvalsDir = path.join(workspace, "approvals");
+      if (!fs.lstatSync(approvalsDir, { throwIfNoEntry: false })) continue;
+      let existingIds;
+      try { existingIds = workspaceJobIds(workspace, { cache }); } catch { continue; }
+      if (!existingIds) continue;
+      const deletedIds = plannedByWorkspace.get(workspace) ?? new Set();
+      try {
+        realDirectory(approvalsDir);
+        for (const item of fs.readdirSync(approvalsDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+          const jobDir = path.join(approvalsDir, item.name);
+          try {
+            if (item.isSymbolicLink() || !item.isDirectory() || !APPROVAL_JOB_ID_PATTERN.test(item.name)) {
+              throw new Error(`Unsafe or unexpected approval artifacts entry: ${jobDir}`);
+            }
+            const deletedByPass = deletedIds.has(item.name);
+            if (!deletedByPass && existingIds.has(item.name)) continue;
+            const inspected = inspectApprovalJobDir(jobDir, cutoff, deletedByPass);
+            if (inspected) approvalDirs.push({ workspace, jobId: item.name, path: jobDir, reason: deletedByPass ? "deleted-job" : "orphan", bytes: inspected.bytes });
+          } catch (error) {
+            if (error.code !== "ENOENT") errors.push(errorEntry({ scope: "approvals", workspace, jobId: item.name, path: jobDir }, error));
+          }
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") errors.push(errorEntry({ scope: "approvals", workspace, path: approvalsDir }, error));
+      }
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") errors.push(errorEntry({ scope: "approvals", path: root }, error));
+  }
+  return { approvalDirs, errors };
+}
+function pruneApprovalDirs(candidates, cutoff, deletedJobKeys, { env = process.env, cache = null } = {}) {
+  const report = { approvalDirsDeleted: 0, bytesFreed: 0, errors: [] };
+  if (!candidates.length) return report;
+  const root = resolveStateRoot(env);
+  for (const candidate of candidates) {
+    const { workspace, jobId, path: jobDir } = candidate, approvalsDir = path.join(workspace, "approvals");
+    try {
+      realDirectory(root);
+      if (path.dirname(workspace) !== root || !APPROVAL_JOB_ID_PATTERN.test(jobId) || path.dirname(jobDir) !== approvalsDir || path.basename(jobDir) !== jobId) {
+        throw new Error("Approval artifacts directory is outside its workspace state dir.");
+      }
+      if (!fs.lstatSync(jobDir, { throwIfNoEntry: false })) continue;
+      realDirectory(workspace); realDirectory(approvalsDir);
+      const existingIds = workspaceJobIds(workspace, { cache });
+      if (!existingIds) throw new Error("Workspace state is locked or pending migration; retaining approval artifacts.");
+      if (existingIds.has(jobId)) continue;
+      const key = `${workspace}\0${jobId}`;
+      if (candidate.reason === "deleted-job" && !deletedJobKeys.has(key)) continue;
+      const inspected = inspectApprovalJobDir(jobDir, cutoff, deletedJobKeys.has(key));
+      if (!inspected) continue;
+      let freed = 0;
+      for (const file of inspected.files) {
+        try {
+          const stat = fs.lstatSync(file.path);
+          if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`Unsafe entry in approval artifacts directory: ${file.path}`);
+          fs.unlinkSync(file.path); freed += stat.size;
+        } catch (error) { if (error.code !== "ENOENT") throw error; }
+      }
+      try { fs.rmdirSync(jobDir); report.approvalDirsDeleted += 1; report.bytesFreed += freed; }
+      catch (error) { report.bytesFreed += freed; if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) throw error; }
+      try { fs.rmdirSync(approvalsDir); }
+      catch (error) { if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) throw error; }
+    } catch (error) {
+      if (error.code !== "ENOENT") report.errors.push(errorEntry({ scope: "approvals", workspace, jobId, path: jobDir }, error));
+    }
+  }
+  return report;
+}
+
 export function planRetention({ now = Date.now(), days, env = process.env } = {}) {
   const policy = retentionPolicy(env, days), cutoffMs = Number(new Date(now)) - policy.days * DAY;
   if (!Number.isFinite(cutoffMs) || !Number.isFinite(new Date(cutoffMs).getTime())) throw new Error("Invalid retention date or period.");
@@ -487,14 +889,18 @@ export function planRetention({ now = Date.now(), days, env = process.env } = {}
   const snapshots = planClaudeSnapshots(cutoffMs, { env });
   const imports = planClaudeImports({ now, env });
   const names = planAgentNames(cutoffMs, { env, inspectSessions: () => reservationSessions(env, state.jobs) });
+  const at = Number(new Date(now));
+  const rooms = planRooms(cutoffMs, { env });
+  const admissionLocks = planAdmissionLocks(at, { env });
+  const approvals = planApprovalDirs(cutoffMs, state.jobs, { env, cache });
   const threads = state.errors.length || state.incomplete ? { threads: [], errors: [] } : inspectThreads(env, cutoffMs, state.referenced);
-  const plan = { cutoff: new Date(cutoffMs).toISOString(), ...policy, jobs: state.jobs, inertWorkspaces: state.inertWorkspaces, workspacesRetained: state.workspacesRetained, runs: runs.runs, runSessions: runs.runSessions, markers: markers.markers, snapshots: snapshots.snapshots, imports: imports.imports, agentNameSessions: names.agentNameSessions, agentNameTemporaries: names.agentNameTemporaries, threads: threads.threads, retained: state.retained, errors: [...state.errors, ...markers.errors, ...runs.errors, ...snapshots.errors, ...imports.errors, ...names.errors, ...threads.errors] };
-  Object.defineProperty(plan, CONTEXT, { value: { env: { ...env }, now: Number(new Date(now)), cache } });
+  const plan = { cutoff: new Date(cutoffMs).toISOString(), ...policy, jobs: state.jobs, inertWorkspaces: state.inertWorkspaces, workspacesRetained: state.workspacesRetained, runs: runs.runs, runSessions: runs.runSessions, markers: markers.markers, snapshots: snapshots.snapshots, imports: imports.imports, agentNameSessions: names.agentNameSessions, agentNameTemporaries: names.agentNameTemporaries, rooms: rooms.rooms, roomsRetained: rooms.roomsRetained, admissionLocks: admissionLocks.admissionLocks, approvalDirs: approvals.approvalDirs, threads: threads.threads, retained: state.retained, errors: [...state.errors, ...markers.errors, ...runs.errors, ...snapshots.errors, ...imports.errors, ...names.errors, ...rooms.errors, ...admissionLocks.errors, ...approvals.errors, ...threads.errors] };
+  Object.defineProperty(plan, CONTEXT, { value: { env: { ...env }, now: at, cache } });
   return plan;
 }
 
 export async function applyRetention(plan, { deleteThread } = {}) {
-  const report = { jobsDeleted: 0, runsDeleted: 0, runSessionsDeleted: 0, markersDeleted: 0, snapshotsDeleted: 0, importsDeleted: 0, agentNameSessionsDeleted: 0, agentNameTemporariesDeleted: 0, threadsDeleted: 0, threadsSkipped: 0, bytesFreed: 0, inertWorkspaces: [], workspacesRetained: (plan?.workspacesRetained ?? []).map(item => ({ ...item })), retained: (plan?.retained ?? []).map(item => ({ ...item })), errors: [...(plan?.errors ?? [])], days: plan?.days, warnings: [...(plan?.warnings ?? [])] };
+  const report = { jobsDeleted: 0, runsDeleted: 0, runSessionsDeleted: 0, markersDeleted: 0, snapshotsDeleted: 0, importsDeleted: 0, agentNameSessionsDeleted: 0, agentNameTemporariesDeleted: 0, roomsDeleted: 0, admissionLocksDeleted: 0, approvalDirsDeleted: 0, threadsDeleted: 0, threadsSkipped: 0, bytesFreed: 0, inertWorkspaces: [], workspacesRetained: (plan?.workspacesRetained ?? []).map(item => ({ ...item })), roomsRetained: (plan?.roomsRetained ?? []).map(item => ({ ...item })), retained: (plan?.retained ?? []).map(item => ({ ...item })), errors: [...(plan?.errors ?? [])], days: plan?.days, warnings: [...(plan?.warnings ?? [])] };
   const cache = plan?.[CONTEXT]?.cache ?? new Map();
   try {
     const env = plan[CONTEXT]?.env ?? process.env, cutoff = Date.parse(plan.cutoff);
@@ -513,7 +919,7 @@ export async function applyRetention(plan, { deleteThread } = {}) {
         report.errors.push(errorEntry({ workspace }, error));
       }
     }
-    const workspaces = new Map(), removedJobFiles = new Set();
+    const workspaces = new Map(), removedJobFiles = new Set(), deletedJobKeys = new Set();
     for (const candidate of plan.jobs) {
       const selected = workspaces.get(candidate.workspace) ?? new Set();
       selected.add(candidate.jobId); workspaces.set(candidate.workspace, selected);
@@ -548,6 +954,7 @@ export async function applyRetention(plan, { deleteThread } = {}) {
                   } catch (error) { if (error.code !== "ENOENT") throw error; }
                 }
                 report.jobsDeleted += 1;
+                deletedJobKeys.add(`${workspace}\0${id}`);
               }
             } catch (error) {
               if (error.code !== RETAIN_ARTIFACT_PATHS) throw error;
@@ -558,6 +965,7 @@ export async function applyRetention(plan, { deleteThread } = {}) {
           return selected;
         });
         report.jobsDeleted += removed.length;
+        for (const job of removed) deletedJobKeys.add(`${workspace}\0${job.id}`);
         counted = true;
       } catch (error) {
         report.errors.push(errorEntry({ workspace }, error));
@@ -565,7 +973,11 @@ export async function applyRetention(plan, { deleteThread } = {}) {
         // actually dropped even if an artifact unlink subsequently failed.
         if (!counted && selectedIds.length) try {
           const current = readJson(path.join(workspace, "state.json"));
-          if (Array.isArray(current?.jobs)) report.jobsDeleted += selectedIds.filter(id => !current.jobs.some(job => job.id === id)).length;
+          if (Array.isArray(current?.jobs)) {
+            const dropped = selectedIds.filter(id => !current.jobs.some(job => job.id === id));
+            report.jobsDeleted += dropped.length;
+            for (const id of dropped) deletedJobKeys.add(`${workspace}\0${id}`);
+          }
         } catch { /* original failure is already reported */ }
       }
       // Also account for partial artifact removal if commitState hit an I/O error.
@@ -598,10 +1010,24 @@ export async function applyRetention(plan, { deleteThread } = {}) {
     report.snapshotsDeleted = snapshots.snapshotsDeleted;
     report.bytesFreed += snapshots.bytesFreed;
     report.errors.push(...snapshots.errors);
-    const imports = sweepClaudeImports({ now: plan[CONTEXT]?.now ?? Date.now(), env, files: plan.imports ?? [] });
+    const at = plan[CONTEXT]?.now ?? Date.now();
+    const imports = sweepClaudeImports({ now: at, env, files: plan.imports ?? [] });
     report.importsDeleted = imports.importsDeleted;
     report.bytesFreed += imports.bytesFreed;
     report.errors.push(...imports.errors);
+    const rooms = pruneRooms(plan.rooms ?? [], cutoff, { env });
+    report.roomsDeleted = rooms.roomsDeleted;
+    report.bytesFreed += rooms.bytesFreed;
+    for (const item of rooms.roomsRetained) recordRoomRetention(report.roomsRetained, item.roomId, item.path, item.reason);
+    report.errors.push(...rooms.errors);
+    const admissionLocks = pruneAdmissionLocks(plan.admissionLocks ?? [], at, { env });
+    report.admissionLocksDeleted = admissionLocks.admissionLocksDeleted;
+    report.bytesFreed += admissionLocks.bytesFreed;
+    report.errors.push(...admissionLocks.errors);
+    const approvals = pruneApprovalDirs(plan.approvalDirs ?? [], cutoff, deletedJobKeys, { env, cache });
+    report.approvalDirsDeleted = approvals.approvalDirsDeleted;
+    report.bytesFreed += approvals.bytesFreed;
+    report.errors.push(...approvals.errors);
     for (const thread of plan.threads) {
       try {
         // Even expired jobs that failed to be removed now protect their threads.
@@ -693,7 +1119,7 @@ function acquireAutomaticLock(directory) {
 
 export async function runAutomaticRetention({ cwd = process.cwd(), now = Date.now(), env = process.env, broker, deleteThread } = {}) {
   let release;
-  const failed = error => ({ jobsDeleted: 0, runsDeleted: 0, runSessionsDeleted: 0, markersDeleted: 0, snapshotsDeleted: 0, importsDeleted: 0, threadsDeleted: 0, threadsSkipped: 0, bytesFreed: 0, retained: [], errors: [errorEntry({ scope: "automatic-retention" }, error)] });
+  const failed = error => ({ jobsDeleted: 0, runsDeleted: 0, runSessionsDeleted: 0, markersDeleted: 0, snapshotsDeleted: 0, importsDeleted: 0, roomsDeleted: 0, admissionLocksDeleted: 0, approvalDirsDeleted: 0, threadsDeleted: 0, threadsSkipped: 0, bytesFreed: 0, roomsRetained: [], retained: [], errors: [errorEntry({ scope: "automatic-retention" }, error)] });
   try {
     const directory = path.join(resolveIsolatedCodexHome(env), "duet");
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });

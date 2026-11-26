@@ -570,7 +570,7 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | `fugato roundtable close <roomId> [--title t] [--label l] [--selects n] [--unreviewed reason]` | Close the room; with a title, `--selects` or a body on stdin, first records the chair's closing decision under the review gate. Closing does not cancel jobs |
 | `fugato forum read <roomId> [--after n] [--thread n] [--limit n] [--json]` | Chair index/thread reads |
 | `fugato forum post <roomId> --kind <kind> [--thread n] [--reply-to n] [--title t] [--label l] [--ref r]… [--mention m]…` | Chair posts, body on stdin; see [forum](roundtable.md#the-forum) |
-| `fugato cleanup --dry-run --json` / `fugato cleanup --json` | Preview/apply retention with read-only inert workspace reporting; text output includes manual removal hints; `--days N` overrides the period |
+| `fugato cleanup --dry-run --json` / `fugato cleanup --json` | Preview/apply retention (jobs, runs, markers, closed roundtable rooms, stale Antigravity admission locks, staged approval artifacts and threads) with read-only inert workspace and retained-room reporting; text output includes manual removal hints; `--days N` overrides the period |
 | `fugato journal <start\|use\|add\|validate\|close\|show\|list>` | Criteria (including `add withdraw`), verdicts and decisions; `start --switch` selects a new run while leaving the old one open; `use <runId>` selects an existing open run for the session |
 
 Without an active run, journal add/close use the sole open run in the current
