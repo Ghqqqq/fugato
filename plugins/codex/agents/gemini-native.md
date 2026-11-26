@@ -55,9 +55,12 @@ plain brief to continue the same Antigravity session.
 Roundtable seats are supported when `fugato roundtable start` assigns this
 agent (`--roundtable <roomId> --persona <id>`). Forum notices arrive only
 between turns, never mid-turn, and parked approvals hold that member's notices.
-Parent-bridge calls (`ask_parent`, `forum_read`, `forum_post`) are auto-allowed
-one call at a time and audited in job activity without arguments; edits and
-commands still require approval. Gemini roundtable seats cannot be read-only.
+Every Gemini worker's parent bridge also exposes three read-only workspace tools
+(`workspace_list`, `workspace_grep`, `workspace_git_read`) confined to the job's
+execution directory with no shell; they are auto-allowed one call at a time
+alongside `ask_parent` (and `forum_read`, `forum_post` on roundtable seats) and
+audited in job activity without arguments. Edits and shell commands still
+require approval. Gemini roundtable seats cannot be read-only.
 
 If a model reads this prompt, the native adapter is unavailable or failed.
 Return exactly this blocked report without performing the assignment:

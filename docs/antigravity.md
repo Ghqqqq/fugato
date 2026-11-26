@@ -221,6 +221,14 @@ with `operation-too-large-to-display-exactly`. A request of kind `other` with
 reviewable input can reach Claude. An execution request without a command
 line is denied. [`permissionReview` and `permissionDecision`](../plugins/codex/scripts/lib/antigravity.mjs)
 
+Every Gemini worker's parent bridge also exposes three read-only workspace
+tools—`workspace_list`, `workspace_grep` and `workspace_git_read`—scoped to
+the job's execution directory (`CODEX_COMPANION_BRIDGE_EXEC_CWD`). They run
+without a shell, reject path/symlink escapes and untrusted git config hooks or
+pagers, cap output size and runtime, and are auto-allowed one call at a time
+with argument-free `permissionAutoAllowed` audit entries in job activity.
+Codex bridges do not expose these tools. [`workspace-read-tools.mjs`](../plugins/codex/scripts/lib/workspace-read-tools.mjs)
+
 ## Reports, budgets and stopping
 
 - Native report cards identify the backend as `antigravity` and the provider
@@ -290,8 +298,9 @@ launch.
 Gemini members receive forum notices only between turns, never mid-turn. Parked
 approvals hold that member's notices until answered. Edits and commands still
 park for approval in agy's default mode, while parent-bridge calls
-(`ask_parent`, `forum_read`, `forum_post`) are auto-allowed one call at a time
-and audited in job activity without arguments.
+(`ask_parent`, `forum_read`, `forum_post`, `workspace_list`, `workspace_grep`,
+`workspace_git_read`) are auto-allowed one call at a time and audited in job
+activity without arguments.
 
 Terms note: roundtable seats run `agy acp` as a backend worker. Google's FAQ
 names Claude Code as third-party software, and an `antigravity-cli` collaborator
