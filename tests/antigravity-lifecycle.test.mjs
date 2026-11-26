@@ -7,6 +7,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, waitForCondition, writeExecutable } from "./helpers.mjs";
+import { acpProcessGone } from "../plugins/codex/scripts/lib/acp-process.mjs";
+import { tryAcquireConcurrency } from "../plugins/codex/scripts/lib/concurrency.mjs";
 import { answerQuestion, PARENT_BRIDGE_ENV } from "../plugins/codex/scripts/lib/job-runtime.mjs";
 import { resolveJobFile, unresolvedTask, updateJob, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -498,4 +500,58 @@ test("parent questions reach their own backend when ACP and Codex share thread a
     assert.equal(reply.result.content[0].text, "Sample B");
     bridge.stdin.end();
   }
+});
+
+test("concurrency admission skips acpProcessGone for live antigravity wrappers and probes dead wrappers out of lock", () => {
+  const dir = makeTempDir("acp-concurrency-"), env = buildEnv(dir);
+  const concurrencyDir = path.join(env.CODEX_COMPANION_HOME, "duet", "concurrency");
+  const slotsFile = path.join(concurrencyDir, "slots.json");
+  const liveJob = path.join(dir, "live-acp.json"), nextJob = path.join(dir, "next-acp.json");
+  const write = (file, data) => fs.writeFileSync(file, JSON.stringify(data), { mode: 0o600 });
+  write(liveJob, { id: "live-acp", backend: "antigravity", request: { backend: "antigravity" },
+    acpProcessPid: process.pid, acpProcessExited: false, turnId: "acp-live", turnSubmission: { at: new Date().toISOString() } });
+  write(nextJob, { id: "next-acp", backend: "antigravity", request: { backend: "antigravity" } });
+
+  const first = tryAcquireConcurrency({ limit: 1, jobFile: liveJob, env, backend: "antigravity" });
+  assert.ok(first);
+  first.submitted();
+
+  let probeCalls = 0;
+  const spyProbe = job => {
+    probeCalls++;
+    assert.equal(fs.existsSync(path.join(concurrencyDir, ".state-lock")), false,
+      "acpProcessGone must never execute while holding the concurrency lock");
+    return acpProcessGone(job);
+  };
+  assert.equal(tryAcquireConcurrency({ limit: 1, jobFile: nextJob, env, backend: "antigravity", acpProcessGone: spyProbe }), null);
+  const second = tryAcquireConcurrency({ limit: 2, jobFile: nextJob, env, backend: "antigravity", acpProcessGone: spyProbe });
+  assert.ok(second);
+  second.release();
+  assert.equal(probeCalls, 0);
+
+  const dead = spawnSync(process.execPath, ["-e", ""], { encoding: "utf8" });
+  assert.equal(dead.status, 0);
+  assert.equal(alive(dead.pid), false);
+  const saved = JSON.parse(fs.readFileSync(slotsFile, "utf8"));
+  saved[0].pid = dead.pid;
+  write(slotsFile, saved);
+  write(liveJob, { id: "live-acp", backend: "antigravity", request: { backend: "antigravity" },
+    acpProcessPid: dead.pid, acpProcessExited: false, turnId: "acp-live", turnSubmission: { at: new Date().toISOString() } });
+
+  assert.equal(tryAcquireConcurrency({ limit: 1, jobFile: nextJob, env, backend: "antigravity",
+    acpProcessGone: () => { probeCalls++; return false; } }), null);
+  assert.equal(probeCalls, 1);
+
+  const reclaimed = tryAcquireConcurrency({ limit: 1, jobFile: nextJob, env, backend: "antigravity", acpProcessGone: spyProbe });
+  assert.ok(reclaimed);
+  assert.equal(probeCalls, 2);
+  reclaimed.release();
+
+  write(slotsFile, saved);
+  write(liveJob, { id: "live-acp", backend: "antigravity", request: { backend: "antigravity" },
+    acpProcessPid: dead.pid, acpProcessExited: true, turnId: "acp-live", turnSubmission: { at: new Date().toISOString() } });
+  const exited = tryAcquireConcurrency({ limit: 1, jobFile: nextJob, env, backend: "antigravity", acpProcessGone: spyProbe });
+  assert.ok(exited);
+  assert.equal(probeCalls, 2);
+  exited.release();
 });

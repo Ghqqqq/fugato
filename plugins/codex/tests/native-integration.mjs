@@ -833,6 +833,36 @@ test('roundtable timer records a ready idle wake without sending or spawning', a
   assert.equal(f.jobs().length, 1); assert.equal(f.capture.notices.length, notices);
 });
 
+test('roundtable timer ticks spawn no companion without open rooms, while wake passes deliver in bound rooms', async () => {
+  const f = fixture('review-ok', 'critic');
+  const tick = await notifierTick(f);
+  const before = f.capture.processes.length;
+  await tick();
+  assert.equal(f.capture.processes.length, before, 'Timer tick with no roundtables directory must start zero processes');
+
+  const roundtables = `${f.root}/isolated/duet/roundtables`;
+  fs.mkdirSync(roundtables, { recursive: true });
+  f.$.fs.list = async dir => fs.readdirSync(dir, { withFileTypes: true }).map(entry => ({
+    name: entry.name, kind: entry.isDirectory() ? 'dir' : 'file',
+  }));
+  f.$.fs.read = async file => fs.readFileSync(file, 'utf8');
+  await tick();
+  assert.equal(f.capture.processes.length, before, 'Empty roundtables directory must start zero processes');
+
+  const closed = nativeRoom(f);
+  setStatus(closed.room.roomId, 'closed', closed.env);
+  await tick();
+  assert.equal(f.capture.processes.length, before, 'Closed-only room with no store records must start zero processes');
+
+  const rt = nativeRoom(f);
+  await f.turn(rt.header + 'Finish the first contribution.', 1);
+  (await f.$.agent.list())[0].status = 'completed';
+  rt.post('decision');
+  await tick();
+  await wakePass(f);
+  assert.equal(roundtableWakes(f).length, 1);
+});
+
 test('roundtable main-loop tool hook delivers once to the bound id and continues its thread', async () => {
   const f = fixture('review-ok', 'critic'), rt = nativeRoom(f);
   await f.turn(rt.header + 'Finish first.', 1);
@@ -1021,6 +1051,38 @@ test('roundtable notifier reverts undelivered wakes to ready without consuming t
   refuse = false; cNow += 5001; await wakePass(cf);
   assert.equal(roundtableWakes(cf).length, 1);
   assert.equal(cf.readStore()[cKey].attempt.retried, undefined);
+});
+
+test('roundtable notifier reads room status once per pass for delivery and once fresh per actual wake', async () => {
+  const f = fixture('review-ok', 'critic'), personas = ['conjecturer', 'critic', 'improver'];
+  const rt = nativeRoom(f, personas);
+  for (const persona of personas) {
+    const header = `DUET: --roundtable ${rt.room.roomId} --persona ${persona}\n`;
+    await f.turn(header + `Initial work for ${persona}.`, 1, false, { agentId: `agent-${persona}`, name: persona });
+  }
+  for (const agent of await f.$.agent.list()) agent.status = 'completed';
+  postEvent(rt.room.roomId, 'critic', { kind: 'question', title: 'Chair input', body: 'Need choice', mentions: ['chair'] }, rt.env);
+  rt.post('decision');
+  const tick = await notifierTick(f);
+  const subcommands = since => f.capture.processes.slice(since)
+    .filter(call => call.kind === 'run' && call.request.argv[1]?.endsWith('/bin/fugato'))
+    .map(call => call.request.argv[2] === 'status' ? 'status' : `${call.request.argv[2]} ${call.request.argv[3]}`);
+  const count = (list, name) => list.filter(item => item === name).length;
+
+  const beforeTick = f.capture.processes.length;
+  await tick();
+  const tickCalls = subcommands(beforeTick);
+  assert.equal(count(tickCalls, 'forum pending'), 1);
+  assert.equal(count(tickCalls, 'roundtable status'), 1, `Timer pass should read room status once, saw: ${tickCalls.join(', ')}`);
+  assert.equal(count(tickCalls, 'status'), 3);
+  assert.equal(f.capture.notices.filter(notice => notice.message.content[0].text.includes('chair updates')).length, 1);
+
+  const beforeWake = f.capture.processes.length;
+  await wakePass(f);
+  const wakeCalls = subcommands(beforeWake);
+  assert.equal(roundtableWakes(f).length, 3);
+  assert.equal(count(wakeCalls, 'forum pending'), 1);
+  assert.equal(count(wakeCalls, 'roundtable status'), 4, `Wake pass should read room status once for delivery plus 1 fresh recheck per wake, saw: ${wakeCalls.join(', ')}`);
 });
 
 test('running Codex workers refuse role headers before steering or queuing a delivery', async () => {
