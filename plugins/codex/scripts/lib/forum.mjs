@@ -6,6 +6,7 @@ import { withJournalLock, resolveStateDirForRoot, readJobFile } from "./state.mj
 import { PERSONA_IDS, INTENSITIES } from "./roundtable-personas.mjs";
 import { backendForModel } from "./roles.mjs";
 import { createMemberWorkspaces, rollbackMemberWorkspaces, memberWorkspaceStatus, candidateWorkspaceDiff } from "./roundtable-workspaces.mjs";
+import { summarizeUsage } from "./run-journal.mjs";
 
 export const EVENT_KINDS = Object.freeze(["idea", "finding", "question", "request", "intent", "candidate", "decision"]);
 const BACKENDS = ["codex", "antigravity"];
@@ -188,14 +189,54 @@ function isNotStartedTerminalJob(job) {
   if ((job.pendingQuestion && job.pendingQuestion.answer === undefined) || job.phase === "needs_answer") return false;
   return [job.turnResolution, job.result?.turnStatus, job.recovery?.turnStatus].includes("notStarted");
 }
+function summarizeMemberJob(jobId, job) {
+  const report = job?.report ?? job?.result?.structured;
+  const summary = report?.summary ?? job?.result?.structured?.summary ?? job?.summary ?? report?.keyFindings?.join(" ") ?? "";
+  const status = (job?.pendingQuestion && job.pendingQuestion.answer === undefined) || job?.phase === "needs_answer" ? "needs_answer" : job?.status ?? "unknown";
+  return { jobId, status, reportStatus: report?.status ?? null, summary: typeof summary === "string" ? summary.slice(0, 600) : "",
+    details: `fugato result ${jobId} --details` };
+}
 function memberJobs(room, member, env, jobIds = member.jobIds) {
-  return jobIds.map(jobId => {
-    const job = readMemberJob(room, member, jobId, env);
-    const report = job?.report ?? job?.result?.structured;
-    const summary = report?.summary ?? job?.result?.structured?.summary ?? job?.summary ?? report?.keyFindings?.join(" ") ?? "";
-    const status = (job?.pendingQuestion && job.pendingQuestion.answer === undefined) || job?.phase === "needs_answer" ? "needs_answer" : job?.status ?? "unknown";
-    return { jobId, status, reportStatus: report?.status ?? null, summary: typeof summary === "string" ? summary.slice(0, 600) : "",
-      details: `fugato result ${jobId} --details` };
+  return jobIds.map(jobId => summarizeMemberJob(jobId, readMemberJob(room, member, jobId, env)));
+}
+function countJobApprovals(jobs) {
+  let pending = 0, answered = 0;
+  for (const job of jobs) {
+    if (job?.pendingQuestion?.kind === "action-approval" && job.pendingQuestion.answer == null) pending++;
+    if (Array.isArray(job?.questionHistory)) {
+      for (const entry of job.questionHistory) {
+        if (entry?.kind === "action-approval" && entry.answer != null) answered++;
+      }
+    }
+  }
+  return { pending, answered };
+}
+const UNREAD_FOOTER_MAX_CHARS = 240;
+const UNREAD_FOOTER_MAX_REFS = 3;
+function formatUnreadRef(event) {
+  return event.author.kind === "chair" ? `#${event.seq} chair ${event.kind}` : `#${event.seq} ${event.kind} mention`;
+}
+export function unreadFooter(roomId, persona, env = process.env, options = null) {
+  return locked(roomId, env, ({ room, events }) => {
+    if (options && Object.hasOwn(options, "sessionId")) assertChair(room, options.sessionId);
+    if (room.status !== "open") return null;
+    const name = typeof persona === "string" ? persona : persona?.persona ?? persona?.name;
+    const member = room.members.find(value => value.name === name);
+    if (!member || member.status === "stopped") return null;
+    const cursor = Math.max(member.indexCursor, member.notifiedSeq);
+    const unread = events.filter(event => event.seq > cursor && event.author.name !== member.name && visible(event, member) &&
+      (event.author.kind === "chair" || event.mentions.includes(member.name)));
+    if (!unread.length) return null;
+    const prefix = `Roundtable ${room.roomId}: ${unread.length} unread for you`;
+    const suffix = " — call forum_read.";
+    const refs = unread.slice(0, UNREAD_FOOTER_MAX_REFS).map(formatUnreadRef);
+    for (let count = refs.length; count >= 0; count--) {
+      const omitted = unread.length - count;
+      const detail = count ? ` (${refs.slice(0, count).join(", ")}${omitted > 0 ? `, +${omitted} more` : ""})` : "";
+      const line = `${prefix}${detail}${suffix}`;
+      if (line.length <= UNREAD_FOOTER_MAX_CHARS) return line;
+    }
+    return `${prefix}${suffix}`.slice(0, UNREAD_FOOTER_MAX_CHARS);
   });
 }
 
@@ -477,7 +518,15 @@ export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs
     return { room, events };
   });
   const items = open(events), attention = [];
-  const members = room.members.map(member => ({ ...member, jobs: memberJobs(room, member, env), workspace: memberWorkspaceStatus(room, member, env) }));
+  const allUsageRecords = [];
+  const members = room.members.map(member => {
+    const records = member.jobIds.map(jobId => ({ jobId, job: readMemberJob(room, member, jobId, env) }));
+    const rawJobs = records.map(({ job }) => job);
+    const usageRecords = rawJobs.map(job => job ? { backend: member.backend, model: member.model, ...job } : null);
+    allUsageRecords.push(...usageRecords);
+    return { ...member, jobs: records.map(({ jobId, job }) => summarizeMemberJob(jobId, job)),
+      workspace: memberWorkspaceStatus(room, member, env), approvals: countJobApprovals(rawJobs), usage: summarizeUsage(usageRecords) };
+  });
   for (const event of items) if (event.mentions.includes("chair") || (!event.mentions.length && now - Date.parse(event.at) >= windowMs)) {
     attention.push({ kind: "open_item", seq: event.seq, resource: `post/${event.seq}`, summary: `#${event.seq} ${event.kind} from ${event.author.name}: ${delta(event)}` });
   }
@@ -500,17 +549,33 @@ export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs
   for (const event of events) if (event.kind === "candidate" && !reviewed(event, events)) {
     attention.push({ kind: "unreviewed_candidate", seq: event.seq, resource: `candidate/${event.seq}`, summary: `Candidate #${event.seq} from ${event.author.name} needs a non-author finding.` });
   }
+  const totals = {
+    approvals: members.reduce((sum, member) => ({ pending: sum.pending + member.approvals.pending, answered: sum.answered + member.approvals.answered }), { pending: 0, answered: 0 }),
+    usage: summarizeUsage(allUsageRecords)
+  };
   return { attention, ...room, members, selectedCandidate: selection(events), openItems: items,
-    counts: { events: events.length, threads: events.filter(event => event.seq === event.thread).length, openItems: items.length } };
+    counts: { events: events.length, threads: events.filter(event => event.seq === event.thread).length, openItems: items.length },
+    totals };
+}
+function formatStatusTokens(usage) {
+  if (!usage || !usage.jobsWithUsage) return "unknown";
+  if (usage.jobsByKey && usage.jobsByKey.totalTokens === 0) return "unknown";
+  return String(usage.totalTokens);
 }
 export function renderAttention(room) {
   return `${room.attention.length ? `Needs the chair (${room.attention.length}):\n${room.attention.map(item => `- ${item.summary} → ${item.resource}`).join("\n")}` : "Nothing needs the chair."}\n`;
 }
 export function renderRoundtableStatus(room) {
+  const approvals = room.totals?.approvals ?? { pending: 0, answered: 0 };
+  const usage = room.totals?.usage ?? { jobsWithUsage: 0, totalTokens: 0 };
   return renderAttention(room) +
     `Roundtable ${room.roomId} (${room.status}, ${room.intensity})\n` +
     `Counts: ${room.counts.events} posts, ${room.counts.threads} threads, ${room.counts.openItems} open items\n` +
-    room.members.map(member => `${member.name}: ${member.status}; ${member.backend ?? "codex"} ${member.model}; jobs ${member.jobs.map(job => `${job.jobId}:${job.status}`).join(", ") || "none"}; workspace ${member.workspace.path}`).join("\n") + "\n";
+    `Approvals: ${approvals.pending} pending, ${approvals.answered} answered; tokens: ${formatStatusTokens(usage)} (${usage.jobsWithUsage} job(s) with usage)\n` +
+    room.members.map(member => {
+      const mApprovals = member.approvals ?? { pending: 0, answered: 0 };
+      return `${member.name}: ${member.status}; ${member.backend ?? "codex"} ${member.model}; jobs ${member.jobs.map(job => `${job.jobId}:${job.status}`).join(", ") || "none"}; workspace ${member.workspace.path}; approvals ${mApprovals.pending}/${mApprovals.answered}; tokens ${formatStatusTokens(member.usage)}`;
+    }).join("\n") + "\n";
 }
 export function validateMember(roomId, persona, sessionId, env = process.env) {
   const room = readRoom(roomId, env);
