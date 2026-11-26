@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.10.0
 
 - Support explicit Google Gemini (`agy acp`, `fugato:gemini-native`) roundtable
   seats alongside Codex members via `--persona-model id=gemini-*[:effort]` (per
