@@ -6,8 +6,8 @@ import { makeTempDir, initGitRepo, run } from "./helpers.mjs";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
-function fixture() {
-  const dir = makeTempDir(); installFakeCodex(dir);
+function fixture(options) {
+  const dir = makeTempDir(); installFakeCodex(dir, undefined, options);
   const repo = path.join(dir, "repo"); fs.mkdirSync(repo); initGitRepo(repo);
   const script = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
   const env = { ...buildEnv(dir), CLAUDE_PLUGIN_DATA: path.join(dir, "data") };
@@ -86,7 +86,7 @@ test("sandbox defaults apply to fresh tasks; named and thread follow-ups inherit
 });
 
 test("task cwd and follow-ups stay in the requested directory while state, snapshots and reviews use the repository root", () => {
-  const f = fixture();
+  const f = fixture({ mutable: true });
   const sub = path.join(f.repo, "packages", "web");
   fs.mkdirSync(sub, { recursive: true });
   fs.writeFileSync(path.join(f.repo, "pre-existing.txt"), "baseline\n");

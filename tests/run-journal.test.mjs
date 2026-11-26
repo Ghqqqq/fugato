@@ -15,8 +15,8 @@ const journalModule = new URL("../plugins/codex/scripts/lib/run-journal.mjs", im
 const runtimeModule = new URL("../plugins/codex/scripts/lib/job-runtime.mjs", import.meta.url).href;
 const stateModule = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
 const SESSION = "journal-session:1";
-function fixture() {
-  const root = makeTempDir(); installFakeCodex(root);
+function fixture(options) {
+  const root = makeTempDir(); installFakeCodex(root, undefined, options);
   const cwd = path.join(root, "workspace"); fs.mkdirSync(cwd);
   const env = { ...buildEnv(root), CODEX_COMPANION_HOME: path.join(root, "isolated"), CLAUDE_PLUGIN_DATA: path.join(root, "data"), CODEX_COMPANION_SESSION_ID: SESSION };
   const state = resolveStateDir(cwd, env), runs = path.join(state, "runs");
@@ -678,7 +678,7 @@ test("direct tasks link exact worker brief and one terminal compact report; unli
     return fs.existsSync(root) ? fs.readdirSync(root).flatMap(session => fs.readdirSync(path.join(root, session)).map(name => `${session}/${name}`)).sort() : [];
   };
   {
-    const h = fixture(); initGitRepo(h.cwd);
+    const h = fixture({ mutable: true }); initGitRepo(h.cwd);
     const bin = path.join(h.root, "codex"), source = fs.readFileSync(bin, "utf8");
     // Availability is checked after --run validation and before reservation/link.
     // Install before broker startup so the executable's identity never changes.

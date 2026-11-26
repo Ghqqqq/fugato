@@ -18,10 +18,10 @@ import { instructionInventory } from "../plugins/codex/hooks/claude-memory.mjs";
 const DAY = 86400000;
 const cli = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
 const hook = new URL("../plugins/codex/scripts/session-lifecycle-hook.mjs", import.meta.url).pathname;
-function fixture() {
+function fixture(options) {
   const root = makeTempDir("retention-"), cwd = path.join(root, "workspace");
   fs.mkdirSync(cwd);
-  installFakeCodex(root);
+  installFakeCodex(root, undefined, options);
   const env = { ...buildEnv(root), CODEX_COMPANION_HOME: path.join(root, "isolated"), CLAUDE_CONFIG_DIR: path.join(root, "claude") };
   delete env.CODEX_COMPANION_RETENTION_DAYS;
   // Whole seconds: Node 22's utimes stores float seconds, so a millisecond
@@ -528,7 +528,7 @@ test("automatic cleanup persists its report, serializes overlapping runs and wai
   assert.equal(methods.filter(method => method === "thread/read").length, 7);
   assert.equal(methods.includes("turn/start"), false);
 
-  const h = fixture(), hung = seedJob(h, "hung", { ...stopped, workspaceRoot: h.cwd, request: { cwd: h.cwd } });
+  const h = fixture({ mutable: true }), hung = seedJob(h, "hung", { ...stopped, workspaceRoot: h.cwd, request: { cwd: h.cwd } });
   const executable = path.join(h.root, "codex");
   fs.writeFileSync(executable, fs.readFileSync(executable, "utf8").replace('case "thread/read": {', 'case "thread/read": { return;'));
   const original = fs.readFileSync(hung.file, "utf8");

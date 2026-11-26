@@ -107,7 +107,7 @@ async function until(check, timeout = 15000) {
 // fileChange notification adds 100 real activity events in one state update.
 // A file gate starts the burst only after the direct owner has attached.
 function installBurstCodex(dir) {
-  installFakeCodex(dir, "w5-working");
+  installFakeCodex(dir, "w5-working", { mutable: true });
   const binary = path.join(dir, "codex"), gate = path.join(dir, "burst-start");
   const branch = 'if (BEHAVIOR === "w5-parent" || BEHAVIOR === "w5-working") {';
   let source = fs.readFileSync(binary, "utf8");
@@ -234,7 +234,7 @@ test("simultaneous dispatches reserve different names while both jobs are active
 
   // Hold one connection's empty pre-check snapshot while another workspace
   // attempts admission. The second caller must finish without entering it.
-  const race = fixture("review-ok");
+  const race = fixture("review-ok", { mutable: true });
   const other = path.join(race.dir, "other"), ready = path.join(race.dir, "reads"), gate = path.join(race.dir, "release-read");
   const armed = path.join(race.dir, "hold-reads");
   fs.mkdirSync(other); initGitRepo(other); fs.mkdirSync(ready);
@@ -284,7 +284,7 @@ test("simultaneous dispatches reserve different names while both jobs are active
 
   // A fresh thread is published before its first turn is accepted. Its live
   // job must also exclude a cross-workspace follow-up without a turn handle.
-  const fresh = fixture("review-ok"), remote = path.join(fresh.dir, "remote");
+  const fresh = fixture("review-ok", { mutable: true }), remote = path.join(fresh.dir, "remote");
   fs.mkdirSync(remote); initGitRepo(remote);
   const freshBinary = path.join(fresh.dir, "codex"), freshSource = fs.readFileSync(freshBinary, "utf8");
   const held = path.join(fresh.dir, "first-start"), release = path.join(fresh.dir, "release-start");
@@ -996,7 +996,7 @@ test("task-worker SIGTERM resolves a pending question and confirms its turn inte
 
 test("cancel or parent exit interrupts foreground work without killing a saved PID", async () => {
   for (const [command, reason, scenario] of [["review", "cancelled_by_user"], ["task", "parent_exit", "startup"], ["task", "parent_exit", "closed-stderr"]]) {
-    const f = fixture(command === "review" ? "w5-review" : "w5-working");
+    const f = fixture(command === "review" ? "w5-review" : "w5-working", scenario === "startup" ? { mutable: true } : undefined);
     const probing = path.join(f.dir, "probing"), release = path.join(f.dir, "release-probe");
     if (scenario === "startup") {
       const binary = path.join(f.dir, "codex"), anchor = 'const fs = require("node:fs");';
@@ -1713,7 +1713,7 @@ test("a signalled owner wait stops the worker immediately; only a silent owner g
 
   // A killed worker cannot run its grant releases. Recovery restores the
   // preexisting session grant, while a live worker retains its task approval.
-  const grant = fixture("computer-use-requests"), binary = path.join(grant.dir, "codex");
+  const grant = fixture("computer-use-requests", { mutable: true }), binary = path.join(grant.dir, "codex");
   fs.writeFileSync(binary, fs.readFileSync(binary, "utf8").replace("if (pending.questionItem) {", "if (BEHAVIOR === 'computer-use-requests') return;\n      if (pending.questionItem) {"));
   const granted = json(grant.call("task", "--detached", "--json", "fixture"));
   const question = await waitUntil(() => storedJob(grant, granted.jobId).pendingQuestion);
@@ -1765,7 +1765,7 @@ test("automatic inferred-turn recheck reconciles without a command and remains b
   // The broker intentionally waits four seconds before retiring an abandoned
   // stream with no terminal notification. Recheck after that existing grace.
   const launch = (allowInterrupt, initial = "6000", retry = "7000", holdRead = false) => {
-    const f = fixture("inferred-final:running");
+    const f = fixture("inferred-final:running", holdRead ? { mutable: true } : undefined);
     Object.assign(f.env, { CODEX_COMPANION_INFERRED_RECHECK_MS: initial, CODEX_COMPANION_INFERRED_RECHECK_RETRY_MS: retry });
     if (holdRead) {
       const binary = path.join(f.dir, "codex"), source = fs.readFileSync(binary, "utf8"), branch = 'case "thread/read": {';
@@ -1960,7 +1960,7 @@ test("inferred final answers confirm the exact turn or remain recoverable by nam
   const changeServer = (shared, patch) => fs.writeFileSync(path.join(shared.dir, "fake-codex-state.json"), JSON.stringify({ ...shared.state(), ...patch }));
   // One real inferred turn supplies both unresolved history and broker-cleanup
   // variants. Every replay starts from its complete, quiescent durable snapshot.
-  const shared = fixture("inferred-final:running");
+  const shared = fixture("inferred-final:running", { mutable: true });
   // This test owns lazy-recovery timing and replays durable snapshots. Keep
   // automatic helpers asleep until the suite's process-ledger teardown.
   shared.env.CODEX_COMPANION_INFERRED_RECHECK_MS = "3600000";
@@ -2330,7 +2330,7 @@ test("a direct wait whose parent exits stops its worker; unconfirmed interruptio
   assert.equal(cancelMissing.confirmation, "confirmed");
   assert.equal(direct(indexOnly.call("task", "--thread", indexJob.threadId, "--direct", "fixture")).status, "completed");
 
-  const reset = fixture("review-ok"), resetBinary = path.join(reset.dir, "codex");
+  const reset = fixture("review-ok", { mutable: true }), resetBinary = path.join(reset.dir, "codex");
   const resetSource = fs.readFileSync(resetBinary, "utf8");
   const usageMarker = 'if (BEHAVIOR === "large-jsonl") {\n          emitTurnCompleted';
   assert.ok(resetSource.includes(usageMarker));
@@ -2448,7 +2448,7 @@ test("task --continue resumes the job's thread with its recorded authorization a
   } }, "new threads use the bridge with only the job handle and state-location variables");
   assert.equal(Object.hasOwn(start, "dynamicTools"), false);
   // An older runtime rejects the bridge override, then the dynamic registration.
-  const fallback = fixture("task-ok"), binary = path.join(fallback.dir, "codex");
+  const fallback = fixture("task-ok", { mutable: true }), binary = path.join(fallback.dir, "codex");
   fs.writeFileSync(path.join(fallback.repo, "CLAUDE.md"), "PROJECT_RULE\n");
   fs.writeFileSync(binary, fs.readFileSync(binary, "utf8").replace('case "thread/start": {', `case "thread/start": {
     state.startRegistrations = [...(state.startRegistrations || []), [Boolean(message.params.config), Boolean(message.params.dynamicTools)]];
@@ -2466,7 +2466,7 @@ test("task --continue resumes the job's thread with its recorded authorization a
 
   // Unrelated errors, including serde's list of accepted fields, are not registration rejections.
   for (const originalError of ["unknown field `serviceName`, expected one of `cwd`, `model`, `config`, `dynamicTools`"]) {
-    const unrelated = fixture("task-ok"), unrelatedBinary = path.join(unrelated.dir, "codex");
+    const unrelated = fixture("task-ok", { mutable: true }), unrelatedBinary = path.join(unrelated.dir, "codex");
     fs.writeFileSync(unrelatedBinary, fs.readFileSync(unrelatedBinary, "utf8").replace('case "thread/start": {', `case "thread/start": {
     state.startAttempts = (state.startAttempts || 0) + 1; saveState(state);
     if (state.startAttempts === 1) {
@@ -2677,7 +2677,7 @@ function changeQuestionReply(f, code) {
 }
 
 test("fugato answers a named pending worker once and retains owner and sole-wait protections", async () => {
-  const f = fixture("w5-parent"), gate = path.join(f.dir, "answer-finish");
+  const f = fixture("w5-parent", { mutable: true }), gate = path.join(f.dir, "answer-finish");
   const duet = new URL("../plugins/codex/bin/duet", import.meta.url).pathname;
   changeQuestionReply(f, `      while (!fs.existsSync(${JSON.stringify(gate)})) await new Promise(resolve => setTimeout(resolve, 25));`);
   const compact = direct(f.call("task", "--direct", "--owner", "parent's owner", "fixture"));
