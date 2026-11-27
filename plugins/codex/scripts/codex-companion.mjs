@@ -161,7 +161,7 @@ Durable run criteria, verdicts and decisions in the isolated home.
       Known criteria only; show as withdrawn with their reason and no unchecked/unmet issue.
     verdict: {"jobId":"...","verdict":"ACCEPT|ACCEPT_WITH_GLUE|REWORK|REASSIGN",
               "criteria":[{"criterion":"...","evidence":"...","result":"met|not_met|cannot_verify"}],"reason":"..."}
-      Criterion: declared exact text, a unique trailing-… prefix from show, or a unique id: K7/K7:, or F3/F3: for "F3: …".
+      Criterion: declared exact text, 1-based active index (1, #1, 1.), unique trailing-…/... prefix, or unique id (K7/K7:, F3/F3: for "F3: …").
       Unknown/ambiguous criteria are rejected; introduce new ones with add criteria.
       Historical verdict-only criteria keep their existing validation behavior; no migration is performed.
       Optional resolves: ["<jobId>", ...] names linked jobs in this run whose REWORK/REASSIGN

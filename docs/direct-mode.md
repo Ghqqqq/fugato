@@ -465,8 +465,7 @@ lease otherwise.
 | Codex project discovery | `CLAUDE.md` where no `AGENTS.md` exists, unless [already forwarded](claude-md.md#delivery-to-workers) | `fugato setup --project-docs agents-only` |
 
 For model and effort, explicit user choices win; dispatch uses explicit flags,
-then recorded follow-up settings, then saved defaults, then built-ins. Mode
-reminders and status show the effective values; see
+then recorded follow-up settings, then saved defaults, then built-ins. SessionStart, status and mode reminders (for any overrides) show the effective values; see
 [Default worker models](configuration.md#default-worker-models).
 
 The parent chooses a sandbox per call; fresh tasks without a flag use the

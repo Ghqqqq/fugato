@@ -198,7 +198,7 @@ heavy mutating fan-out is not a measured guarantee.
 Choose a [worker role](ultra-codex.md#worker-roles) for each fresh assignment
 with `--role <id>`. Apply `--high-stakes` when the rule applies. Use normal
 speed by default and `--fast` only for Codex rows when the user requests it.
-The reminder shows the effective role table.
+SessionStart prints the full role table; the compact reminder shows Gemini availability and any overridden roles.
 
 ### `/fugato:pair`
 
@@ -289,9 +289,8 @@ word (for example `/fugato:pair -- status the parser`). A task keeps its selecte
 mode; it never silently switches modes to evade a limit.
 
 While enabled, one hook adds a versioned mode reminder to normal prompts and
-suppresses it for all four mode commands. Ultra/pair/duel reminders name their
-effective role settings. Roundtable names its intensity and roster selection
-and points to role-based persona models.
+suppresses it for all four mode commands. Ultra/pair/duel reminders show Gemini availability and any overridden roles.
+Roundtable names its intensity, roster selection and Gemini availability.
 Controls do not load protocol text into Claude's context. Tasks use the shared
 [core protocol](../plugins/codex/prompts/protocol/core.md) plus their active
 mode file (`ultra.md`, `pair.md`, `duel.md` or `roundtable.md`). Each file's

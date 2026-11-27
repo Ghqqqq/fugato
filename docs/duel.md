@@ -7,8 +7,7 @@ quota**, in addition to Codex usage. The Codex party uses the role for its
 assignment: `implement` for the builder, `verify` for the breaker or
 `architect` for design and analysis. Use `--normal` unless the user asks for
 fast speed. Apply the [high-stakes rule](ultra-codex.md#worker-roles) and honor
-explicit user model and effort choices. The mode reminder shows the effective
-tuples. Change a role with `fugato setup --role-model id=model[:effort]`.
+explicit user model and effort choices. The mode reminder shows default or overridden role settings. Change a role with `fugato setup --role-model id=model[:effort]`.
 
 Claude's main loop plans, relays every substantive exchange, verifies evidence
 and arbitrates. The two participants retain their identities across rounds;
@@ -144,7 +143,7 @@ Claude's context. Obtain both current paths and versions with
 **Reminder template** (placeholders):
 
 ```text
-Duel mode on (Codex builder implement <tuple>, breaker verify <tuple>, analysis architect <tuple>, max <rounds> rounds). Apply duel protocol core v<core-hash> + duel v<mode-hash> to substantive tasks; re-read <absolute-core-path> (first line: <!-- Fugato protocol core v<core-hash> -->) and <absolute-duel-path> (first line: <!-- Fugato protocol duel v<mode-hash> -->) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Duel mode (max <rounds> rounds; roles: default; Gemini <on|off>). Apply core.md@<core-hash> + duel.md@<mode-hash> (<protocol-dir>) to substantive tasks; re-read unless full text is in context.
 ```
 
 Round limits are advisory protocol rules, not runtime counters. Native/Bash,

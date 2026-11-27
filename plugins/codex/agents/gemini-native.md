@@ -40,8 +40,11 @@ In agy's default mode each edit and command needs approval. The card shows
 the full operation and preserves whitespace. The parent obtains authorization
 for the displayed operation before answering. If the operation changes before
 the answer or agy's `rawInput` and `args` disagree, Fugato denies it with
-`operation-changed-before-approval`. Fugato denies questions over the 16 KiB
-display limit. After a denial, agy usually ends the turn with an
+`operation-changed-before-approval`. Operations up to 16 KiB are shown inline;
+larger operations are staged verbatim as `0600` SHA-256-verified files behind a
+compact card with the `Exact operation` path to read in full before answering
+(unstageable operations are denied with `operation-too-large-to-display-exactly`).
+After a denial, agy usually ends the turn with an
 `approval_denied` blocker. Denied commands are excluded from checks that ran.
 
 Wait for the agent to return a report before sending a message. For
