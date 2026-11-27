@@ -250,7 +250,7 @@ function startGrantSequence() {
   const sequences = {
     "grant-sequence": ["node --test tests/a.test.mjs", "node --test tests/b.test.mjs", "node --test a.mjs && rm -rf /"],
     "grant-single-test": ["node --test tests/c.test.mjs"],
-    "grant-cross-prefix": ["node --test tests/a.test.mjs", "git diff --stat"],
+    "grant-cross-prefix": ["node --test tests/a.test.mjs", "claude plugin test plugins/codex"],
     "grant-escape-after-grant": ["node --test tests/a.test.mjs", "node --test ../outside.test.mjs"]
   };
   const commands = sequences[behavior];

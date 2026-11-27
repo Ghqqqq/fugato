@@ -387,31 +387,37 @@ function permissionReview(tool, staging = null) {
   return tooLarge;
 }
 
+const RUN_COMMAND_GRANT_KEYS = new Set([
+  "CommandLine", "command", "Cwd", "cwd", "WaitMsBeforeAsync", "NotificationTimeoutSeconds", "toolSummary"
+]);
+
 function runCommandPrefix(call, executionCwd) {
   if (!call?.tool || !executionCwd) return null;
   const tool = call.tool;
+  if (typeof tool.toolCallId !== "string" || !tool.toolCallId.trim()) return null;
   if (tool.name !== "run_command") return null;
   if (tool.kind != null && tool.kind !== "execute") return null;
   if (call.diffs?.length || toolDiffs(tool).length) return null;
   const input = tool.rawInput;
   if (!isPlainObject(input) || !isDeepStrictEqual(input, tool.args)) return null;
-  if (input.IsDaemon === true) return null;
+  if (!Object.keys(input).every(key => RUN_COMMAND_GRANT_KEYS.has(key))) return null;
   const commandLine = typeof input.CommandLine === "string" ? input.CommandLine
     : input.CommandLine === undefined && typeof input.command === "string" ? input.command : null;
   if (!commandLine) return null;
   if (typeof input.CommandLine === "string" && input.command !== undefined && input.command !== input.CommandLine) return null;
   if (input.Cwd !== undefined && input.cwd !== undefined && input.Cwd !== input.cwd) return null;
-  let effectiveCwd = path.resolve(executionCwd);
+  let realExecCwd;
+  try { realExecCwd = fs.realpathSync(path.resolve(executionCwd)); }
+  catch { return null; }
   const rawCwd = input.Cwd ?? input.cwd;
   if (rawCwd !== undefined) {
     if (typeof rawCwd !== "string" || !rawCwd.trim()) return null;
-    const base = effectiveCwd;
-    const candidate = path.resolve(base, rawCwd);
-    const rel = path.relative(base, candidate);
-    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
-    effectiveCwd = candidate;
+    let realRawCwd;
+    try { realRawCwd = fs.realpathSync(path.resolve(realExecCwd, rawCwd)); }
+    catch { return null; }
+    if (realRawCwd !== realExecCwd) return null;
   }
-  const classified = classifyCommand(commandLine, { cwd: effectiveCwd });
+  const classified = classifyCommand(commandLine, { cwd: realExecCwd });
   return classified.eligible ? classified.prefix : null;
 }
 

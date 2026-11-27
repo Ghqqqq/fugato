@@ -9,6 +9,7 @@ import { buildEnv } from "./fake-codex-fixture.mjs";
 import { installFakeAntigravity } from "./fake-antigravity-fixture.mjs";
 import { initGitRepo, makeTempDir, writeExecutable } from "./helpers.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { runAntigravityTurn } from "../plugins/codex/scripts/lib/antigravity.mjs";
 import { parseActionApprovalAnswer, actionApprovalOptions, jobGrantOption } from "../plugins/codex/scripts/lib/server-requests.mjs";
 import { register as registerPlugin } from "../plugins/codex/hooks/register.mjs";
 import { isValidActionApprovalAnswer } from "../plugins/codex/hooks/native-agent.mjs";
@@ -16,9 +17,17 @@ import { isValidActionApprovalAnswer } from "../plugins/codex/hooks/native-agent
 const plugin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "plugins", "codex");
 const script = path.join(plugin, "scripts", "codex-companion.mjs");
 
+function seedRepoTargets(repo) {
+  fs.mkdirSync(path.join(repo, "tests"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "plugins", "codex"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "tests", "a.test.mjs"), "");
+  fs.writeFileSync(path.join(repo, "tests", "b.test.mjs"), "");
+  fs.writeFileSync(path.join(repo, "tests", "c.test.mjs"), "");
+}
+
 function cliFixture(t, options = "grant-sequence") {
   const dir = makeTempDir("agy-grants-"), repo = path.join(dir, "repo");
-  fs.mkdirSync(repo); initGitRepo(repo);
+  fs.mkdirSync(repo); initGitRepo(repo); seedRepoTargets(repo);
   const acp = installFakeAntigravity(dir, options);
   const codexTrap = path.join(dir, "codex-trap");
   writeExecutable(codexTrap, "#!/usr/bin/env node\nprocess.exit(97);\n");
@@ -48,7 +57,7 @@ test("parseActionApprovalAnswer and isValidActionApprovalAnswer accept only exac
   const opts2 = actionApprovalOptions();
   assert.deepEqual(opts3, ["Allow once", 'Allow "node --test" for this job', "Deny"]);
   assert.deepEqual(opts2, ["Allow once", "Deny"]);
-  assert.equal(jobGrantOption("git diff"), 'Allow "git diff" for this job');
+  assert.equal(jobGrantOption("claude plugin test"), 'Allow "claude plugin test" for this job');
 
   assert.deepEqual(parseActionApprovalAnswer("Allow once", opts3), { valid: true, decision: "once" });
   assert.deepEqual(parseActionApprovalAnswer('Allow "node --test" for this job', opts3), { valid: true, decision: "job_grant" });
@@ -64,7 +73,7 @@ test("parseActionApprovalAnswer and isValidActionApprovalAnswer accept only exac
     "yes", "Allow", "allow once", "deny", "Deny:", "Deny:   ",
     "deny: use workspace_grep", "Deny use workspace_grep",
     `Deny: ${"g".repeat(1001)}`,
-    'Allow "git diff" for this job',
+    'Allow "claude plugin test" for this job',
     'Allow "node --test" for this job.'
   ];
   for (const input of invalidForBoth) {
@@ -90,8 +99,6 @@ test("scoped job grant offers three options, auto-allows matching later command,
 
   json(f.invoke(["answer", launch.jobId, "--question", first.question.id, "--owner", launch.ownerId, "--json"], 'Allow "node --test" for this job'));
 
-  // Command #2 (node --test tests/b.test.mjs) must auto-allow without parking.
-  // The next parked question must be command #3 (node --test a.mjs && rm -rf /) with only 2 options.
   const next = json(f.call("wait", launch.jobId, "--owner", launch.ownerId, "--json"));
   assert.equal(next.status, "needs_answer");
   assert.match(next.question.text, /node --test a\.mjs && rm -rf \//);
@@ -125,8 +132,8 @@ test("a granted prefix never auto-allows a different prefix or a path escaping c
 
     const q2 = json(f.call("wait", launch.jobId, "--owner", launch.ownerId, "--json"));
     assert.equal(q2.status, "needs_answer");
-    assert.match(q2.question.text, /git diff --stat/);
-    assert.deepEqual(q2.question.options, ["Allow once", 'Allow "git diff" for this job', "Deny"]);
+    assert.match(q2.question.text, /claude plugin test plugins\/codex/);
+    assert.deepEqual(q2.question.options, ["Allow once", 'Allow "claude plugin test" for this job', "Deny"]);
     json(f.invoke(["answer", launch.jobId, "--question", q2.question.id, "--owner", launch.ownerId, "--json"], "Allow once"));
     const done = json(f.call("wait", launch.jobId, "--owner", launch.ownerId, "--json"));
     assert.equal(done.status, "completed");
@@ -151,6 +158,52 @@ test("a granted prefix never auto-allows a different prefix or a path escaping c
   });
 });
 
+test("runCommandPrefix enforces rawInput key allowlist, exact Cwd realpath equality, non-empty toolCallId, and denies git grants", async t => {
+  const dir = makeTempDir("agy-rawinput-");
+  const repo = path.join(dir, "repo");
+  fs.mkdirSync(path.join(repo, "sub", "tests"), { recursive: true });
+  seedRepoTargets(repo);
+  fs.writeFileSync(path.join(repo, "sub", "tests", "a.test.mjs"), "");
+  const req = (toolCallId, rawInput) => ({
+    method: "session/request_permission",
+    params: {
+      toolCall: { sessionUpdate: "tool_call", toolCallId, name: "run_command", kind: "execute", status: "pending", rawInput, args: rawInput },
+      options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }]
+    }
+  });
+  const serverRequests = [
+    req("ok-root-cwd", { CommandLine: "node --test tests/a.test.mjs", Cwd: repo, WaitMsBeforeAsync: 5000, toolSummary: "ok" }),
+    req("unknown-env", { CommandLine: "node --test tests/a.test.mjs", env: { NODE_OPTIONS: "--eval=1" } }),
+    req("unknown-workdir", { CommandLine: "node --test tests/a.test.mjs", WorkingDirectory: dir }),
+    req("unknown-bg", { CommandLine: "node --test tests/a.test.mjs", IsBackground: true }),
+    req("unknown-daemon", { CommandLine: "node --test tests/a.test.mjs", IsDaemon: false }),
+    req("sub-cwd", { CommandLine: "node --test tests/a.test.mjs", Cwd: "sub" }),
+    req("git-ineligible", { CommandLine: "git diff --stat" }),
+    req("   ", { CommandLine: "node --test tests/a.test.mjs" })
+  ];
+  const fake = installFakeAntigravity(dir, { serverRequests, turnUpdates: [] });
+  const prevBin = process.env.FUGATO_ANTIGRAVITY_BIN;
+  process.env.FUGATO_ANTIGRAVITY_BIN = fake.binary;
+  t.after(() => {
+    if (prevBin === undefined) delete process.env.FUGATO_ANTIGRAVITY_BIN;
+    else process.env.FUGATO_ANTIGRAVITY_BIN = prevBin;
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const seen = new Map();
+  await runAntigravityTurn(repo, {
+    executionCwd: repo, prompt: "Check rawInput guards.", sandbox: "danger-full-access",
+    onApprovalRequest: request => {
+      seen.set(request.toolCall.toolCallId, request.options);
+      return { decision: "deny" };
+    }
+  });
+  assert.deepEqual(seen.get("ok-root-cwd"), ["Allow once", 'Allow "node --test" for this job', "Deny"]);
+  for (const id of ["unknown-env", "unknown-workdir", "unknown-bg", "unknown-daemon", "sub-cwd", "git-ineligible"]) {
+    assert.deepEqual(seen.get(id), ["Allow once", "Deny"], id);
+  }
+  assert.equal(seen.has("   "), false, "whitespace-only toolCallId must be rejected before asking");
+});
+
 test("job grants do not carry over into a continuation job or a new job", t => {
   const f = cliFixture(t, "grant-single-test");
   const firstLaunch = json(f.call("task", "--backend", "antigravity", "--detached", "--json", "First job."));
@@ -161,7 +214,6 @@ test("job grants do not carry over into a continuation job or a new job", t => {
   const firstDone = json(f.call("wait", firstLaunch.jobId, "--owner", firstLaunch.ownerId, "--json"));
   assert.equal(firstDone.status, "completed");
 
-  // Continuation job (--continue) must NOT inherit the in-memory grant.
   const contLaunch = json(f.call("task", "--continue", firstLaunch.jobId, "--detached", "--json", "Continue job."));
   const qCont = json(f.call("wait", contLaunch.jobId, "--owner", contLaunch.ownerId, "--json"));
   assert.equal(qCont.status, "needs_answer");
@@ -171,7 +223,6 @@ test("job grants do not carry over into a continuation job or a new job", t => {
   assert.equal(contDone.status, "completed");
   assert.deepEqual((f.stored(contLaunch.jobId).activity ?? []).filter(ev => ev.type === "permissionAutoAllowed"), []);
 
-  // Fresh job must NOT inherit the in-memory grant either.
   const freshLaunch = json(f.call("task", "--backend", "antigravity", "--detached", "--json", "New job."));
   const qFresh = json(f.call("wait", freshLaunch.jobId, "--owner", freshLaunch.ownerId, "--json"));
   assert.equal(qFresh.status, "needs_answer");
@@ -193,7 +244,7 @@ test("fugato answer handles Deny: <guidance>, plain Deny, Allow once, and reject
     ["empty Deny: is denied without guidance", "Deny:", "deny", undefined],
     ["blank Deny: is denied without guidance", "Deny:   ", "deny", undefined],
     ["overlong guidance is denied without guidance", `Deny: ${"x".repeat(1001)}`, "deny", undefined],
-    ["wrong grant prefix is denied", 'Allow "git diff" for this job', "deny", undefined]
+    ["wrong grant prefix is denied", 'Allow "claude plugin test" for this job', "deny", undefined]
   ];
   for (const [label, answerText, expectedOutcome, expectedGuidance] of cases) {
     await t.test(label, () => {
@@ -230,7 +281,7 @@ test("fugato answer handles Deny: <guidance>, plain Deny, Allow once, and reject
 // Minimal host harness exercising the real native-agent.mjs hooks against the real companion CLI.
 function nativeHarness(t, acpBehavior) {
   const dir = makeTempDir("agy-native-grants-"), repo = path.join(dir, "repo"), home = path.join(dir, "home");
-  fs.mkdirSync(repo); fs.mkdirSync(home); initGitRepo(repo);
+  fs.mkdirSync(repo); fs.mkdirSync(home); initGitRepo(repo); seedRepoTargets(repo);
   const acp = installFakeAntigravity(dir, acpBehavior);
   const env = {
     ...buildEnv(dir), HOME: home, USERPROFILE: home,
@@ -368,7 +419,7 @@ test("native adapter validator accepts Deny: <guidance> and job grants while ref
     assert.match(q.next, /Allow "node --test" for this job/);
     assert.match(q.next, /Deny: <guidance>/);
 
-    for (const bad of ["yes", "Allow", "Deny:", "Deny:   ", 'Allow "git diff" for this job', `Deny: ${"z".repeat(1001)}`]) {
+    for (const bad of ["yes", "Allow", "Deny:", "Deny:   ", 'Allow "claude plugin test" for this job', `Deny: ${"z".repeat(1001)}`]) {
       const refused = await h.runTurn(`Answer ${q.question.id}\n${bad}`);
       assert.equal(refused.status, "needs_answer", bad);
       assert.equal(refused.question.id, q.question.id, bad);
@@ -397,7 +448,6 @@ test("native adapter validator accepts Deny: <guidance> and job grants while ref
     assert.deepEqual(q3.question.options, ["Allow once", "Deny"]);
     assert.equal(q3.next, `SendMessage to ${q3.worker}: "Answer ${q3.question.id}\nAllow once" (or Deny)`);
 
-    // A job-grant answer must be refused on a 2-option card.
     const refused = await h.runTurn(`Answer ${q3.question.id}\nAllow "node --test" for this job`);
     assert.equal(refused.status, "needs_answer");
     assert.equal(refused.question.id, q3.question.id);

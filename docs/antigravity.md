@@ -203,20 +203,25 @@ In agy's default mode, every edit and command prompts for permission. The
 report card shows the full approval text with its whitespace preserved.
 Claude reviews the operation and follows the report's `next` instructions.
 `Allow once` applies only to the operation shown. For a safe, parseable
-`run_command` matching the parsed-argv allowlist (`node --test <relative files>`,
-`claude plugin test <relative dir>`, `git diff|status|log|show [flags] [relative paths]`,
-`npm test`, or `npm run test` / `npm run test:<name>`) with no shell operators,
-expansions, globs, or leading `VAR=value` overrides and with every path-like
-argument relative and resolving inside the job execution directory, the card
-also offers a third option: `Allow "<prefix>" for this job`. Answering that
-exact option allows the command and grants that prefix in memory for the
-current job only—never written to `config.toml` or the job file and never
+`run_command` matching one of the four parsed-argv allowlist forms—`node --test <file>...`
+(existing regular files), `claude plugin test <dir>` (an existing directory),
+`npm test`, or `npm run test` / `npm run test:<name>`—the card also offers a
+third option: `Allow "<prefix>" for this job`. Commands must contain no quotes,
+no shell operators, expansions, globs, or non-ASCII characters, and no `.`,
+`..`, or `node_modules` path segments; every path argument must exist and
+`realpath` inside the job execution directory, and any `Cwd`/`cwd` field must
+`realpath` to that exact execution directory. `git` commands are never
+grantable and show only `Allow once` and `Deny`—use the auto-allowed,
+hook-free `workspace_git_read` tool for `git` inspection instead. Answering the
+exact job-grant option allows the command and grants that prefix in memory for
+the current job only—never written to `config.toml` or the job file and never
 inherited by `--continue`, `--to`, `--thread`, or a new job. Later matching
 `run_command` calls in the same job auto-allow without parking and emit an
 argument-free `permissionAutoAllowed` activity entry
-(`job grant auto-allowed: <prefix>`). Commands with shell operators,
-expansions, non-allowlisted verbs, or escaping/absolute paths offer only
-`Allow once` and `Deny`.
+(`job grant auto-allowed: <prefix>`). Note that a `node --test` or `npm test`
+(or `npm run test` / `npm run test:<name>`) grant lets the worker run test code
+it can edit in its worktree for the rest of that job, so grant it only when
+that is acceptable.
 [Command classification](../plugins/codex/scripts/lib/command-classify.mjs)
 
 If the operation changes while the answer is pending, or if agy's `rawInput`
