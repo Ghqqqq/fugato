@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { listJobs, updateJob, readJobFile, resolveJobFile, resolveStateRoot, resolveStateDirForRoot, unresolvedTask } from "./state.mjs";
 import { inertIndexlessWorkspace } from "./indexless-state.mjs";
-import { APPROVAL_OPTIONS, ACTION_APPROVAL_OPTIONS, parseApprovalAnswer } from "./server-requests.mjs";
+import { APPROVAL_OPTIONS, ACTION_APPROVAL_OPTIONS, parseApprovalAnswer, parseActionApprovalAnswer } from "./server-requests.mjs";
 import { finishJournalJob } from "./run-journal.mjs";
 import { buildWorkerReport } from "./worker-report.mjs";
 import { jobBackend } from "./backends.mjs";
@@ -899,13 +899,18 @@ export class JobRuntime {
   async approval(request) {
     if (request.kind === "acp-permission") {
       const matches = job => job.request?.backend === "antigravity" && job.threadId === request.binding?.threadId && job.turnId === request.binding?.turnId;
-      if (request.signal?.aborted || !matches(readJobFile(resolveJobFile(this.cwd, this.id)))) return "deny";
+      if (request.signal?.aborted || !matches(readJobFile(resolveJobFile(this.cwd, this.id)))) return { decision: "deny" };
+      const options = Array.isArray(request.options) && request.options.length ? request.options : ACTION_APPROVAL_OPTIONS;
       const { text, resolution } = await askParentQuestion(this.cwd, this.id,
-        { question: request.question, options: ACTION_APPROVAL_OPTIONS, kind: "action-approval", binding: request.binding },
+        { question: request.question, options, kind: "action-approval", binding: request.binding },
         { signal: this.abort.signal, cancelled: () => request.signal?.aborted, onProgress: this.onProgress, turnId: request.binding.turnId });
       const current = readJobFile(resolveJobFile(this.cwd, this.id));
-      return resolution === "answered" && text === "Allow once" && !request.signal?.aborted && !this.abort.signal.aborted &&
-        !current.cancelRequested && ACTIVE.has(current.status) && matches(current) ? "once" : "deny";
+      const active = resolution === "answered" && !request.signal?.aborted && !this.abort.signal.aborted &&
+        !current.cancelRequested && ACTIVE.has(current.status) && matches(current);
+      if (!active) return { decision: "deny" };
+      const parsed = parseActionApprovalAnswer(text, options);
+      if (!parsed.valid) return { decision: "deny" };
+      return parsed.guidance ? { decision: parsed.decision, guidance: parsed.guidance } : { decision: parsed.decision };
     }
     if (request.kind === "action-approval") {
       const job = readJobFile(resolveJobFile(this.cwd, this.id));
