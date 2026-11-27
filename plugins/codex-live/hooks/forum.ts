@@ -19,6 +19,9 @@ export async function isolatedHome($: EngineInterface): Promise<string> {
   return home.replace(/\/$/, '');
 }
 
+const jobIdPattern = /^[A-Za-z0-9_.-]{1,128}$/;
+const MEMBER_JOB_LIMIT = 200;
+
 function roomView(value: unknown, session: string, id: string): ForumRoom | undefined {
   if (!value || typeof value !== 'object') return;
   const room = value as Record<string, unknown>;
@@ -26,8 +29,20 @@ function roomView(value: unknown, session: string, id: string): ForumRoom | unde
       typeof room.status !== 'string' || !['open', 'paused', 'closed'].includes(room.status) || typeof room.createdAt !== 'string' || !Number.isFinite(Date.parse(room.createdAt)) ||
       !Array.isArray(room.members) || room.members.length > 6 || room.members.some((member: { name?: unknown }) =>
         !member || typeof member.name !== 'string') || !Number.isSafeInteger(room.nextSeq) || (room.nextSeq as number) < 1) return;
+  const members = room.members.map((member: { name: string }) => limitChars(clean(member.name), 100));
+  const memberJobIds: Record<string, string[]> = {};
+  let hasJobIds = false;
+  for (const [index, member] of (room.members as { name: string; jobIds?: unknown }[]).entries()) {
+    if (!Array.isArray(member.jobIds)) continue;
+    const ids = [...new Set(member.jobIds
+      .filter((jobId): jobId is string => typeof jobId === 'string' && jobIdPattern.test(jobId)))].slice(-MEMBER_JOB_LIMIT);
+    if (ids.length) {
+      memberJobIds[members[index]!] = ids;
+      hasJobIds = true;
+    }
+  }
   return { roomId: id, sessionId: session, goal: limitChars(cleanBody(room.goal), 10_000), status: room.status as ForumRoom['status'],
-    intensity: limitChars(clean(room.intensity), 40), members: room.members.map((member: { name: string }) => limitChars(clean(member.name), 100)),
+    intensity: limitChars(clean(room.intensity), 40), members, ...(hasJobIds ? { memberJobIds } : {}),
     createdAt: room.createdAt, postCount: (room.nextSeq as number) - 1 };
 }
 

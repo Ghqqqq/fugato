@@ -7,6 +7,7 @@ import { PERSONA_IDS, INTENSITIES } from "./roundtable-personas.mjs";
 import { backendForModel } from "./roles.mjs";
 import { createMemberWorkspaces, rollbackMemberWorkspaces, memberWorkspaceStatus, candidateWorkspaceDiff } from "./roundtable-workspaces.mjs";
 import { summarizeUsage } from "./run-journal.mjs";
+import { seedApprovalTotals } from "./activity.mjs";
 
 export const EVENT_KINDS = Object.freeze(["idea", "finding", "question", "request", "intent", "candidate", "decision"]);
 const BACKENDS = ["codex", "antigravity"];
@@ -199,17 +200,33 @@ function summarizeMemberJob(jobId, job) {
 function memberJobs(room, member, env, jobIds = member.jobIds) {
   return jobIds.map(jobId => summarizeMemberJob(jobId, readMemberJob(room, member, jobId, env)));
 }
-function countJobApprovals(jobs) {
+export function countJobApprovals(jobs) {
   let pending = 0, answered = 0;
   for (const job of jobs) {
-    if (job?.pendingQuestion?.kind === "action-approval" && job.pendingQuestion.answer == null) pending++;
-    if (Array.isArray(job?.questionHistory)) {
+    if (!job) continue;
+    if (job.pendingQuestion?.kind === "action-approval" && job.pendingQuestion.answer == null) pending++;
+    if (job.approvalTotals && typeof job.approvalTotals === "object" && !Array.isArray(job.approvalTotals)
+        && Number.isSafeInteger(job.approvalTotals.answered) && job.approvalTotals.answered >= 0) {
+      answered += job.approvalTotals.answered;
+    } else if (Array.isArray(job.questionHistory)) {
       for (const entry of job.questionHistory) {
         if (entry?.kind === "action-approval" && entry.answer != null) answered++;
       }
     }
   }
   return { pending, answered };
+}
+function countJobApprovalTotals(jobs) {
+  const totals = { answered: 0, denied: 0, autoAllowed: 0, autoDenied: 0 };
+  for (const job of jobs) {
+    if (!job) continue;
+    const jobTotals = seedApprovalTotals(job);
+    totals.answered += jobTotals.answered;
+    totals.denied += jobTotals.denied;
+    totals.autoAllowed += jobTotals.autoAllowed;
+    totals.autoDenied += jobTotals.autoDenied;
+  }
+  return totals;
 }
 const UNREAD_FOOTER_MAX_CHARS = 240;
 const UNREAD_FOOTER_MAX_REFS = 3;
@@ -525,7 +542,8 @@ export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs
     const usageRecords = rawJobs.map(job => job ? { backend: member.backend, model: member.model, ...job } : null);
     allUsageRecords.push(...usageRecords);
     return { ...member, jobs: records.map(({ jobId, job }) => summarizeMemberJob(jobId, job)),
-      workspace: memberWorkspaceStatus(room, member, env), approvals: countJobApprovals(rawJobs), usage: summarizeUsage(usageRecords) };
+      workspace: memberWorkspaceStatus(room, member, env), approvals: countJobApprovals(rawJobs),
+      approvalTotals: countJobApprovalTotals(rawJobs), usage: summarizeUsage(usageRecords) };
   });
   for (const event of items) if (event.mentions.includes("chair") || (!event.mentions.length && now - Date.parse(event.at) >= windowMs)) {
     attention.push({ kind: "open_item", seq: event.seq, resource: `post/${event.seq}`, summary: `#${event.seq} ${event.kind} from ${event.author.name}: ${delta(event)}` });
@@ -551,6 +569,12 @@ export function roundtableStatus({ sessionId, roomId, now = Date.now(), windowMs
   }
   const totals = {
     approvals: members.reduce((sum, member) => ({ pending: sum.pending + member.approvals.pending, answered: sum.answered + member.approvals.answered }), { pending: 0, answered: 0 }),
+    approvalTotals: members.reduce((sum, member) => ({
+      answered: sum.answered + member.approvalTotals.answered,
+      denied: sum.denied + member.approvalTotals.denied,
+      autoAllowed: sum.autoAllowed + member.approvalTotals.autoAllowed,
+      autoDenied: sum.autoDenied + member.approvalTotals.autoDenied
+    }), { answered: 0, denied: 0, autoAllowed: 0, autoDenied: 0 }),
     usage: summarizeUsage(allUsageRecords)
   };
   return { attention, ...room, members, selectedCandidate: selection(events), openItems: items,

@@ -660,6 +660,54 @@ export function headerLayout(state: CodexLiveState, selected: CodexLiveJob, body
 
 }
 
+export type RoomTotals = {
+  pending: number;
+  answered: number;
+  totalTokens?: number;
+  partialTokens: boolean;
+  hasJobs: boolean;
+};
+
+export function roomTotals(room: ForumRoom, state: CodexLiveState): RoomTotals {
+  const jobIds = new Set<string>();
+  for (const ids of Object.values(room.memberJobIds ?? {})) {
+    for (const id of ids) jobIds.add(id);
+  }
+  if (!jobIds.size) return { pending: 0, answered: 0, partialTokens: false, hasJobs: false };
+  let pending = 0;
+  let answered = 0;
+  let hasJobs = false;
+  const jobsById = new Map(state.jobs.map(job => [job.id, job]));
+  const seenTokens = new Map<string, number | undefined>();
+  for (const id of jobIds) {
+    const job = jobsById.get(id);
+    const usage = state.usageByJob?.[id]?.usage ?? job?.usage;
+    const approvals = state.approvalsByJob?.[id] ?? job?.approvals;
+    if (job || usage || approvals) hasJobs = true;
+    if (approvals) {
+      const expired = approvals.pending > 0 && approvals.expiresAt !== undefined && state.nowMs >= approvals.expiresAt;
+      if (!expired) pending += Math.max(0, approvals.pending);
+      answered += Math.max(0, approvals.answered);
+    }
+    if (usage) seenTokens.set(id, usage.totalTokens);
+  }
+  const knownTotals = [...seenTokens.values()].filter((n): n is number => n !== undefined);
+  const totalTokens = knownTotals.length > 0 ? knownTotals.reduce((sum, n) => sum + n, 0) : undefined;
+  const partialTokens = totalTokens !== undefined && knownTotals.length < seenTokens.size;
+  return { pending, answered, totalTokens, partialTokens, hasJobs };
+}
+
+function roomTotalSpans(totals: RoomTotals): Span[] {
+  if (!totals.hasJobs && !totals.pending && !totals.answered && totals.totalTokens === undefined) return [];
+  const spans: Span[] = [
+    { text: `appr ${totals.pending}p/${totals.answered}a`, color: totals.pending > 0 ? 'warning' : 'subtle' },
+  ];
+  if (totals.totalTokens !== undefined) {
+    spans.push({ text: ` · ${compactNumber(totals.totalTokens)}${totals.partialTokens ? '+' : ''} tok`, color: 'subtle' });
+  }
+  return spans;
+}
+
 // Render uses its current props, scroll uses its current event, and polling
 // uses the last measurement. Never grow a render to an older measured height.
 export function paneLayout(state: CodexLiveState, selected: CodexLiveJob | ForumRoom | undefined,
@@ -674,11 +722,14 @@ export function paneLayout(state: CodexLiveState, selected: CodexLiveJob | Forum
   const listedRooms = visibleForums(state).sort(forumOrder);
   const roomControls = listedRooms.some(room => room.status === 'closed') ? 1 : 0;
   const titleRows = bodyRows >= 7 && (visibleSessions(state).length || listedRooms.length) ? 1 : 0;
+  const forumTotals = forum ? roomTotalSpans(roomTotals(forum, state)) : [];
   const top: Span[][] = forum ? [
     clipSpans([{ text: fit(forum.goal.split('\n')[0] ?? '', Math.min(40,
       Math.max(0, columns - width(` · ${forum.intensity} · ${forum.status} · ${forum.postCount} posts`)))), bold: true },
       { text: ` · ${forum.intensity} · ${forum.status} · ${forum.postCount} posts`, color: 'subtle' }], columns),
-    [{ text: fit(forum.members.join(' · '), columns), color: 'subtle' as const }],
+    forumTotals.length
+      ? alignSpans([{ text: forum.members.join(' · '), color: 'subtle' }], forumTotals, columns, 2)
+      : [{ text: fit(forum.members.join(' · '), columns), color: 'subtle' as const }],
   ].slice(0, Math.max(0, bodyRows - footerRows - titleRows - 1)) : [];
   const roomBudget = Math.max(0, bodyRows - footerRows - titleRows - top.length - 2 - roomControls);
   const forumRooms = listedRooms.slice(0, Math.min(3, roomBudget));
@@ -785,8 +836,14 @@ export function footerLayout(job: CodexLiveJob | ForumRoom, state: CodexLiveStat
     const label = job.posts?.length && job.posts.every(post => expanded.includes(`post:${post.seq}`)) ? 'collapse all' : 'expand all';
     const toggle = fit(label, columns);
     const toggleGap = columns >= width(toggle) + 3 ? ' · ' : '';
+    const totals = roomTotals(job, state);
+    const right = totals.totalTokens !== undefined
+      ? `${compactNumber(totals.totalTokens)}${totals.partialTokens ? '+' : ''} tok`
+      : totals.hasJobs || totals.pending || totals.answered
+        ? `appr ${totals.pending}p/${totals.answered}a`
+        : '';
     return { ...feedFooter(`forum · ${job.status} · ${job.postCount} posts${following ? ' · following' : ''}`, 'subtle',
-      Math.max(0, columns - width(toggle) - width(toggleGap)), following, newLines), toggle, toggleGap };
+      Math.max(0, columns - width(toggle) - width(toggleGap)), following, newLines, right), toggle, toggleGap };
   }
   const { word } = jobState(job);
   const color = jobRowColor(job);
