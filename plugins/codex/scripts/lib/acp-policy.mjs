@@ -58,9 +58,7 @@ function hasGitComponent(filePath) {
 // the remaining segments.
 function canonicalizeExistingOrAncestor(absPath, depth = 0) {
   if (depth > MAX_SYMLINK_DEPTH) {
-    const error = new Error("Too many symbolic links encountered while resolving path.");
-    error.code = "ELOOP";
-    throw error;
+    throw Object.assign(new Error("Too many symbolic links encountered while resolving path."), { code: "ELOOP" });
   }
   try {
     return fs.realpathSync.native(absPath);
@@ -94,9 +92,7 @@ function canonicalizeExistingOrAncestor(absPath, depth = 0) {
 // present so symlink/.. follows the symlink before stepping up (matching POSIX).
 function resolveCanonical(inputPath, baseDir, depth = 0) {
   if (depth > MAX_SYMLINK_DEPTH) {
-    const error = new Error("Too many symbolic links encountered while resolving path.");
-    error.code = "ELOOP";
-    throw error;
+    throw Object.assign(new Error("Too many symbolic links encountered while resolving path."), { code: "ELOOP" });
   }
   const parts = inputPath.split(/[\\/]+/);
   if (!parts.includes("..")) {
@@ -232,6 +228,7 @@ function resolveProtectedHomes(env = process.env) {
  *       `outside_workspace` (or `git_metadata_write` for resolved gitdir/commondir
  *       or `.git` components). Reads elsewhere -> allowed.
  */
+/** @param {{ target?: string, executionCwd?: string, access?: string, env?: NodeJS.ProcessEnv }} [options] */
 export function evaluatePath({ target, executionCwd, access, env = process.env } = {}) {
   if (access !== "read" && access !== "write") {
     return { allowed: false, code: "invalid_access", reason: "Access mode must be 'read' or 'write'." };
@@ -811,6 +808,7 @@ function checkCommandRecursive(commandLine, depth, context) {
  * on the out-of-bounds denylist. It is NOT auto-approval; the command still
  * parks for chair approval unless a separate grant applies.
  */
+/** @param {string} commandLine @param {{ executionCwd?: string, env?: NodeJS.ProcessEnv }} [options] */
 export function evaluateCommand(commandLine, { executionCwd, env = process.env } = {}) {
   if (typeof commandLine !== "string" || !commandLine.trim() || commandLine.includes("\0")) {
     return {

@@ -928,9 +928,10 @@ export async function runAntigravityTurn(cwd, options = {}) {
   }
   // A guided denial the worker recovered from is soft: when the turn ended
   // cleanly and every blocker is such a denial, report deniedActions instead.
-  const guidedDenials = blockers.filter(value => value?.kind === "acp-permission" && value.code === "approval_denied" && typeof value.guidance === "string");
+  const guidanceOf = (/** @type {any} */ value) => typeof value?.guidance === "string" ? value.guidance : null;
+  const guidedDenials = blockers.filter(value => value?.kind === "acp-permission" && value.code === "approval_denied" && guidanceOf(value));
   const deniedActions = stopReason === "end_turn" && !failure && !cancelRequested && guidedDenials.length && guidedDenials.length === blockers.length
-    ? blockers.splice(0).map(value => ({ code: value.code, guidance: value.guidance })) : [];
+    ? blockers.splice(0).map(value => ({ code: value.code, guidance: guidanceOf(value) })) : [];
   const denialNotice = deniedActions.length
     ? `${deniedActions.length} denied ${deniedActions.length === 1 ? "action" : "actions"} came with guidance; the worker continued and ended its turn normally.` : null;
   const notice = [steeringNotice, denialNotice].filter(Boolean).join(" ") || null;

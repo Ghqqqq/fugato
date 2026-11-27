@@ -99,6 +99,7 @@ function validateRealPath(arg, realCwd, expectedType) {
   return { ok: true };
 }
 
+/** @param {string} commandLine @param {{ cwd?: string }} [options] */
 export function classifyCommand(commandLine, { cwd } = {}) {
   if (typeof cwd !== "string" || !cwd.trim()) return { eligible: false, reason: "missing_cwd" };
   if (typeof commandLine !== "string" || !commandLine.trim()) return { eligible: false, reason: "empty_command" };
@@ -134,7 +135,8 @@ export function classifyCommand(commandLine, { cwd } = {}) {
   }
   if (rule.args.kind === "relativeFiles" || rule.args.kind === "relativeDir") {
     if (rest.length < (rule.args.min ?? 0)) return { eligible: false, reason: "missing_arguments" };
-    if (rule.args.max !== undefined && rest.length > rule.args.max) return { eligible: false, reason: "unexpected_arguments" };
+    const max = "max" in rule.args ? rule.args.max : undefined;
+    if (max !== undefined && rest.length > max) return { eligible: false, reason: "unexpected_arguments" };
     const expectedType = rule.args.kind === "relativeFiles" ? "file" : "dir";
     for (const arg of rest) {
       const checked = validateRealPath(arg, realCwd, expectedType);
