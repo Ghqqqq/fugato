@@ -216,20 +216,38 @@ export function formatRoleSummary(table) {
   return `${roles}; high-stakes ${tuples.at(-1)}; Gemini ${gemini}`;
 }
 
+function formatReminderRoles(table, roleIds = null) {
+  if (!table) return "roles: default";
+  const rows = roleIds ? roleIds.map(id => table.roles.find(row => row.id === id)).filter(Boolean) : table.roles;
+  const overridden = rows.filter(row => row.source === "saved" || row.source === "legacy");
+  const gemini = table.gemini?.installed ? "on" : "off";
+  if (!overridden.length) return `roles: default; Gemini ${gemini}`;
+  const allTuples = formatRoleTuples([...table.roles, ...(table.highStakes ? [table.highStakes] : [])]);
+  const tupleById = new Map(table.roles.map((row, index) => [row.id, allTuples[index]]));
+  const groups = new Map();
+  for (const { id } of overridden) {
+    const tuple = tupleById.get(id);
+    if (!groups.has(tuple)) groups.set(tuple, []);
+    groups.get(tuple).push(id);
+  }
+  const list = Array.from(groups, ([tuple, ids]) => `${ids.join("|")} ${tuple}`).join(", ");
+  return `roles: overrides ${list}; Gemini ${gemini}`;
+}
+
 // What the UserPromptSubmit hook adds to the prompt while the mode is on.
 // Short on purpose: it is paid on every prompt. The protocol itself is read
 // only when its current version is absent (including after compaction).
 export function reminderText(mode, protocolDir = PROTOCOL_DIR, table) {
   const name = mode.name ?? "ultra", options = mode.options ?? mode;
   const [core, active] = protocolParts(name, protocolDir);
-  const suffix = `core v${core.version} + ${active.part} v${active.version} to substantive tasks; re-read ${core.file} (first line: ${core.header}) and ${active.file} (first line: ${active.header}) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.`;
-  if (name === "roundtable") return `Roundtable mode on (intensity ${options.intensity}, roles ${options.roles?.join(",") ?? "recommend roster for confirmation"}; persona models from role table with room and saved persona overrides). Apply Roundtable mode protocol ${suffix}`;
-  if (name === "pair" || name === "duel") {
-    const ids = name === "pair" ? ["implement", "verify"] : ["implement", "verify", "architect"];
-    const [implement, verify, architect] = formatRoleTuples(ids.map(id => table.roles.find(row => row.id === id)));
-    if (name === "pair") return `Pair mode on (executor role implement ${implement}, verifier role verify ${verify}, max ${PAIR_MAX_REWORK_ROUNDS} rework rounds). Apply pair protocol ${suffix}`;
-    return `Duel mode on (Codex builder implement ${implement}, breaker verify ${verify}, analysis architect ${architect}, max ${options.rounds} rounds). Apply duel protocol ${suffix}`;
+  const suffix = `Apply core.md@${core.version} + ${active.part}.md@${active.version} (${protocolDir}) to substantive tasks; re-read unless full text is in context.`;
+  if (name === "roundtable") {
+    const gemini = table ? `; Gemini ${table.gemini?.installed ? "on" : "off"}` : "";
+    return `Roundtable mode (${options.intensity ?? "standard"}, roles: ${options.roles?.join(",") ?? "recommend"}${gemini}). ${suffix}`;
   }
-  const cap = options.maxWorkers === "unlimited" ? "no worker cap" : `max ${effectiveMaxWorkers(options.maxWorkers)} workers${options.maxWorkers === "auto" ? " (auto)" : ""}`;
-  return `Ultra-codex mode on (${options.scale}, ${cap}; roles: ${formatRoleSummary(table)}). Apply protocol ${suffix}`;
+  if (name === "pair") return `Pair mode (max ${PAIR_MAX_REWORK_ROUNDS} rework; ${formatReminderRoles(table, ["implement", "verify"])}). ${suffix}`;
+  if (name === "duel") return `Duel mode (max ${options.rounds ?? DEFAULT_DUEL_ROUNDS} rounds; ${formatReminderRoles(table, ["implement", "verify", "architect"])}). ${suffix}`;
+  const maxWorkers = options.maxWorkers ?? DEFAULT_MAX_WORKERS;
+  const cap = maxWorkers === "unlimited" ? "no cap" : `max ${effectiveMaxWorkers(maxWorkers)}${maxWorkers === "auto" ? " auto" : ""}`;
+  return `Ultra mode (${options.scale ?? "auto"}, ${cap}; ${formatReminderRoles(table)}). ${suffix}`;
 }

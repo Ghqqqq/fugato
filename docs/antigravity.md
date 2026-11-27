@@ -134,10 +134,10 @@ fallback. Escalating a resolved Gemini job that still fails after a rework is
 a separate step: a fresh `fugato:codex-native` dispatch with `--high-stakes`
 (see the protocol's Worker roles section).
 
-Wait for the worker's report before using `SendMessage`. A running turn
-refuses messages, even if a progress notice already shows a question.
-Once the turn finishes, send a plain brief to start the next assignment on
-the same session. Use `/tasks` to stop the worker.
+You can use `SendMessage` from the main conversation while a Gemini worker is
+running to steer the turn (see [Mid-turn steering](#mid-turn-steering)). Once
+the turn finishes, send a plain brief to start the next assignment on the same
+session. Use `/tasks` to stop the worker.
 [Message routing](../plugins/codex/hooks/steering.mjs)
 
 If the report says `needs_answer`, its `next` field shows the exact reply
@@ -157,6 +157,37 @@ characters. Fugato checks the ID against the job's actual pending question.
 It refuses replies with a missing header, a stale or mismatched ID, or an
 invalid body. Those replies start no work.
 [`geminiAnswerNext` and `geminiMessageRefusal`](../plugins/codex/hooks/native-agent.mjs)
+
+## Mid-turn steering
+
+ACP v1 has no `turn/steer` RPC, so Fugato delivers mid-turn steering to a
+running Gemini worker at parent-bridge tool boundaries.
+
+- When the chair sends `SendMessage` to a running `fugato:gemini-native` worker
+  that has no pending question, Fugato persists the note immediately in
+  `<jobId>.steering.json`, returns delivered without waiting on the Codex 6 s
+  poll loop, and records a `Gemini steering queued.` notice.
+- On the worker's next parent-bridge tool call (`workspace_*`, `forum_*`, or
+  `ask_parent`, including non-roundtable jobs and `forum_read`), the bridge
+  atomically drains all queued notes, marks them `applied` with `appliedAt`,
+  and appends them once to the tool reply framed as
+  `[Chair steering update — apply immediately]` (or `[Chair denial guidance]`
+  for denial guidance). Subsequent tool replies never repeat already-applied
+  notes.
+- Delivery happens only at parent-bridge tool boundaries. During a
+  pure-reasoning stretch or local tool sequence with no parent-bridge calls,
+  queued notes stay undrained until the turn ends. At turn end, Fugato marks
+  any remaining queued notes terminal so they are never delivered twice, and
+  surfaces them on the job report in `unconsumedSteers` (`[{ id, text }]`,
+  bounded to 3 clipped entries plus `unconsumedSteersOmitted`) alongside a
+  warning `notice` telling the chair to resend with `SendMessage` if still
+  needed.
+- If a question or approval is pending (`needs_answer`), steering defers and
+  `Answer <questionId>` routing is unchanged. Active Gemini roundtable seats
+  continue to receive forum unread notices via bridge tool footers rather than
+  the steering queue.
+  [Steering queue](../plugins/codex/scripts/lib/steering.mjs) ·
+  [Bridge footer drain](../plugins/codex/scripts/parent-bridge-mcp.mjs)
 
 ## Companion CLI
 
@@ -202,11 +233,41 @@ assign disjoint paths or start each CLI task in a separately prepared worktree.
 In agy's default mode, every edit and command prompts for permission. The
 report card shows the full approval text with its whitespace preserved.
 Claude reviews the operation and follows the report's `next` instructions.
-The answer applies only to the operation shown. If the operation changes
-while the answer is pending, or if agy's `rawInput` and its `args` copy
-disagree, Fugato denies the request with `operation-changed-before-approval`.
-After `Deny`, agy usually ends the turn and Fugato reports the job as blocked
-with `approval_denied`.
+`Allow once` applies only to the operation shown. For a safe, parseable
+`run_command` matching one of the four parsed-argv allowlist forms—`node --test <file>...`
+(existing regular files), `claude plugin test <dir>` (an existing directory),
+`npm test`, or `npm run test` / `npm run test:<name>`—the card also offers a
+third option: `Allow "<prefix>" for this job`. Commands must contain no quotes,
+no shell operators, expansions, globs, or non-ASCII characters, and no `.`,
+`..`, or `node_modules` path segments; every path argument must exist and
+`realpath` inside the job execution directory, and any `Cwd`/`cwd` field must
+`realpath` to that exact execution directory. `git` commands are never
+grantable and show only `Allow once` and `Deny`—use the auto-allowed,
+hook-free `workspace_git_read` tool for `git` inspection instead. Answering the
+exact job-grant option allows the command and grants that prefix in memory for
+the current job only—never written to `config.toml` or the job file and never
+inherited by `--continue`, `--to`, `--thread`, or a new job. Later matching
+`run_command` calls in the same job auto-allow without parking and emit an
+argument-free `permissionAutoAllowed` activity entry
+(`job grant auto-allowed: <prefix>`). Note that a `node --test` or `npm test`
+(or `npm run test` / `npm run test:<name>`) grant lets the worker run test code
+it can edit in its worktree for the rest of that job, so grant it only when
+that is acceptable.
+[Command classification](../plugins/codex/scripts/lib/command-classify.mjs)
+
+If the operation changes while the answer is pending, or if agy's `rawInput`
+and its `args` copy disagree, Fugato denies the request with
+`operation-changed-before-approval`. You may deny either with plain `Deny` or
+with `Deny: <guidance>` (1–1,000 trimmed characters after `Deny:`); both are
+accepted by native `Answer <questionId>` replies and `fugato answer`. Guidance
+is queued for the worker and delivered with its next parent-bridge tool result
+as `[Chair denial guidance]`. If agy then ends the turn normally and every
+blocker is such a guided denial, the job completes with `deniedActions`
+(`[{ code, guidance }]`) and a notice instead of `blocked`. Otherwise (agy
+stops the turn, a plain `Deny`, or any other blocker) Fugato reports the job as
+blocked with `approval_denied`, recording `guidance` on that blocker. Any
+answer other than `Allow once`, the exact displayed job-grant option, `Deny`,
+or `Deny: <guidance>` denies the request.
 
 For a CLI task, run the `fugato answer` command in the report's `next` field.
 The command already targets the displayed question ID. Pass just the answer
@@ -241,6 +302,38 @@ without a shell, reject path/symlink escapes and untrusted git config hooks or
 pagers, cap output size and runtime, and are auto-allowed one call at a time
 with argument-free `permissionAutoAllowed` audit entries in job activity.
 Codex bridges do not expose these tools. [`workspace-read-tools.mjs`](../plugins/codex/scripts/lib/workspace-read-tools.mjs)
+
+The bridge also exposes two confined write tools, auto-allowed the same way.
+`workspace_edit({ path, target, replacement, replace_all?, expected_occurrences? })`
+changes exactly one match by default and returns an error with the match count
+and line numbers (leaving the file unchanged and the turn alive) for zero or
+several matches. `workspace_write({ path, content, mode? })` creates
+(default), overwrites or appends. Both accept only workspace-relative paths,
+refuse `..`, symlinks, any `.git` component and results over 256 KiB, write
+atomically, and record a `fileChange` entry (`Update(path) · +N −M` /
+`Write(path)`) whose path joins the turn's `touchedFiles`. Gemini workers are
+told to prefer them; the built-in `edit_file` and `write_file` still park.
+When a built-in `edit_file` would replace several matches, or finds none, its
+card starts with `AMBIGUOUS:` or `NO MATCH:`.
+[`workspace-write-tools.mjs`](../plugins/codex/scripts/lib/workspace-write-tools.mjs)
+
+Before any request parks, Fugato applies a fail-closed boundary policy.
+Inside the job's execution directory a request passes the gate, except a write
+to any `.git` path; passing is not approval. Outside it, reads and writes under
+`~/.claude`, `~/.codex`, `~/.gemini` or the isolated Fugato home (including
+sibling roundtable worktrees), writes to the worktree's `gitdir`/`commondir`, and
+any other write are denied locally without waking Claude. Commands that run
+`npm run build`, `npm run verify`, `npm publish`, `npm install`/`ci`,
+`git push`, a recursive `rm` of an absolute or parent path, or that reference a
+protected home are denied the same way, as is a command whose working directory
+lies outside the job's directory. Paths are taken from every path-like argument
+(including nested and array values, `file:` URIs and diff targets) and resolved
+against the request's own working directory; a tool not clearly read-only is
+checked as a write. Each denial ends up as a blocker with
+its policy code (`protected_home`, `outside_workspace`, `git_metadata_write`,
+`forbidden_command`). Fugato gates only the tool calls agy submits through
+`session/request_permission`; it is not an operating-system sandbox.
+[`acp-policy.mjs`](../plugins/codex/scripts/lib/acp-policy.mjs)
 
 ## Reports, budgets and stopping
 
@@ -319,8 +412,8 @@ status <roomId>` reports pending and answered action approvals alongside token
 totals per member and for the room. Edits and commands still
 park for approval in agy's default mode, while parent-bridge calls
 (`ask_parent`, `forum_read`, `forum_post`, `workspace_list`, `workspace_grep`,
-`workspace_git_read`) are auto-allowed one call at a time and audited in job
-activity without arguments.
+`workspace_git_read`, `workspace_edit`, `workspace_write`) are auto-allowed one
+call at a time and audited in job activity without arguments.
 
 Terms note: roundtable seats run `agy acp` as a backend worker. Google's FAQ
 names Claude Code as third-party software, and an `antigravity-cli` collaborator

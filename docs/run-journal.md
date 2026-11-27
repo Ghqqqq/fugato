@@ -71,26 +71,29 @@ provides the same totals for its displayed job list.
 | `close` | `judgment` (`passed`, `blocked`, `abandoned`), non-empty `summary`; optional `openRisks` array of strings |
 
 Verdict criteria must already be declared by `start` or `add criteria`. Each
-`criterion` accepts exact text (including case and whitespace), a unique shown
-prefix ending in `…`, or a unique ID such as `K7`, `K7:` or `F3` when a declared
-criterion starts with that ID. `K<n>` IDs may be followed by a colon, whitespace or
-end of text; other IDs of one to four uppercase letters followed by digits (`F3`, `S1`,
-`AC2`) must be followed by a colon.
+`criterion` accepts exact text (including case and whitespace), a 1-based index
+over active (non-withdrawn) criteria in `show` order (`1`, `#1`, or `1.`), a
+unique shown prefix ending in `…` or `...`, or a unique ID such as `K7`, `K7:`
+or `F3` when a declared criterion starts with that ID. `K<n>` IDs may be
+followed by a colon, whitespace or end of text; other IDs of one to four
+uppercase letters followed by digits (`F3`, `S1`, `AC2`) must be followed by a
+colon.
 IDs are not assigned automatically. A shown prefix can match whitespace folded
-for display; accepted shortcuts are saved as the full declared text. Unknown or
-ambiguous matches are rejected before writing. Use exact text to disambiguate,
-and `journal add criteria` to introduce new criteria.
+for display; accepted shortcuts are saved as the full declared text. Unknown,
+out-of-range or ambiguous matches are rejected before writing. Use exact text
+to disambiguate, and `journal add criteria` to introduce new criteria.
 
 Empty criteria arrays are allowed when no criterion applies. Verdicts can name
 jobs whose ordinary records have expired. The latest verdict supersedes earlier
-verdicts in the recovery view; all entries remain in the journal. Jobs without a
-verdict and jobs whose latest verdict is unresolved `REWORK` or `REASSIGN` are
-open items. A later `ACCEPT` or `ACCEPT_WITH_GLUE` resolves earlier rework or
-reassignment when it lists the rejected job in `resolves`, or is a descendant
-through explicit `followUpOf`/`continuationOf` links. Sharing a thread alone does
-not resolve it. The accepting job's latest verdict must still be acceptance and
-must follow the rejected job's latest verdict in journal order; a later rejection
-reopens it. `resolves` accepts job IDs linked to this run regardless of their
+verdicts in the recovery view; all entries remain in the journal. Unresolved
+jobs without a verdict and jobs whose latest verdict is unresolved `REWORK` or
+`REASSIGN` are open items. A later `ACCEPT` or `ACCEPT_WITH_GLUE` resolves
+earlier rework, reassignment or unjudged superseded ancestors when it lists the
+superseded job in `resolves`, or is a descendant through explicit
+`followUpOf`/`continuationOf` links. Sharing a thread alone does not resolve it,
+and independent unjudged jobs remain open. The accepting job's latest verdict
+must still be acceptance and, when the superseded job has a verdict, must follow
+it in journal order; a later rejection reopens it. `resolves` accepts job IDs linked to this run regardless of their
 Claude session; unknown job IDs are rejected before writing.
 
 When the user drops a criterion, record its exact text and the reason:
@@ -160,7 +163,7 @@ or unreadable journal. Text lists every issue and its next safe action. JSON is:
 | --- | --- | --- |
 | `unfinished_job` | Linked job has no `job_finished` and its readable record is queued/running | Check status and the existing owner wait; wait for completion |
 | `unrecorded_finish` | Linked job has a readable terminal record but no `job_finished` | Read `fugato result <jobId> --details` to retry finish recording, then verify evidence and record a verdict |
-| `no_verdict` | Finished job has no verdict | Inspect its report, verify criteria and record a verdict |
+| `no_verdict` | Finished job has no verdict and no accepted `followUpOf`/`continuationOf`/`resolves` descendant | Inspect its report, verify criteria and record a verdict |
 | `open_rework` | Latest rejection has no later acceptance on that job, linked descendant or job naming it in `resolves` | Verify a correction before accepting; record `resolves` for a fresh replacement; continuing a stopped job requires consent |
 | `unmet_criterion` | Latest result for a non-withdrawn criterion is `not_met` or `cannot_verify` | Resolve and recheck it, then record observed evidence with `met` |
 | `unchecked_criterion` | Non-withdrawn task-level criterion appears in no verdict | Check and record that exact criterion text |

@@ -198,7 +198,7 @@ heavy mutating fan-out is not a measured guarantee.
 Choose a [worker role](ultra-codex.md#worker-roles) for each fresh assignment
 with `--role <id>`. Apply `--high-stakes` when the rule applies. Use normal
 speed by default and `--fast` only for Codex rows when the user requests it.
-The reminder shows the effective role table.
+SessionStart prints the full role table; the compact reminder shows Gemini availability and any overridden roles.
 
 ### `/fugato:pair`
 
@@ -289,9 +289,8 @@ word (for example `/fugato:pair -- status the parser`). A task keeps its selecte
 mode; it never silently switches modes to evade a limit.
 
 While enabled, one hook adds a versioned mode reminder to normal prompts and
-suppresses it for all four mode commands. Ultra/pair/duel reminders name their
-effective role settings. Roundtable names its intensity and roster selection
-and points to role-based persona models.
+suppresses it for all four mode commands. Ultra/pair/duel reminders show Gemini availability and any overridden roles.
+Roundtable names its intensity, roster selection and Gemini availability.
 Controls do not load protocol text into Claude's context. Tasks use the shared
 [core protocol](../plugins/codex/prompts/protocol/core.md) plus their active
 mode file (`ultra.md`, `pair.md`, `duel.md` or `roundtable.md`). Each file's
@@ -503,6 +502,51 @@ findings and the review job ID with `fugato result <jobId>` for the full result.
 An eligible first stop costs one Codex review turn; skipped gates and follow-up
 stops cost none.
 
+### `/fugato:doctor`
+
+Runs a unified, strictly read-only health check across Codex, Antigravity (`agy`),
+dispatch state, `fugato-live`, configuration conflicts, broker health, admission
+locks and staged approval artifacts. It creates, modifies and deletes no files,
+starts no broker or session, submits no model prompt, and never prints tokens,
+cookies or secrets.
+
+```bash
+/fugato:doctor
+/fugato:doctor --offline
+/fugato:doctor --json --cwd /path/to/repo
+```
+
+Checks reported (each with a stable `id`, `status` of `pass`, `warn` or `fail`,
+`code`, `summary` and actionable `fix`):
+
+- **Codex backend**: selected binary and `--version` / `app-server --help` check,
+  isolated home existence as a non-symlink directory, and read-only auth state
+  (queries an already-running broker when present, otherwise reports auth file
+  presence/absence as unverified without spawning `codex app-server`; skipped
+  with `--offline`).
+- **Antigravity backend**: `agy` discovery (`FUGATO_ANTIGRAVITY_BIN` / `PATH`),
+  `agy --version` check (`>= 1.5.15` required for Gemini session continuation),
+  and one bounded ACP `initialize` probe reporting advertised auth methods
+  without starting a session or changing login state (suggests `agy acp --login`;
+  skipped with `--offline`).
+- **Dispatch & plugins**: saved `--dispatch` mode, active `native-unavailable.json`
+  marker with expiry and reset command (`fugato setup --dispatch ...` without
+  `--dry-run`), and optional `fugato-live` plugin presence and manifest sanity.
+- **Configuration conflicts**: flags `permission_mapping=claude` when combined
+  with active Gemini roles or roundtable seats, and warns when saved
+  `default_sandbox` is not `danger-full-access` while Gemini roles/seats exist.
+- **Broker & state health**: workspace broker socket reachability, runtime
+  identity match, stale broker sockets or spawn locks, dead-owner Antigravity
+  admission locks, staged approval artifact disk usage and workspace `.state-lock`
+  health (with `fugato cleanup` where relevant).
+
+Exit code is `0` when no check fails (warnings allowed) and `1` when any check
+fails. Read-only `fugato doctor` is allowlisted in the permission hook so Claude
+can run `fugato doctor [--json] [--offline] [--cwd <dir>]` without extra prompts.
+The Codex binary checks only run `codex --version` and `codex app-server --help`,
+so a passing check confirms the binary starts, not that a session or model
+request would succeed; sign-in is verified only through an already-running broker.
+
 ### `/fugato-live`
 
 Opens the optional read-only live pane; `/fugato-live <name>` selects a worker.
@@ -572,6 +616,7 @@ the next task starts a fresh broker. Both commands accept `--cwd <dir>` and
 | `fugato runtime status` | Inspect the selected binary and saved workspace broker without starting a runtime |
 | `fugato runtime restart` | Retire an idle broker; refuse while busy; start fresh on the next task |
 | `fugato setup` | Runtime readiness and configuration |
+| `fugato doctor [--json] [--offline] [--cwd <dir>]` | Read-only diagnostics across Codex, Antigravity, dispatch, `fugato-live`, config conflicts, broker and state health; exit 0 on pass/warn, 1 on fail |
 | `fugato steer <jobId> --delivery-id <id> --owner <ownerId>` | Internal native-hook steering handoff, message on stdin; use SendMessage for native agents |
 | `fugato models [--json] [--all]` | Discover current account models and efforts, including hidden models with `--all`, and show the effective role table |
 | `fugato ultra-codex [on\|off\|status]` | Ultra session controls; task text belongs in the slash command |

@@ -21,6 +21,11 @@ Object.assign(process.env, {
   CODEX_COMPANION_BROKER_IDLE_SEC: "2"
 });
 fs.mkdirSync(process.env.HOME, { recursive: true });
+fs.writeFileSync(
+  process.env.GIT_CONFIG_GLOBAL,
+  "[user]\n\tname = Codex Plugin Tests\n\temail = tests@example.com\n[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n",
+  "utf8"
+);
 const alive = pid => { try { process.kill(pid, 0); return true; } catch (e) { if (e.code === "ESRCH") return false; throw e; } };
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 after(async () => {

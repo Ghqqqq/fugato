@@ -1,11 +1,11 @@
 import { fileURLToPath } from "node:url";
-import { snippet, activityReader, redactActivity } from "./activity.mjs";
+import { snippet, activityReader, redactActivity, recordApprovalResolution } from "./activity.mjs";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { listJobs, updateJob, readJobFile, resolveJobFile, resolveStateRoot, resolveStateDirForRoot, unresolvedTask } from "./state.mjs";
 import { inertIndexlessWorkspace } from "./indexless-state.mjs";
-import { APPROVAL_OPTIONS, ACTION_APPROVAL_OPTIONS, parseApprovalAnswer } from "./server-requests.mjs";
+import { APPROVAL_OPTIONS, ACTION_APPROVAL_OPTIONS, parseApprovalAnswer, parseActionApprovalAnswer } from "./server-requests.mjs";
 import { finishJournalJob } from "./run-journal.mjs";
 import { buildWorkerReport } from "./worker-report.mjs";
 import { jobBackend } from "./backends.mjs";
@@ -466,6 +466,28 @@ export function directReport(payload, job = {}, env = process.env) {
   }
   if (full.assumptions?.length) report.assumptions = full.assumptions.slice(0, 12).map(brief);
   if (full.keyFindings?.length) report.keyFindings = full.keyFindings.slice(0, 12).map(brief);
+  const rawUnconsumed = Array.isArray(full.unconsumedSteers) ? full.unconsumedSteers
+    : Array.isArray(job.result?.unconsumedSteers) ? job.result.unconsumedSteers
+    : Array.isArray(job.unconsumedSteers) ? job.unconsumedSteers : [];
+  const validUnconsumed = rawUnconsumed
+    .filter(entry => entry && typeof entry === "object" && typeof entry.id === "string" && typeof entry.text === "string")
+    .map(entry => ({ id: truncate(brief(entry.id), 64), text: brief(entry.text) }))
+    .filter(entry => /^[A-Za-z0-9._:-]{1,64}$/.test(entry.id) && entry.text.length > 0);
+  const priorUnconsumedOmitted = Number.isSafeInteger(full.unconsumedSteersOmitted) && full.unconsumedSteersOmitted > 0
+    ? full.unconsumedSteersOmitted : 0;
+  const totalUnconsumed = validUnconsumed.length + priorUnconsumedOmitted;
+  const unconsumedSteers = validUnconsumed.slice(0, 3);
+  const unconsumedSteersOmitted = Math.max(0, totalUnconsumed - unconsumedSteers.length);
+  if (unconsumedSteers.length) report.unconsumedSteers = unconsumedSteers;
+  if (unconsumedSteersOmitted) report.unconsumedSteersOmitted = unconsumedSteersOmitted;
+  const rawNotice = typeof full.notice === "string" && full.notice.trim() ? full.notice
+    : typeof job.notice === "string" && job.notice.trim() ? job.notice : null;
+  const noticeText = rawNotice
+    ? truncate(redactActivity(rawNotice).replace(/\s+/g, " ").trim(), 600)
+    : totalUnconsumed
+      ? `${totalUnconsumed} mid-turn steering ${totalUnconsumed === 1 ? "message was" : "messages were"} not delivered before the Gemini turn ended; resend with SendMessage if still needed.`
+      : null;
+  if (noticeText) report.notice = noticeText;
   if (full.usage) {
     report.usage = full.usage;
     const model = job.result?.model ?? job.request?.model;
@@ -494,6 +516,22 @@ export function directReport(payload, job = {}, env = process.env) {
       }
     });
     report.next = nextCommand(command);
+  }
+  // Shrink or drop unconsumedSteers (preserving unconsumedSteersOmitted count)
+  // before fitDirectEnvelope trims changedFiles, checks or blocker messages.
+  while (envelopeBytes(report) > 2000 && report.unconsumedSteers?.length > 0) {
+    if (report.unconsumedSteers.length > 1) {
+      report.unconsumedSteers.pop();
+      report.unconsumedSteersOmitted = (report.unconsumedSteersOmitted ?? 0) + 1;
+    } else if (report.unconsumedSteers[0].text.length > 24) {
+      report.unconsumedSteers[0].text = `${truncate(report.unconsumedSteers[0].text, Math.floor(report.unconsumedSteers[0].text.length / 2))}…`;
+    } else {
+      delete report.unconsumedSteers;
+      report.unconsumedSteersOmitted = (report.unconsumedSteersOmitted ?? 0) + 1;
+    }
+  }
+  while (envelopeBytes(report) > 2000 && report.notice?.length > 48) {
+    report.notice = `${truncate(report.notice, Math.floor(report.notice.length / 2))}…`;
   }
   fitDirectEnvelope(report, checkPriorities);
   // Long workspace paths can exceed the fixed-field budget even after text
@@ -524,6 +562,10 @@ export function directReport(payload, job = {}, env = process.env) {
     const [blocker, key] = identifiers.sort(([a, ak], [b, bk]) => Buffer.byteLength(b[bk]) - Buffer.byteLength(a[ak]))[0];
     blocker[key] = truncate(blocker[key], Math.max(64, Math.floor(blocker[key].length / 2)));
   }
+  while (envelopeBytes(report) > 2000 && report.notice?.length > 16) {
+    report.notice = `${truncate(report.notice, Math.floor(report.notice.length / 2))}…`;
+  }
+  if (envelopeBytes(report) > 2000 && report.notice) delete report.notice;
   // A fresh task must keep its workspace. Omit a command that still cannot fit.
   if (envelopeBytes(report) > 2000) report.next = null;
   return report;
@@ -681,11 +723,17 @@ async function askParentQuestionSlot(cwd, id, { question, options = [], kind = "
   // requests have no ask_parent item. Never guess a missing ID from question
   // order, text, or the MCP transport's independent request ID.
   callId = kind === "question" ? callId : null;
-  const historyPatch = (current, resolution, answer = undefined) => ({ questionHistory: [...(current.questionHistory ?? []).slice(-19), {
-    id: questionId, callId, kind, text: question, options, askedAt, ...(binding ? { binding: { ...binding, jobId: id } } : {}),
-    answeredAt: answer === undefined ? null : new Date(Date.now()).toISOString(),
-    answer: answer === undefined ? null : answer.slice(0, 2000), resolution
-  }] });
+  const historyPatch = (current, resolution, answer = undefined) => {
+    const entry = {
+      id: questionId, callId, kind, text: question, options, askedAt, ...(binding ? { binding: { ...binding, jobId: id } } : {}),
+      answeredAt: answer === undefined ? null : new Date(Date.now()).toISOString(),
+      answer: answer === undefined ? null : answer.slice(0, 2000), resolution
+    };
+    return {
+      questionHistory: [...(current.questionHistory ?? []).slice(-19), entry],
+      ...recordApprovalResolution(current, entry)
+    };
+  };
   let admission;
   const admittedJob = updateJob(cwd, id, current => {
     let patch = {};
@@ -705,13 +753,15 @@ async function askParentQuestionSlot(cwd, id, { question, options = [], kind = "
     // that was not retried must not block every subsequent question forever.
     if (previous && Date.now() >= previous.expiresAt && (previous.answer === undefined || callerGone)) {
       const resolution = previous.answer === undefined ? "expired" : "orphaned";
+      const archived = {
+        id: previous.id, callId: previous.callId ?? null, kind: previous.kind ?? "question",
+        text: previous.text, options: previous.options, askedAt: previous.askedAt,
+        answeredAt: null, answer: previous.answer?.slice(0, 2000) ?? null, resolution
+      };
       patch = { pendingQuestion: null, phase: current.cancelRequested ? "interrupting" : "running",
         lastQuestion: { id: previous.id, resolution },
-        questionHistory: [...(current.questionHistory ?? []).slice(-19), {
-          id: previous.id, callId: previous.callId ?? null, kind: previous.kind ?? "question",
-          text: previous.text, options: previous.options, askedAt: previous.askedAt,
-          answeredAt: null, answer: previous.answer?.slice(0, 2000) ?? null, resolution
-        }] };
+        questionHistory: [...(current.questionHistory ?? []).slice(-19), archived],
+        ...recordApprovalResolution(current, archived) };
       current = { ...current, ...patch };
     }
     if (!ACTIVE.has(current.status) || current.cancelRequested || (turnId && current.turnId !== turnId)) admission = "interrupted";
@@ -891,13 +941,18 @@ export class JobRuntime {
   async approval(request) {
     if (request.kind === "acp-permission") {
       const matches = job => job.request?.backend === "antigravity" && job.threadId === request.binding?.threadId && job.turnId === request.binding?.turnId;
-      if (request.signal?.aborted || !matches(readJobFile(resolveJobFile(this.cwd, this.id)))) return "deny";
+      if (request.signal?.aborted || !matches(readJobFile(resolveJobFile(this.cwd, this.id)))) return { decision: "deny" };
+      const options = Array.isArray(request.options) && request.options.length ? request.options : ACTION_APPROVAL_OPTIONS;
       const { text, resolution } = await askParentQuestion(this.cwd, this.id,
-        { question: request.question, options: ACTION_APPROVAL_OPTIONS, kind: "action-approval", binding: request.binding },
+        { question: request.question, options, kind: "action-approval", binding: request.binding },
         { signal: this.abort.signal, cancelled: () => request.signal?.aborted, onProgress: this.onProgress, turnId: request.binding.turnId });
       const current = readJobFile(resolveJobFile(this.cwd, this.id));
-      return resolution === "answered" && text === "Allow once" && !request.signal?.aborted && !this.abort.signal.aborted &&
-        !current.cancelRequested && ACTIVE.has(current.status) && matches(current) ? "once" : "deny";
+      const active = resolution === "answered" && !request.signal?.aborted && !this.abort.signal.aborted &&
+        !current.cancelRequested && ACTIVE.has(current.status) && matches(current);
+      if (!active) return { decision: "deny" };
+      const parsed = parseActionApprovalAnswer(text, options);
+      if (!parsed.valid) return { decision: "deny" };
+      return parsed.guidance ? { decision: parsed.decision, guidance: parsed.guidance } : { decision: parsed.decision };
     }
     if (request.kind === "action-approval") {
       const job = readJobFile(resolveJobFile(this.cwd, this.id));

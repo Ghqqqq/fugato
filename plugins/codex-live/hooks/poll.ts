@@ -1,6 +1,6 @@
 import { atom, read } from 'claude-code';
 import type { EngineInterface } from 'claude-code';
-import type { CodexLiveJob, CodexLiveMarker, CodexLiveState } from '../types';
+import type { CodexLiveJob, CodexLiveJobApprovals, CodexLiveMarker, CodexLiveState } from '../types';
 import { ATTENTION_SESSION_LIMIT, attention, boundState, clean, detailedTurns, expireQuestion, fitState, groupedSessions, jobSummary, jobView, markerView, normalizeSessions, oldestJob,
   retainedTurns, sessionForId, sessionId, statusLine, unavailableJob, usageSnapshots, visibleSessions } from './model';
 import { feedLines, hasIndexSummary, paneLayout, normalizeFeed, recentEndedJobIds, selectedJob } from './layout';
@@ -31,6 +31,68 @@ async function readIndexJobs($: EngineInterface, path: string, markers: Readonly
 function staleView(job: CodexLiveJob): CodexLiveJob {
   return { ...job, detailsUnavailable: true,
     ...('fromWorkspaceIndex' in job ? { fromWorkspaceIndex: false } : {}) };
+}
+
+function jobApprovals(value: unknown, job: CodexLiveJob, nowMs: number): CodexLiveJobApprovals | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const pendingObj = raw.pendingQuestion && typeof raw.pendingQuestion === 'object' && !Array.isArray(raw.pendingQuestion)
+    ? raw.pendingQuestion as Record<string, unknown> : undefined;
+  const deadline = pendingObj?.expiresAt !== undefined ? Number(pendingObj.expiresAt) : NaN;
+  const expiresAt = typeof deadline === 'number' && Number.isFinite(deadline) ? deadline : undefined;
+  const pending = job.active && pendingObj?.kind === 'action-approval' && pendingObj.answer == null && !(deadline <= nowMs) ? 1 : 0;
+  let answered = 0;
+  const totals = raw.approvalTotals && typeof raw.approvalTotals === 'object' && !Array.isArray(raw.approvalTotals)
+    ? raw.approvalTotals as Record<string, unknown> : undefined;
+  if (totals && typeof totals.answered === 'number' && Number.isSafeInteger(totals.answered) && totals.answered >= 0) {
+    answered = totals.answered;
+  } else if (Array.isArray(raw.questionHistory)) {
+    for (const entry of raw.questionHistory) {
+      if (entry && typeof entry === 'object' && !Array.isArray(entry) &&
+          (entry as Record<string, unknown>).kind === 'action-approval' &&
+          (entry as Record<string, unknown>).answer != null) answered++;
+    }
+  }
+  if (!pending && !answered) return undefined;
+  return { pending, answered, ...(pending && expiresAt !== undefined ? { expiresAt } : {}) };
+}
+
+function expireApprovals(approvals: CodexLiveJobApprovals | undefined, nowMs: number): CodexLiveJobApprovals | undefined {
+  if (!approvals) return undefined;
+  if (approvals.pending > 0 && approvals.expiresAt !== undefined && nowMs >= approvals.expiresAt) {
+    return approvals.answered > 0 ? { pending: 0, answered: approvals.answered } : undefined;
+  }
+  return approvals;
+}
+
+function approvalSnapshots(
+  previous: CodexLiveState['approvalsByJob'],
+  jobs: readonly CodexLiveJob[],
+  nowMs: number,
+  foreign: ReadonlySet<string>,
+  removed: ReadonlySet<string>,
+): CodexLiveState['approvalsByJob'] {
+  const snapshots: Record<string, CodexLiveJobApprovals> = {};
+  for (const [id, entry] of Object.entries(previous ?? {})) {
+    if (foreign.has(id) || removed.has(id)) continue;
+    const next = expireApprovals(entry, nowMs);
+    if (next) snapshots[id] = next;
+  }
+  for (const job of jobs) {
+    const next = expireApprovals(job.approvals, nowMs);
+    if (next) snapshots[job.id] = next;
+    else delete snapshots[job.id];
+  }
+  if (!Object.keys(snapshots).length) return undefined;
+  if (JSON.stringify(snapshots).length > 50_000) {
+    let size = 2;
+    const kept = Object.entries(snapshots).reverse().filter(entry => {
+      size += JSON.stringify(entry).length + 1;
+      return size <= 50_000;
+    }).reverse();
+    return Object.fromEntries(kept);
+  }
+  return snapshots;
 }
 
 type Cached = {
@@ -234,11 +296,13 @@ export function createPoller($: EngineInterface, diagnostics?: {
             // A task's missing private result normally means its outcome is
             // unresolved. An index omits that result for every task by design.
             const indexedBackend = indexed.backend ?? (indexed.request && typeof indexed.request === 'object' ? (indexed.request as Record<string, unknown>).backend : undefined) ?? entry.job.backend;
-            const job = jobView({ ...indexed, ...(indexedBackend ? { backend: indexedBackend } : {}), jobClass: undefined },
+            const rawIndexed = { ...indexed, ...(indexedBackend ? { backend: indexedBackend } : {}), jobClass: undefined };
+            const job = jobView(rawIndexed,
               { ...entry.marker, summary: clean(indexed.summary).slice(0, 1000) || entry.marker.summary }, false, now);
+            const approvals = jobApprovals(rawIndexed, job, now);
             if (sessionId(entry.job) !== sessionId(job) && previouslyKnown.has(job.id)) joinedThreads.add(job.id);
             const updated = Date.parse(typeof indexed.updatedAt === 'string' ? indexed.updatedAt : '');
-            const summary = { ...job, fromWorkspaceIndex: true, detailsUnavailable: true,
+            const summary = { ...job, ...(approvals ? { approvals } : {}), fromWorkspaceIndex: true, detailsUnavailable: true,
               lastUpdateMs: Number.isFinite(updated) ? updated : entry.job.lastUpdateMs };
             entry.job = summary;
             entry.missingSince = undefined; entry.removed = false;
@@ -287,11 +351,12 @@ export function createPoller($: EngineInterface, diagnostics?: {
             const raw = JSON.parse(text);
             if (!belongsHere(raw, entry)) continue;
             const job = jobView(raw, entry.marker, false, now);
+            const approvals = jobApprovals(raw, job, now);
             if ((entry.processedMtime !== undefined || current.jobs.some(previous => previous.id === job.id)) &&
                 sessionId(entry.job) !== sessionId(job)) joinedThreads.add(job.id);
             if (detailedIds.has(job.id)) selectedReads.set(job.id, raw);
             cachePayload(entry, raw, undefined, text.length * 2);
-            entry.job = { ...job, lastUpdateMs: now };
+            entry.job = { ...job, ...(approvals ? { approvals } : {}), lastUpdateMs: now };
             entry.processedMtime = stat.mtimeMs; // Commit only after read + parse + projection succeeded.
           }
           recovered(entry);
@@ -342,7 +407,11 @@ export function createPoller($: EngineInterface, diagnostics?: {
       // Expiry is a clock transition, including when the file is unchanged or unreadable.
       for (const entry of newest) {
         entry.job = expireQuestion(entry.job, now);
-        if (entry.full) entry.full = expireQuestion(entry.full, now);
+        if (entry.job.approvals) entry.job = { ...entry.job, approvals: expireApprovals(entry.job.approvals, now) };
+        if (entry.full) {
+          entry.full = expireQuestion(entry.full, now);
+          if (entry.full.approvals) entry.full = { ...entry.full, approvals: expireApprovals(entry.full.approvals, now) };
+        }
       }
       const byId = new Map(newest.map(entry => [entry.job.id, entry]));
       for (const id of newlyActive) opened.add(id);
@@ -404,6 +473,8 @@ export function createPoller($: EngineInterface, diagnostics?: {
         let full = saved?.full ?? entry.full;
         if (!full && raw) {
           full = jobView(raw, entry.marker, true, now);
+          const approvals = jobApprovals(raw, full, now);
+          if (approvals) full = { ...full, approvals };
         }
         if (!full && entry.job.detailsUnavailable) full = current.jobs.find(job => job.id === entry.job.id && job.detailsLoaded !== false);
         if (full) {
@@ -426,7 +497,8 @@ export function createPoller($: EngineInterface, diagnostics?: {
           const raw = JSON.parse(await $.fs.read(entry.marker.jobFile));
           if (!belongsHere(raw, entry)) continue;
           const summary = jobView(raw, entry.marker, false, now);
-          entry.job = { ...summary, lastUpdateMs: stat.mtimeMs === entry.processedMtime ? entry.job.lastUpdateMs : now };
+          const approvals = jobApprovals(raw, summary, now);
+          entry.job = { ...summary, ...(approvals ? { approvals } : {}), lastUpdateMs: stat.mtimeMs === entry.processedMtime ? entry.job.lastUpdateMs : now };
           projectDetails(entry, raw);
           entry.processedMtime = stat.mtimeMs;
           recovered(entry);
@@ -486,11 +558,13 @@ export function createPoller($: EngineInterface, diagnostics?: {
         const active = retained.some(session => session.active);
         const stale = jobs.some(job => job.detailsUnavailable);
         const nowMs = forumRooms.length ? Math.floor(now / 1000) * 1000 : stale || jobs.some(job => !job.finished) ? Math.floor(now / 5000) * 5000 : latest.nowMs;
+        const approvalsByJob = approvalSnapshots(latest.approvalsByJob, newest.map(entry => entry.job), now, foreignJobs, removedJobs);
         let candidate: CodexLiveState = { ...latest, forumRooms: visibility.forumRooms?.map(room => ({ ...room,
           viewedPosts: forumId(room) === selectedId ? room.postCount : latest.forumRooms?.find(old => old.roomId === room.roomId)?.viewedPosts })),
           jobs, selectedId, nowMs, sessionId: currentSession,
           ...(latest.usageByJob || newest.some(entry => entry.job.usage) ? { usageByJob: usageSnapshots(
             Object.fromEntries(Object.entries(latest.usageByJob ?? {}).filter(([id]) => !foreignJobs.has(id))), newest.map(entry => entry.job)) } : {}),
+          ...(approvalsByJob ? { approvalsByJob } : latest.approvalsByJob ? { approvalsByJob: undefined } : {}),
           turnCounts: Object.fromEntries(Object.entries(turnCounts).filter(([id]) => retainedSessions.has(id))),
           discoveryWarning, attentionOmitted,
           spinnerTick: active && (paneOpen || newlyActive.length) ? Math.floor(now / 1000) : latest.spinnerTick,

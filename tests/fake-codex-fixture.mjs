@@ -120,3 +120,152 @@ function job(f, id) { return json(f.call("status", id, "--json")).job; }
 
 return { fs, path, makeTempDir, initGitRepo, run, requireLocalSockets, buildEnv, installFakeCodex, browserOriginSetup, transportSetup, resolveIsolatedCodexHome, redactActivity, itemActivity, planActivity, activityReader, formatActivity, writeJobFile, upsertJob, updateJob, readJobFile, resolveJobFile, resolveStateDir, JobRuntime, pauseAdjustment, renewLease, markOwnerAttachment, leaseSnapshot, questionMessage, adoptJob, ownershipNotice, answerQuestion, askParentQuestion, ownerLost, directReport, progressSnapshot, PARENT_BRIDGE_ENV, buildWorkerReport, resolveSessionMarkersRoot, AGENT_NAMES, pickAgentName, splitRawArgumentString, bridgeScript, spawnOwned, script, hook, brokerScript, alive, fixture, json, directLines, direct, directError, delay, waitUntil, patchJob, job };
 }
+
+// Shared helpers for the split worker-report suites.
+export async function workerReportHarness() {
+  const { default: assert } = await import("node:assert/strict");
+  const lifecycle = await lifecycleHarness();
+  const { makeTempDir, run, initGitRepo, readJobFile, resolveStateDir, updateJob, spawnOwned: spawn, script, direct, directLines, json } = lifecycle;
+  const stateModule = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
+
+  function fixture(behavior, options) {
+    const dir = makeTempDir();
+    installFakeCodex(dir, behavior, options);
+    const repo = path.join(dir, "repo"); fs.mkdirSync(repo); initGitRepo(repo);
+    const env = { ...buildEnv(dir), CLAUDE_PLUGIN_DATA: path.join(dir, "data"), CODEX_COMPANION_HOME: path.join(dir, "isolated") };
+    const call = (...args) => run(process.execPath, [script, ...args], { cwd: repo, env });
+    const state = () => JSON.parse(fs.readFileSync(path.join(dir, "fake-codex-state.json"), "utf8"));
+    return { dir, repo, env, call, state };
+  }
+
+  function storedFixtureJob(f, id, patch = null) {
+    if (!patch) return readJobFile(path.join(resolveStateDir(f.repo, f.env), "jobs", `${id}.json`));
+    // Fixture setup uses the production lock/index writer without launching a CLI
+    // just to mutate test state. Restore the home before any asynchronous work.
+    const previous = process.env.CODEX_COMPANION_HOME;
+    process.env.CODEX_COMPANION_HOME = f.env.CODEX_COMPANION_HOME;
+    try { return updateJob(f.repo, id, () => patch); }
+    finally { process.env.CODEX_COMPANION_HOME = previous; }
+  }
+
+  function switchingFixture(makeFixture = fixture) {
+    const f = makeFixture("review-ok", { mutable: true }), binary = path.join(f.dir, "codex");
+    const source = fs.readFileSync(binary, "utf8");
+    const declaration = 'const BEHAVIOR = "review-ok";';
+    const request = 'const message = JSON.parse(line);';
+    assert.ok(source.includes(declaration) && source.includes(request));
+    fs.writeFileSync(binary, source.replace(declaration, 'let BEHAVIOR = "review-ok";')
+      .replace(request, `${request}\n  BEHAVIOR = loadState().fixtureBehavior || "review-ok";`));
+    return { ...f, select(behavior) {
+      const state = fs.existsSync(path.join(f.dir, "fake-codex-state.json")) ? f.state() : {};
+      fs.writeFileSync(path.join(f.dir, "fake-codex-state.json"), JSON.stringify({
+        nextThreadId: 1, nextTurnId: 1, appServerStarts: 0, threads: [], capabilities: null, lastInterrupt: null,
+        ...state, fixtureBehavior: behavior
+      }));
+    } };
+  }
+
+  function loseTurn(f) {
+    const response = f.call("task", "--report", "--json", "complete the fixture work");
+    assert.equal(response.status, 1, response.stderr);
+    const id = /Job handle: ([^;]+)/.exec(response.stderr)?.[1];
+    assert.ok(id, response.stderr);
+    const job = storedFixtureJob(f, id);
+    assert.equal(job.status, "failed");
+    assert.ok(job.threadId && job.turnId && job.errorMessage);
+    assert.equal(job.result.failureSource, "transport");
+    assert.equal(job.result.errorCode, "BROKER_CONNECTION_CLOSED");
+    assert.equal(job.result.turnEnded, false);
+    assert.match(job.errorMessage, /connection to Codex closed while the turn was running/i);
+    assert.equal(job.activity.length, 36);
+    assert.equal(f.state().nextTurnId, 2);
+    return job;
+  }
+
+  function recoveryBaseline(f) {
+    const original = loseTurn(f), backup = path.join(f.dir, "recovery-baseline");
+    const files = [f.env.CODEX_COMPANION_HOME, path.join(f.dir, "fake-codex-state.json"),
+      path.join(f.dir, "fake-codex-state.json.requests.jsonl")];
+    const contents = file => {
+      const stat = fs.lstatSync(file);
+      return stat.isDirectory() ? fs.readdirSync(file).sort().map(name => [name, contents(path.join(file, name))])
+        : [stat.mode & 0o777, fs.readFileSync(file).toString("base64")];
+    };
+    fs.mkdirSync(backup);
+    const expected = files.map(contents);
+    files.forEach((file, i) => fs.cpSync(file, path.join(backup, String(i)), { recursive: true }));
+    return { original, restore() {
+      files.forEach((file, i) => {
+        fs.rmSync(file, { recursive: true, force: true });
+        fs.cpSync(path.join(backup, String(i)), file, { recursive: true });
+      });
+      assert.deepEqual(files.map(contents), expected, "restore the job, index, markers, broker metadata and server before each recovery");
+    } };
+  }
+
+  const directJson = response => {
+    try { return JSON.parse(response.stdout); }
+    catch { return JSON.parse(response.stdout.trim().split("\n").filter(line => line.startsWith("{")).at(-1)); }
+  };
+
+  function callAsync(f, ...args) {
+    const child = spawn(process.execPath, [script, ...args], { cwd: f.repo, env: f.env, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    child.stdout.on("data", data => { stdout += data; });
+    child.stderr.on("data", data => { stderr += data; });
+    return { child, done: new Promise(resolve => child.once("close", status => resolve({ status, stdout, stderr }))) };
+  }
+
+  const checkDecisionReport = (f, output, status, code) => {
+    const usage = { inputTokens: 150, cachedInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10, totalTokens: 180 };
+    const result = direct(output, code);
+    assert.equal(result.status, status);
+    assert.deepEqual(Object.keys(result).slice(0, 4), ["status", "worker", "jobId", "summary"]);
+    assert.deepEqual(Object.keys(result).slice(-2), ["next", "details"]);
+    const { summary, ...envelope } = result;
+    assert.ok(Buffer.byteLength(JSON.stringify(envelope)) <= 2000);
+    assert.equal(result.details, `fugato result '${result.jobId}' --details`);
+    assert.equal(result.next, status === "completed" ? null : status === "needs_answer" ? `fugato answer ${result.worker} --question '${result.question.id}'` : status === "running" ? `fugato wait ${result.worker}` : `fugato task --to ${result.worker}`);
+    for (const key of ["waitCommand", "answerCommand", "answerAndWaitCommand", "rawOutputFile", "ownerId"]) assert.equal(Object.hasOwn(result, key), false);
+    const details = json(f.call("result", result.jobId, "--details"), code);
+    const reread = json(f.call("result", result.jobId), code);
+    assert.equal(reread.status, result.status); assert.equal(reread.next, result.next);
+    if (["running", "needs_answer"].includes(status)) {
+      assert.ok(details.waitCommand);
+      if (status === "needs_answer") {
+        assert.deepEqual(Object.keys(result.question), ["id", "kind", "text", "options", "expiresInSec"]);
+        assert.deepEqual(result.question.options, details.question.options);
+        assert.ok(result.question.expiresInSec >= 0);
+        assert.ok(details.answerCommand && details.answerAndWaitCommand);
+      }
+    } else {
+      assert.deepEqual(result.usage, usage);
+      assert.deepEqual(details.usage, usage);
+      assert.deepEqual(storedFixtureJob(f, result.jobId).result.usage, usage);
+      assert.deepEqual(Object.keys(result).slice(-3), ["usage", "next", "details"]);
+      assert.equal(result.summary, fs.readFileSync(details.rawOutputFile, "utf8").trim());
+      assert.deepEqual(reread, result);
+      const quiet = f.call("wait", result.jobId, "--direct", "--quiet");
+      assert.deepEqual(direct(quiet, code), result);
+      assert.equal(quiet.stdout, `${directLines(output.stdout).at(-1)}\n`);
+      const legacy = json(f.call("wait", result.jobId, "--json"), code);
+      const waited = json(f.call("wait", result.jobId, "--details"), code);
+      assert.deepEqual(Object.keys(legacy).filter(key => !Object.hasOwn(waited, key)), [], "no 1.3 wait report keys disappear");
+      for (const key of ["status", "reportFormat", "jobId", "threadId", "turnId", "exitCode", "sandbox", "approvalPolicy", "model", "effort", "serviceTier", "touchedFiles", "preExistingChanges", "fileTrackingStatus", "fileTrackingBasis", "verification", "verificationBasis", "keyFindings", "findingsBasis", "assumptions", "blockers", "question", "rawOutputFile", "resultFile", "ownerId", "sessionId"]) {
+        assert.equal(Object.hasOwn(details, key), Object.hasOwn(legacy, key), key);
+        assert.deepEqual(details[key], key === "blockers" && status === "blocked"
+          ? storedFixtureJob(f, result.jobId).result.structured.blockers : legacy[key], key);
+      }
+      assert.deepEqual(details.claimedVerification, legacy.claimedVerification ?? []);
+      assert.deepEqual(result.checks?.ran ?? [], details.verification);
+      assert.deepEqual(result.checks?.claimed ?? [], details.claimedVerification);
+      if (status !== "completed") {
+        assert.match(details.continuationCommand, / --direct$/);
+        assert.equal(legacy.continuationCommand, details.continuationCommand);
+        assert.equal(json(f.call("adopt", result.jobId, "--json"), 2).continuationCommand, details.continuationCommand);
+      }
+    }
+  };
+
+  return { lifecycle, script, stateModule, fixture, storedFixtureJob, switchingFixture, recoveryBaseline, loseTurn, directJson, callAsync, checkDecisionReport };
+}

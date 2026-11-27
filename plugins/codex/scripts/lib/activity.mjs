@@ -35,6 +35,52 @@ function countToolUses(events, pending) {
   return count;
 }
 
+const nonNegativeInt = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+
+export function isDeniedApproval(resolution, answer) {
+  if (resolution === "denied" || resolution === "deny") return true;
+  return typeof answer === "string" && /^deny/i.test(answer.trim());
+}
+
+export function seedApprovalTotals(stored) {
+  if (stored?.approvalTotals && typeof stored.approvalTotals === "object" && !Array.isArray(stored.approvalTotals)) {
+    return {
+      answered: nonNegativeInt(stored.approvalTotals.answered),
+      denied: nonNegativeInt(stored.approvalTotals.denied),
+      autoAllowed: nonNegativeInt(stored.approvalTotals.autoAllowed),
+      autoDenied: nonNegativeInt(stored.approvalTotals.autoDenied)
+    };
+  }
+  let answered = 0, denied = 0, autoAllowed = 0, autoDenied = 0;
+  if (Array.isArray(stored?.questionHistory)) {
+    for (const entry of stored.questionHistory) {
+      if (entry?.kind !== "action-approval") continue;
+      if (entry.answer != null) answered += 1;
+      if (isDeniedApproval(entry.resolution, entry.answer)) denied += 1;
+    }
+  }
+  if (Array.isArray(stored?.activity)) {
+    for (const event of stored.activity) {
+      if (event?.type === "permissionAutoAllowed") autoAllowed += 1;
+      if (event?.type === "permissionAutoDenied") autoDenied += 1;
+    }
+  }
+  return { answered, denied, autoAllowed, autoDenied };
+}
+
+export function recordApprovalResolution(stored, entry) {
+  const isActionApproval = entry?.kind === "action-approval";
+  const shouldTrack = isActionApproval || Boolean(stored?.approvalTotals)
+    || (Array.isArray(stored?.questionHistory) && stored.questionHistory.some(item => item?.kind === "action-approval"));
+  if (!shouldTrack) return {};
+  const totals = seedApprovalTotals(stored);
+  if (isActionApproval) {
+    if (entry.answer != null) totals.answered += 1;
+    if (isDeniedApproval(entry.resolution, entry.answer)) totals.denied += 1;
+  }
+  return { approvalTotals: totals };
+}
+
 export function appendActivity(stored, events, at = new Date().toISOString()) {
   const retained = stored.activity ?? [];
   const pending = stored.activityTotals ? { ...stored.activityPendingTools } : {};
@@ -46,11 +92,21 @@ export function appendActivity(stored, events, at = new Date().toISOString()) {
   };
   const seq = stored.activitySeq ?? retained.at(-1)?.seq ?? 0;
   const appended = events.map((event, index) => ({ ...event, seq: seq + index + 1, at }));
+  const autoAllowedDelta = appended.filter(event => event?.type === "permissionAutoAllowed").length;
+  const autoDeniedDelta = appended.filter(event => event?.type === "permissionAutoDenied").length;
+  const approvalPatch = autoAllowedDelta > 0 || autoDeniedDelta > 0 || stored.approvalTotals
+      || retained.some(event => event?.type === "permissionAutoAllowed" || event?.type === "permissionAutoDenied")
+    ? { approvalTotals: (() => {
+        const current = seedApprovalTotals(stored);
+        return { ...current, autoAllowed: current.autoAllowed + autoAllowedDelta, autoDenied: current.autoDenied + autoDeniedDelta };
+      })() }
+    : {};
   return {
     activity: [...retained, ...appended].slice(-ACTIVITY_RETAINED_MAX),
     activitySeq: seq + appended.length,
     activityTotals: { events: totals.events + appended.length, toolUses: totals.toolUses + countToolUses(appended, pending) },
-    activityPendingTools: pending
+    activityPendingTools: pending,
+    ...approvalPatch
   };
 }
 

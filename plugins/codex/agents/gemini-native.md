@@ -40,14 +40,20 @@ In agy's default mode each edit and command needs approval. The card shows
 the full operation and preserves whitespace. The parent obtains authorization
 for the displayed operation before answering. If the operation changes before
 the answer or agy's `rawInput` and `args` disagree, Fugato denies it with
-`operation-changed-before-approval`. Fugato denies questions over the 16 KiB
-display limit. After a denial, agy usually ends the turn with an
+`operation-changed-before-approval`. Operations up to 16 KiB are shown inline;
+larger operations are staged verbatim as `0600` SHA-256-verified files behind a
+compact card with the `Exact operation` path to read in full before answering
+(unstageable operations are denied with `operation-too-large-to-display-exactly`).
+After a denial, agy usually ends the turn with an
 `approval_denied` blocker. Denied commands are excluded from checks that ran.
 
-Wait for the agent to return a report before sending a message. For
-`needs_answer`, use `SendMessage` with `Answer <questionId>` on the first
-line, substituting the displayed question ID. Put the answer on the next
-line. For `action-approval`, use exactly `Allow once` or `Deny`. For an
+A SendMessage to a running worker with no pending question is queued as a
+steering note and delivered with its next parent-bridge tool result; one the
+turn cannot take is refused. For `needs_answer`, use `SendMessage` with
+`Answer <questionId>` on the first line, substituting the displayed question
+ID. Put the answer on the next line. For `action-approval`, use exactly
+`Allow once`, the displayed `Allow "<prefix>" for this job` option, `Deny`, or
+`Deny: <guidance>`. For an
 ordinary question, send up to 8,000 characters of answer text. The report's
 `next` field shows the format for that question. Once the job ends, send a
 plain brief to continue the same Antigravity session.
@@ -55,12 +61,14 @@ plain brief to continue the same Antigravity session.
 Roundtable seats are supported when `fugato roundtable start` assigns this
 agent (`--roundtable <roomId> --persona <id>`). Forum notices arrive only
 between turns, never mid-turn, and parked approvals hold that member's notices.
-Every Gemini worker's parent bridge also exposes three read-only workspace tools
-(`workspace_list`, `workspace_grep`, `workspace_git_read`) confined to the job's
-execution directory with no shell; they are auto-allowed one call at a time
+Every Gemini worker's parent bridge also exposes workspace tools confined to the
+job's execution directory with no shell: read-only `workspace_list`,
+`workspace_grep`, `workspace_git_read`, and `workspace_edit` (one match by
+default) and `workspace_write`. They are auto-allowed one call at a time
 alongside `ask_parent` (and `forum_read`, `forum_post` on roundtable seats) and
-audited in job activity without arguments. Edits and shell commands still
-require approval. Gemini roundtable seats cannot be read-only.
+audited in job activity without arguments. Built-in edits and shell commands
+still require approval; a boundary policy denies protected-home access,
+out-of-worktree or `.git` writes and forbidden commands before they park. Gemini roundtable seats cannot be read-only.
 
 If a model reads this prompt, the native adapter is unavailable or failed.
 Return exactly this blocked report without performing the assignment:

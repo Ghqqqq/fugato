@@ -11,13 +11,28 @@ import { createJsonLineReader } from "./lib/app-server.mjs";
 import { jobBackend } from "./lib/backends.mjs";
 import { ACTIVE, ASK_PARENT, PARENT_BRIDGE_ENV, recordedThreadJobs, askParentQuestion } from "./lib/job-runtime.mjs";
 import { readRoom, assertChair, readIndex, readThread, readResource, postEvent, renderForum, unreadFooter, EVENT_KINDS } from "./lib/forum.mjs";
-import { readJobFile, resolveJobFile } from "./lib/state.mjs";
+import { readJobFile, resolveJobFile, updateJob } from "./lib/state.mjs";
+import { appendActivity } from "./lib/activity.mjs";
+import { drainGeminiNotes } from "./lib/steering.mjs";
 import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, resolveWorkspaceExecRoot, callWorkspaceReadTool } from "./lib/workspace-read-tools.mjs";
+import { WORKSPACE_WRITE_TOOLS, WORKSPACE_WRITE_TOOL_NAMES, callWorkspaceWriteTool } from "./lib/workspace-write-tools.mjs";
 
 const cwd = process.env[PARENT_BRIDGE_ENV.cwd], envThread = process.env[PARENT_BRIDGE_ENV.threadId], envJob = process.env[PARENT_BRIDGE_ENV.jobId];
 const backend = process.env.CODEX_COMPANION_BRIDGE_BACKEND ?? "codex";
 const workspaceRoot = backend === "antigravity" ? resolveWorkspaceExecRoot(process.env[WORKSPACE_EXEC_CWD_ENV]) : null;
-const workspaceTools = workspaceRoot ? WORKSPACE_READ_TOOLS : [];
+const workspaceTools = workspaceRoot ? [...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS] : [];
+const MAX_BRIDGE_TOUCHED_FILES = 500;
+// Record a confined bridge edit as a file change, so native logs and
+// fugato-live show Update/Write(path) and the turn's touchedFiles include it.
+function recordBridgeFileChange(job, change) {
+  try {
+    updateJob(job.workspaceRoot, job.id, current => ({
+      ...appendActivity(current, [{ type: "fileChange", lifecycle: "completed", status: "completed", path: change.path,
+        kind: change.kind === "create" ? "add" : "update", added: change.added, removed: change.removed }]),
+      bridgeTouchedFiles: [...new Set([...(Array.isArray(current.bridgeTouchedFiles) ? current.bridgeTouchedFiles : []), change.path])].slice(-MAX_BRIDGE_TOUCHED_FILES)
+    }));
+  } catch { /* The edit already happened; a lost activity entry must not fail the tool call. */ }
+}
 const caller = { pid: process.pid, nonce: randomUUID() };
 const validThread = id => typeof id === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(id);
 // Match the job filename alphabet used by retention, with a bounded length.
@@ -134,6 +149,23 @@ function withUnreadFooter(payload, toolName, job) {
     return payload;
   }
 }
+function formatSteeringNote(note) {
+  const header = note.source === "denial-guidance"
+    ? "[Chair denial guidance]"
+    : "[Chair steering update — apply immediately]";
+  return `${header}\n${note.text}`;
+}
+async function withSteeringFooter(payload, job) {
+  if (!payload || !Array.isArray(payload.content) || backend !== "antigravity" || !job || !ACTIVE.has(job.status) || job.cancelRequested) return payload;
+  try {
+    if (jobBackend(job) !== "antigravity" || !job.workspaceRoot || !job.id) return payload;
+    const notes = await drainGeminiNotes(job.workspaceRoot, job.id, { turnId: job.turnId ?? null });
+    if (!notes.length) return payload;
+    return { ...payload, content: [...payload.content, { type: "text", text: notes.map(formatSteeringNote).join("\n\n") }] };
+  } catch {
+    return payload;
+  }
+}
 
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", createJsonLineReader(async line => {
@@ -161,7 +193,8 @@ process.stdin.on("data", createJsonLineReader(async line => {
         const workspaceTool = workspaceTools.some(tool => tool.name === name);
         if (name !== TOOL.name && !forumTool && !workspaceTool) { send({ id: message.id, error: { code: -32602, message: "Unknown tool" } }); break; }
         if (!forumTool && !workspaceTool && !valid(args)) {
-          send({ id: message.id, result: withUnreadFooter({ ...result("Invalid ask_parent arguments: question (<=1000 chars) and up to 6 options (<=160 chars) are accepted."), isError: true }, name, footerJobForError()) });
+          const errJob = footerJobForError();
+          send({ id: message.id, result: await withSteeringFooter(withUnreadFooter({ ...result("Invalid ask_parent arguments: question (<=1000 chars) and up to 6 options (<=160 chars) are accepted."), isError: true }, name, errJob), errJob) });
           break;
         }
         const threadId = boundThread();
@@ -170,8 +203,14 @@ process.stdin.on("data", createJsonLineReader(async line => {
           ? await jobForTurn(threadId, validTurn(turnId) ? turnId : null) : null;
         if (!job) { send({ id: message.id, result: { ...result("No Fugato task is listening on this thread right now. Proceed on a conservative assumption within the authorized scope and report it."), isError: true } }); break; }
         activeJob = job;
+        if (workspaceTool && WORKSPACE_WRITE_TOOL_NAMES.includes(name)) {
+          const outcome = callWorkspaceWriteTool(name, args === undefined ? {} : args, workspaceRoot, { env: process.env });
+          if (!outcome.result.isError && outcome.fileChange) recordBridgeFileChange(job, outcome.fileChange);
+          send({ id: message.id, result: await withSteeringFooter(withUnreadFooter(outcome.result, name, job), job) });
+          break;
+        }
         if (workspaceTool) {
-          send({ id: message.id, result: withUnreadFooter(await callWorkspaceReadTool(name, args === undefined ? {} : args, workspaceRoot), name, job) });
+          send({ id: message.id, result: await withSteeringFooter(withUnreadFooter(await callWorkspaceReadTool(name, args === undefined ? {} : args, workspaceRoot), name, job), job) });
           break;
         }
         if (forumTool) {
@@ -183,16 +222,17 @@ process.stdin.on("data", createJsonLineReader(async line => {
           if (name === "forum_read") {
             const view = args?.resource !== undefined ? readResource(roomId, author, args.resource, process.env, args)
               : args?.thread !== undefined ? readThread(roomId, author, args.thread) : readIndex(roomId, author, args ?? {});
-            send({ id: message.id, result: result(renderForum(view)) });
+            send({ id: message.id, result: await withSteeringFooter(result(renderForum(view)), job) });
           } else {
             const event = postEvent(roomId, author, args);
-            send({ id: message.id, result: withUnreadFooter(result(`Posted #${event.seq} ${event.kind} as ${event.author.name} in thread #${event.thread}${event.initial ? "; your first round is now unsealed" : ""}.`), name, job) });
+            send({ id: message.id, result: await withSteeringFooter(withUnreadFooter(result(`Posted #${event.seq} ${event.kind} as ${event.author.name} in thread #${event.thread}${event.initial ? "; your first round is now unsealed" : ""}.`), name, job), job) });
           }
           break;
         }
         const callId = typeof _meta?.callId === "string" && /^[A-Za-z0-9_-]{1,120}$/.test(_meta.callId) ? _meta.callId : null;
-        const { text } = await askParentQuestion(job.workspaceRoot, job.id, { question: args.question, options: args.options ?? [], callId }, { caller, turnId: job.turnId });
-        send({ id: message.id, result: withUnreadFooter(result(text), name, job) });
+        const { text, resolution } = await askParentQuestion(job.workspaceRoot, job.id, { question: args.question, options: args.options ?? [], callId }, { caller, turnId: job.turnId });
+        const askPayload = withUnreadFooter(result(text), name, job);
+        send({ id: message.id, result: ["interrupted", "cancelled"].includes(resolution) ? askPayload : await withSteeringFooter(askPayload, job) });
         break;
       }
       default:
@@ -200,9 +240,9 @@ process.stdin.on("data", createJsonLineReader(async line => {
     }
   } catch (error) {
     const label = message.params?.name?.startsWith("forum_") ? "Roundtable forum"
-      : message.params?.name?.startsWith("workspace_") ? "Workspace read tool" : "Parent question";
+      : message.params?.name?.startsWith("workspace_") ? "Workspace tool" : "Parent question";
     const payload = { ...result(`${label} unavailable (${error instanceof Error ? error.message : String(error)}). Proceed conservatively and report missing essential input.`), isError: true };
-    send({ id: message.id, result: message.method === "tools/call" ? withUnreadFooter(payload, message.params?.name, activeJob) : payload });
+    send({ id: message.id, result: message.method === "tools/call" ? await withSteeringFooter(withUnreadFooter(payload, message.params?.name, activeJob), activeJob) : payload });
   }
 }));
 process.stdin.on("end", () => process.exit(0));

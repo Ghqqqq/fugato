@@ -43,6 +43,9 @@ let sessionId = null, model = currentModel ?? (["non-gemini-default", "no-gemini
 let thought = currentEffort ?? "high", promptRequest = null, thinkingOverride = null;
 let scriptedReplies = 0, mcpServers = [], activeMcpCalls = new Map();
 let pendingLoad = null;
+// Permission fixtures edit a file inside the session's directory, as agy does;
+// Fugato's boundary policy denies writes outside the job execution directory.
+let sessionCwd = null;
 const configs = () => [
   { id: modelId, category: "model", name: "Model", type: "select", currentValue: model,
     options: behavior === "dynamic-selectors" ? [{ group: "models", name: "Models", options: available }] : available },
@@ -65,8 +68,8 @@ function sessionReply(id, loaded = false) {
     sendBatch(behavior === "config-after-" + suffix ? [response, notification] : [notification, response]);
   } else send(response);
 }
-function editCall(toolCallId) {
-  const rawInput = { Path: "/fixture/calc.py", Target: "    return a - b", Replacement: "    return a + b" };
+function editCall(toolCallId, root = "/fixture") {
+  const rawInput = { Path: path.join(root, "calc.py"), Target: "    return a - b", Replacement: "    return a + b" };
   return { toolCallId, name: "edit_file", title: "Correct the calculation", kind: "edit", args: rawInput, rawInput,
     locations: [{ path: rawInput.Path }], content: [{ type: "diff", path: rawInput.Path, oldText: rawInput.Target, newText: rawInput.Replacement }] };
 }
@@ -116,6 +119,7 @@ input.on("line", line => {
       if (++scriptedReplies === mcpPermissionRequests.length) finish();
       return;
     }
+    if (handleGrantReply(message)) return;
     if (serverRequests.length) {
       if (++scriptedReplies === serverRequests.length) finish();
     } else if (message.id === "1" && behavior !== "permission-cancel") finish();
@@ -133,12 +137,14 @@ input.on("line", line => {
     case "session/new": {
       if (behavior === "auth-required") { send({ id: message.id, error: { code: -32000, message: "Authentication required" } }); break; }
       mcpServers = Array.isArray(message.params?.mcpServers) ? message.params.mcpServers : [];
+      if (typeof message.params?.cwd === "string") sessionCwd = message.params.cwd;
       save(value => { sessionId = "agy-session-" + value.nextSession++; value.sessions.push({ sessionId, cwd: message.params.cwd }); });
       sessionReply(message.id);
       break;
     }
     case "session/load":
       sessionId = message.params.sessionId;
+      if (typeof message.params?.cwd === "string") sessionCwd = message.params.cwd;
       mcpServers = Array.isArray(message.params?.mcpServers) ? message.params.mcpServers : [];
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OLD REPLAY MUST BE EXCLUDED" } });
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "OLD REASONING" } });
@@ -201,7 +207,7 @@ input.on("line", line => {
       if (behavior === "stdout-eof") { output.then(() => process.stdout.end()); break; }
       if (["hold", "ignore-cancel"].includes(behavior)) break;
       if (["permission", "mixed-permission", "permission-cancel", "foreign-permission", "only-always", "permission-partial", "permission-unscoped"].includes(behavior)) {
-        const toolCall = { sessionUpdate: "tool_call", ...editCall("edit-1"), status: "pending" };
+        const toolCall = { sessionUpdate: "tool_call", ...editCall("edit-1", sessionCwd ?? "/fixture"), status: "pending" };
         if (behavior === "permission-partial") update(toolCall);
         const options = [];
         if (["mixed-permission", "only-always"].includes(behavior)) options.push({ optionId: "trust-forever", name: "Always allow", kind: "allow_always" });
@@ -214,6 +220,8 @@ input.on("line", line => {
       }
       if (behavior === "unknown-request") { send({ id: "1", method: "fs/write_text_file", params: { sessionId, path: "/outside", content: "denied" } }); break; }
       if (behavior === "foreign-session") update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "FOREIGN MESSAGE" } }, "other-session");
+      if (startGrantSequence()) break;
+      if (behavior === "steer-bridge") { runSteerBridge(); break; }
       finish(); break;
     case "session/cancel":
       if (behavior !== "ignore-cancel") finish("cancelled");
@@ -224,3 +232,79 @@ input.on("line", line => {
 });
 input.on("close", () => { output.finally(() => process.exit(0)); });
 process.stdout.on("error", () => process.exit(0));
+
+let grantQueue = null;
+function grantCommandCall(toolCallId, command) {
+  const rawInput = { CommandLine: command, WaitMsBeforeAsync: 5000, toolSummary: "Run " + command };
+  return { toolCallId, name: "run_command", kind: "execute", title: command, args: rawInput, rawInput };
+}
+function sendNextGrantCommand() {
+  if (!grantQueue || grantQueue.index >= grantQueue.commands.length) { grantQueue = null; finish(); return; }
+  const idx = grantQueue.index++;
+  const reqId = "grant-" + (idx + 1);
+  const call = grantCommandCall("grant-cmd-" + (idx + 1), grantQueue.commands[idx]);
+  grantQueue.active = { reqId, call };
+  const options = [
+    { optionId: "allow", name: "Allow", kind: "allow_once" },
+    { optionId: "deny", name: "Deny", kind: "reject_once" }
+  ];
+  update({ sessionUpdate: "tool_call", ...call, status: "in_progress" });
+  update({ sessionUpdate: "tool_call_update", ...call, status: "pending" });
+  send({ id: reqId, method: "session/request_permission", params: { sessionId, toolCall: { sessionUpdate: "tool_call", ...call, status: "pending" }, options } });
+}
+function startGrantSequence() {
+  const sequences = {
+    "grant-sequence": ["node --test tests/a.test.mjs", "node --test tests/b.test.mjs", "node --test a.mjs && echo done"],
+    "grant-single-test": ["node --test tests/c.test.mjs"],
+    "grant-cross-prefix": ["node --test tests/a.test.mjs", "claude plugin test plugins/codex"],
+    "grant-escape-after-grant": ["node --test tests/a.test.mjs", "node --test ../outside.test.mjs"]
+  };
+  const commands = sequences[behavior];
+  if (!commands) return false;
+  grantQueue = { commands, index: 0, active: null };
+  sendNextGrantCommand();
+  return true;
+}
+function handleGrantReply(message) {
+  if (!grantQueue?.active || message.id !== grantQueue.active.reqId) return false;
+  const { call } = grantQueue.active;
+  grantQueue.active = null;
+  const approved = message.result?.outcome?.outcome === "selected" && message.result.outcome.optionId === "allow";
+  update({ ...call, sessionUpdate: "tool_call_update", status: approved ? "completed" : "failed",
+    ...(approved ? { rawOutput: { exitCode: 0, stdout: "ok" } } : {}) });
+  sendNextGrantCommand();
+  return true;
+}
+async function runSteerBridge() {
+  while (promptGate && !fs.existsSync(promptGate)) await new Promise(resolve => setTimeout(resolve, 10));
+  const server = mcpServers[0];
+  if (!server) { finish(); return; }
+  const { spawn } = await import("node:child_process");
+  const childEnv = { ...process.env, ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])) };
+  const child = spawn(server.command, server.args ?? [], { env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+  const pending = new Map();
+  let nextId = 1;
+  readline.createInterface({ input: child.stdout }).on("line", line => {
+    try {
+      const msg = JSON.parse(line);
+      const waiter = pending.get(msg.id);
+      if (waiter) { pending.delete(msg.id); waiter(msg); }
+    } catch {}
+  });
+  const call = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Bridge timeout: ${method}`)); }, 10000);
+    pending.set(id, msg => { clearTimeout(timer); resolve(msg); });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  });
+  try {
+    await call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-agy", version: "1" } });
+    const first = await call("tools/call", { name: "workspace_list", arguments: { depth: 1 } });
+    const second = await call("tools/call", { name: "workspace_list", arguments: { depth: 1 } });
+    save(value => { value.steerBridgeReplies = [first.result, second.result]; });
+  } finally {
+    try { child.stdin.end(); } catch {}
+    try { child.kill(); } catch {}
+  }
+  finish();
+}

@@ -68,10 +68,10 @@ test("tools/list exposes workspace tools only on antigravity bridges with a vali
   };
   assert.deepEqual(await listTools({
     [PARENT_BRIDGE_ENV.jobId]: "job-agy-plain", CODEX_COMPANION_BRIDGE_BACKEND: "antigravity", CODEX_COMPANION_BRIDGE_EXEC_CWD: repo
-  }), ["ask_parent", "workspace_list", "workspace_grep", "workspace_git_read"]);
+  }), ["ask_parent", "workspace_list", "workspace_grep", "workspace_git_read", "workspace_edit", "workspace_write"]);
   assert.deepEqual(await listTools({
     [PARENT_BRIDGE_ENV.jobId]: "job-agy-rt", CODEX_COMPANION_BRIDGE_BACKEND: "antigravity", CODEX_COMPANION_BRIDGE_EXEC_CWD: repo
-  }), ["ask_parent", "forum_read", "forum_post", "workspace_list", "workspace_grep", "workspace_git_read"]);
+  }), ["ask_parent", "forum_read", "forum_post", "workspace_list", "workspace_grep", "workspace_git_read", "workspace_edit", "workspace_write"]);
   assert.deepEqual(await listTools({
     [PARENT_BRIDGE_ENV.jobId]: "job-agy-plain", CODEX_COMPANION_BRIDGE_BACKEND: "antigravity"
   }), ["ask_parent"]);

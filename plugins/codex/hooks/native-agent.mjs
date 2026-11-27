@@ -148,7 +148,10 @@ function geminiAnswer(text) {
 }
 function geminiAnswerNext(state, question) {
   const approval = question.kind === 'action-approval';
-  return `SendMessage to ${state.name || state.agentId}: "Answer ${question.id}\n${approval ? 'Allow once' : '<your answer>'}"${approval ? ' (or Deny)' : ''}`;
+  const grant = approval && Array.isArray(question.options)
+    ? question.options.find(option => typeof option === 'string' && /^Allow "[^"\r\n]+" for this job$/.test(option)) : null;
+  const alternatives = approval ? grant ? ` (or ${grant}, Deny, or Deny: <guidance>)` : ' (or Deny)' : '';
+  return `SendMessage to ${state.name || state.agentId}: "Answer ${question.id}\n${approval ? 'Allow once' : '<your answer>'}"${alternatives}`;
 }
 const logKey = (agentId, turnId) => JSON.stringify([agentId, turnId]);
 const invalidateProgress = $ => {
@@ -671,7 +674,7 @@ const UNSETTLED = [...ACTIVE, ...RECOVERY_STATUSES];
 const REPORT_STATUSES = new Set([...ACTIVE, ...RECOVERY_STATUSES, 'completed', 'needs_input', 'needs_answer', 'blocked',
   'failed', 'interrupted', 'cancelled', 'owner_stopped', 'ownership_moved']);
 const REPORT_FIELDS = new Set(['status', 'worker', 'jobId', 'backend', 'provider', 'model', 'summary', 'summaryTruncated', 'blockers',
-  'question', 'changedFiles', 'changedFilesShared', 'changedFilesNote', 'checks', 'assumptions', 'keyFindings', 'usage', 'next', 'details', 'notice',
+  'question', 'changedFiles', 'changedFilesShared', 'changedFilesNote', 'checks', 'assumptions', 'keyFindings', 'unconsumedSteers', 'unconsumedSteersOmitted', 'usage', 'next', 'details', 'notice',
   'changedFilesOmitted', 'keyFindingsOmitted', 'assumptionsOmitted', 'blockersOmitted',
   'verificationOmitted', 'claimedVerificationOmitted', 'touchedFilesOmitted', 'preExistingChangesOmitted',
   'approvedBrowserOriginsOmitted', 'approvedComputerAppsOmitted']);
@@ -779,7 +782,7 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   const options = strings(question?.options).map((option, index) => `${index + 1}. ${option}`);
   if (count(question?.optionsOmitted)) options.push(`+${question.optionsOmitted} more`);
   if (report.backend === 'antigravity' && report.notice) add('notice', [[span(plain(report.notice), 'warning')]], 'warning');
-  if (report.backend === 'antigravity' && question?.kind === 'action-approval' && typeof question.text === 'string') {
+  if (question?.kind === 'action-approval' && typeof question.text === 'string') {
     // Keep the operation and its choices together. Let the host wrap literal
     // text so fact clipping cannot change a path or hide the end of an edit.
     groups.push({ label: 'question', rows: [{ type: 'Box', props: { flexDirection: 'column' }, children: [
@@ -1302,6 +1305,15 @@ async function reconcile($, state, recovery = false, allowAbsent = false, { pers
 // An addressed answer is reserved syntax even after its job has ended. For
 // live jobs the companion projects the unexpired question and atomically
 // checks that same ID again when the answer command attaches.
+export function isValidActionApprovalAnswer(decision, options) {
+  if (decision === 'Allow once' || decision === 'Deny') return true;
+  if (Array.isArray(options) && options.some(option => typeof option === 'string' && /^Allow "[^"\r\n]+" for this job$/.test(option) && decision === option)) return true;
+  if (decision.startsWith('Deny:')) {
+    const guidance = decision.slice('Deny:'.length).trim();
+    return guidance.length >= 1 && guidance.length <= 1000;
+  }
+  return false;
+}
 async function geminiMessageRefusal($, state, job, reply, oversized) {
   if (!job || !ACTIVE.includes(job.status)) {
     if (job && !ended(job, state)) return blocked(GEMINI_BUSY, state);
@@ -1315,7 +1327,7 @@ async function geminiMessageRefusal($, state, job, reply, oversized) {
   const { question } = current;
   const body = reply?.body ?? '', decision = body.trim();
   if (reply && reply.id === question.id && decision && body.length <= 8000
-    && (question.kind !== 'action-approval' || decision === 'Allow once' || decision === 'Deny')) return;
+    && (question.kind !== 'action-approval' || isValidActionApprovalAnswer(decision, question.options))) return;
   const reason = oversized === 'answer' || body.length > 8000 ? 'The answer exceeds the 8000-character limit.' : 'This message did not answer the pending question.';
   return { ...current, notice: reason + ' ' + geminiAnswerNext(state, question) };
 }

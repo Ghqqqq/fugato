@@ -49,7 +49,8 @@ export const COMMAND_OPTIONS = {
     booleanOptions: ["json", "all", "wait"]
   },
   runtime: { valueOptions: ["cwd"], booleanOptions: ["json"] },
-  cancel: { valueOptions: ["cwd"], booleanOptions: ["json", "all"] }
+  cancel: { valueOptions: ["cwd"], booleanOptions: ["json", "all"] },
+  doctor: { valueOptions: ["cwd"], booleanOptions: ["json", "offline"] }
 };
 
 // The fugato launcher implies direct mode for these verbs.
