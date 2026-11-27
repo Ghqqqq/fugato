@@ -358,6 +358,12 @@ Inspect or retire this workspace's shared Codex runtime.
   restart  Retire the broker only when idle; the next task starts a fresh broker.
 Busy brokers refuse restart and report running workspace workers.
   --cwd, -C <dir>  Workspace; --json  JSON output; --help, -h  Help without contacting the broker.`,
+  doctor: `Usage: fugato doctor [--json] [--offline] [--cwd <dir>]
+Run strictly read-only readiness diagnostics across Codex, Antigravity, dispatch, plugins, config and state.
+Creates, modifies and deletes no files; starts no broker or session; submits no model prompt.
+  --offline  Skip network/auth probes (no ACP initialize or broker auth query); still runs local --version checks.
+  --cwd, -C <dir>  Workspace; --json  Machine-readable JSON report; --help, -h  Help without running probes.
+Exit 0 when no check fails (warnings allowed); exit 1 when any check fails.`,
   cancel: `Usage: fugato cancel [<worker|jobId> | --all] [--cwd <dir>] [--json]
 Cancel the selected active job and report whether interruption was confirmed.
 Example: fugato cancel Ada
@@ -3763,6 +3769,22 @@ async function handleCleanup(argv) {
   outputCommandResult(result, `${[summary, ...planned, ...directories, ...(legacyRetained ? [`${legacyRetained} retained (legacy paths)`] : []), ...result.warnings, ...(result.errors.length ? [`${result.errors.length} errors/skips; use --json for details.`] : [])].join("\n")}\n`, options.json);
 }
 
+async function handleDoctor(argv) {
+  const tokens = normalizeArgv(argv, "raw");
+  const separator = tokens.indexOf("--");
+  if ((separator < 0 ? tokens : tokens.slice(0, separator)).some(token => token === "--help" || token === "-h")) {
+    printUsage("doctor");
+    return;
+  }
+  const { options, positionals } = parseCommandInput(tokens, COMMAND_OPTIONS.doctor);
+  validatePositionalArity(positionals, 0, "doctor");
+  const cwd = resolveCommandCwd(options);
+  const { runDoctor, renderDoctorReport } = await import("./lib/doctor.mjs");
+  const report = await runDoctor({ cwd, offline: Boolean(options.offline), env: process.env });
+  outputCommandResult(report, renderDoctorReport(report), options.json);
+  if (!report.ok) process.exitCode = 1;
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
@@ -3842,6 +3864,9 @@ async function main() {
       break;
     case "runtime":
       await handleRuntime(argv);
+      break;
+    case "doctor":
+      await handleDoctor(argv);
       break;
     case "roundtable": {
       // Mode-control seam: bare status/no action belongs here. The room CLI

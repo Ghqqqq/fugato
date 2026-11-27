@@ -88,8 +88,8 @@ export function approveDuet(input, env = process.env) {
   if (!executable) return {};
   const argumentsHeader = header.slice(executable.length).replace(/^[ \t]+/, "");
   // Recognize our own fully quoted absolute rewrite on a repeated hook call.
-  if (!/^(?:task|answer|wait|result|status|cancel|runtime|roundtable|forum)(?=[ \t]|$)/.test(argumentsHeader)
-      && !(executable !== launcherName && /^'(?:task|answer|wait|result|status|cancel|runtime|roundtable|forum)'(?=[ \t]|$)/.test(argumentsHeader))) return {};
+  if (!/^(?:task|answer|wait|result|status|cancel|runtime|roundtable|forum|doctor)(?=[ \t]|$)/.test(argumentsHeader)
+      && !(executable !== launcherName && /^'(?:task|answer|wait|result|status|cancel|runtime|roundtable|forum|doctor)'(?=[ \t]|$)/.test(argumentsHeader))) return {};
   if (heredoc) {
     if (newline < 0) return {};
     const lines = command.slice(newline + 1).split("\n");
@@ -193,7 +193,7 @@ export function approveDuet(input, env = process.env) {
   if (cancelAll && positionals.length) return {};
   if (verb === "runtime" && !flags.has("help") && (positionals.length !== 1 || !["status", "restart"].includes(positionals[0]))) return {};
   const needsTarget = ["answer", "wait"].includes(verb) || (verb === "cancel" && !cancelAll) || (verb === "result" && !flags.has("thread"));
-  if ((!forumReadOnly && positionals.length > (verb === "task" ? 0 : 1)) || (needsTarget && !flags.has("help") && positionals.length !== 1)) return {};
+  if ((!forumReadOnly && positionals.length > (["task", "doctor"].includes(verb) ? 0 : 1)) || (needsTarget && !flags.has("help") && positionals.length !== 1)) return {};
   if ((flags.has("fast") && flags.has("normal")) || ["to", "thread", "fresh"].filter(key => flags.has(key)).length > 1) return {};
   if (flags.get("fork") && threadSelectors.some(key => flags.has(key))) return {};
   if (flags.has("source") && !flags.get("fork")) return {};
