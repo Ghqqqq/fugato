@@ -46,7 +46,7 @@ The `UserPromptSubmit` hook appends one compact versioned reminder to normal pro
 **Reminder template** (placeholders, not a current version or path):
 
 ```text
-Ultra mode (<scale>, max <n> auto; roles: default; Gemini <on|off>). Re-read core.md@<core-hash>, ultra.md@<mode-hash> in <protocol-dir> unless full text is in context (not mentions).
+Ultra mode (<scale>, max <n> auto; roles: default; Gemini <on|off>). Apply core.md@<core-hash> + ultra.md@<mode-hash> (<protocol-dir>) to substantive tasks; re-read unless full text is in context.
 ```
 
 An explicit integer renders `max <n>`. The `unlimited` setting renders

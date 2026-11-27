@@ -240,7 +240,7 @@ function formatReminderRoles(table, roleIds = null) {
 export function reminderText(mode, protocolDir = PROTOCOL_DIR, table) {
   const name = mode.name ?? "ultra", options = mode.options ?? mode;
   const [core, active] = protocolParts(name, protocolDir);
-  const suffix = `Re-read core.md@${core.version}, ${active.part}.md@${active.version} in ${protocolDir} unless full text is in context (not mentions).`;
+  const suffix = `Apply core.md@${core.version} + ${active.part}.md@${active.version} (${protocolDir}) to substantive tasks; re-read unless full text is in context.`;
   if (name === "roundtable") {
     const gemini = table ? `; Gemini ${table.gemini?.installed ? "on" : "off"}` : "";
     return `Roundtable mode (${options.intensity ?? "standard"}, roles: ${options.roles?.join(",") ?? "recommend"}${gemini}). ${suffix}`;

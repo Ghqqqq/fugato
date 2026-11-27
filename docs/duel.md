@@ -143,7 +143,7 @@ Claude's context. Obtain both current paths and versions with
 **Reminder template** (placeholders):
 
 ```text
-Duel mode (max <rounds> rounds; roles: default; Gemini <on|off>). Re-read core.md@<core-hash>, duel.md@<mode-hash> in <protocol-dir> unless full text is in context (not mentions).
+Duel mode (max <rounds> rounds; roles: default; Gemini <on|off>). Apply core.md@<core-hash> + duel.md@<mode-hash> (<protocol-dir>) to substantive tasks; re-read unless full text is in context.
 ```
 
 Round limits are advisory protocol rules, not runtime counters. Native/Bash,

@@ -111,7 +111,7 @@ is versioned independently.
 **Reminder template** (placeholders):
 
 ```text
-Pair mode (max 2 rework; roles: default; Gemini <on|off>). Re-read core.md@<core-hash>, pair.md@<mode-hash> in <protocol-dir> unless full text is in context (not mentions).
+Pair mode (max 2 rework; roles: default; Gemini <on|off>). Apply core.md@<core-hash> + pair.md@<mode-hash> (<protocol-dir>) to substantive tasks; re-read unless full text is in context.
 ```
 
 Round limits are protocol-managed, not runtime counters. Native-first dispatch,

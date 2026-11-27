@@ -99,7 +99,7 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
     assert.ok(reminder.includes(`core.md@${core.version}`));
     assert.ok(reminder.includes(`${mode.name}.md@${active.version}`));
     assert.ok(reminder.includes(PROTOCOL_DIR));
-    assert.match(reminder, /Re-read .* unless full text is in context \(not mentions\)\./);
+    assert.match(reminder, /^.+\. Apply core\.md@\w+ \+ \w+\.md@\w+ \(.+\) to substantive tasks; re-read unless full text is in context\.$/);
     for (const otherMode of MODE_NAMES.filter(name => name !== mode.name)) {
       assert.equal(reminder.includes(protocolFile(otherMode)), false, `${mode.name} reminder must not name ${otherMode}`);
       assert.equal(reminder.includes(`${otherMode}.md`), false, `${mode.name} reminder must not name ${otherMode}.md`);
@@ -154,7 +154,7 @@ test("ultra reminder stays compact and updates when agy becomes available", () =
   }
   setMode(f.repo, SESSION, { scale: "quick", maxWorkers: 2 }, f.env);
   const [core, ultra] = protocolParts("ultra");
-  const suffix = `Re-read core.md@${core.version}, ultra.md@${ultra.version} in ${PROTOCOL_DIR} unless full text is in context (not mentions).`;
+  const suffix = `Apply core.md@${core.version} + ultra.md@${ultra.version} (${PROTOCOL_DIR}) to substantive tasks; re-read unless full text is in context.`;
   const reminder = () => {
     const result = f.prompt("task");
     assert.equal(result.status, 0, result.stderr);
@@ -172,15 +172,15 @@ test("reminders list only overridden roles and qualify model slugs that collide 
   const reminder = () => f.prompt("task").stdout.trim();
   setMode(f.repo, SESSION, { name: "ultra" }, f.env);
   const ultraReminder = reminder();
-  assert.match(ultraReminder, /^Ultra mode \(auto, max \d+ auto; roles: overrides implement gpt-6\.1-sol\/medium, architect gpt-6\.1-astra\/xhigh, verify gpt-6\.2-sol\/high; Gemini off\)\. Re-read /);
+  assert.match(ultraReminder, /^Ultra mode \(auto, max \d+ auto; roles: overrides implement gpt-6\.1-sol\/medium, architect gpt-6\.1-astra\/xhigh, verify gpt-6\.2-sol\/high; Gemini off\)\. Apply /);
   assert.equal(ultraReminder.includes("scan "), false, "compact reminder must omit non-overridden roles");
   assert.equal(ultraReminder.includes("high-stakes"), false, "compact reminder must omit non-overridden high-stakes");
   setMode(f.repo, SESSION, { name: "pair" }, f.env);
   const pairReminder = reminder();
-  assert.match(pairReminder, /^Pair mode \(max 2 rework; roles: overrides implement gpt-6\.1-sol\/medium, verify gpt-6\.2-sol\/high; Gemini off\)\. Re-read /);
+  assert.match(pairReminder, /^Pair mode \(max 2 rework; roles: overrides implement gpt-6\.1-sol\/medium, verify gpt-6\.2-sol\/high; Gemini off\)\. Apply /);
   assert.equal(pairReminder.includes("architect"), false, "pair reminder must list only pair-relevant overrides");
   setMode(f.repo, SESSION, { name: "duel", options: { rounds: 1 } }, f.env);
-  assert.match(reminder(), /^Duel mode \(max 1 rounds; roles: overrides implement gpt-6\.1-sol\/medium, verify gpt-6\.2-sol\/high, architect gpt-6\.1-astra\/xhigh; Gemini off\)\. Re-read /);
+  assert.match(reminder(), /^Duel mode \(max 1 rounds; roles: overrides implement gpt-6\.1-sol\/medium, verify gpt-6\.2-sol\/high, architect gpt-6\.1-astra\/xhigh; Gemini off\)\. Apply /);
   const resume = f.json(f.lifecycle("SessionStart", { source: "resume" }));
   assert.ok(resume.hookSpecificOutput.additionalContext.endsWith(reminder()));
 });
@@ -216,7 +216,7 @@ test("compact reminderText stays <= 280 chars for all four modes with a >=100-ch
       assert.ok(text.includes(`core.md@${core.version}`), `${mode.name} must name core.md and its hash`);
       assert.ok(text.includes(`${mode.name}.md@${active.version}`), `${mode.name} must name ${mode.name}.md and its hash`);
       assert.ok(text.includes(geminiState), `${mode.name} must reflect ${geminiState}`);
-      assert.match(text, /Re-read .* unless full text is in context \(not mentions\)\./);
+      assert.match(text, /^.+\. Apply core\.md@\w+ \+ \w+\.md@\w+ \(.+\) to substantive tasks; re-read unless full text is in context\.$/);
     }
   }
 
