@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+- Cut routine Gemini approvals. The parent bridge adds confined
+  `workspace_edit` (one exact match unless `replace_all` or
+  `expected_occurrences` says otherwise) and `workspace_write` tools that are
+  auto-allowed, write atomically, refuse `..`, symlinks, `.git` and results over
+  256 KiB, and show `Update(path) · +N −M` / `Write(path)` in native logs and
+  `fugato-live` and in `touchedFiles`. Gemini workers are told to prefer them.
+- Add a fail-closed boundary policy for Gemini tool calls. Before a request
+  parks, Fugato locally denies reads and writes under `~/.claude`, `~/.codex`,
+  `~/.gemini` or the isolated Fugato home outside the job's directory (sibling
+  roundtable worktrees included), writes to `.git` or outside the job's
+  directory, and commands such as `npm run build`, `npm run verify`,
+  `npm publish`, `npm install`, `git push` or a recursive `rm` of an absolute
+  or parent path. Built-in `edit_file` cards warn `AMBIGUOUS:` or `NO MATCH:`
+  before replacing several matches or none.
+- Gemini `run_command` approval cards offer `Allow "<prefix>" for this job`
+  for `node --test <files>`, `claude plugin test <dir>`, `npm test` and
+  `npm run test[:name]` when every token is plain, every path resolves inside
+  the job's directory and the call has no extra execution fields. The grant
+  lives only in memory for that job. Git inspection stays on the auto-allowed
+  `workspace_git_read`.
+- Answer an approval with `Deny: <guidance>` (up to 1,000 characters). The
+  guidance reaches the worker with its next parent-bridge tool result; when the
+  worker then ends its turn normally, the job completes with `deniedActions`
+  and a notice instead of `blocked`.
+- Steer a running Gemini worker with SendMessage. A message to a turn with no
+  pending question is queued and delivered once with the next parent-bridge
+  tool result; `Answer <questionId>` replies still reach the question, and a
+  turn that cannot take a note refuses it as before. Notes left at turn end are
+  reported in `unconsumedSteers` (up to three, plus a count).
+- Add read-only `fugato doctor [--json] [--offline] [--cwd <dir>]` and
+  `/fugato:doctor`, covering Codex, Antigravity, dispatch, `fugato-live`,
+  config conflicts, broker, admission locks and staged approvals.
+- Count approvals beyond the 20-per-job question history: job records keep
+  monotonic `approvalTotals`, used by `roundtable status`, and the
+  `fugato-live` header shows room approval and token totals without starting
+  any process. Codex approval cards render verbatim.
+- Shorten mode reminders to about 250 characters. Journal verdicts accept
+  criterion ordinals (`1`, `#1`) and ASCII `...` prefixes, and a
+  continuation's verdict clears its predecessor's open item.
+- `npm run test:runtime` runs about 45% faster with the same tests, split into
+  smaller files. `npm run test:hooks` and `npm run test:fast` give a quick
+  hook check, and `npm run test:native` fails when the committed replay
+  captures drift.
+
 ## 1.10.0
 
 - Support explicit Google Gemini (`agy acp`, `fugato:gemini-native`) roundtable

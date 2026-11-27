@@ -543,6 +543,9 @@ Checks reported (each with a stable `id`, `status` of `pass`, `warn` or `fail`,
 Exit code is `0` when no check fails (warnings allowed) and `1` when any check
 fails. Read-only `fugato doctor` is allowlisted in the permission hook so Claude
 can run `fugato doctor [--json] [--offline] [--cwd <dir>]` without extra prompts.
+The Codex binary checks only run `codex --version` and `codex app-server --help`,
+so a passing check confirms the binary starts, not that a session or model
+request would succeed; sign-in is verified only through an already-running broker.
 
 ### `/fugato-live`
 

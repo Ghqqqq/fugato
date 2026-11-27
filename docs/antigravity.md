@@ -259,9 +259,13 @@ If the operation changes while the answer is pending, or if agy's `rawInput`
 and its `args` copy disagree, Fugato denies the request with
 `operation-changed-before-approval`. You may deny either with plain `Deny` or
 with `Deny: <guidance>` (1–1,000 trimmed characters after `Deny:`); both are
-accepted by native `Answer <questionId>` replies and `fugato answer`. After a
-denial, agy usually ends the turn and Fugato reports the job as blocked with
-`approval_denied`, recording `guidance` on that blocker when supplied. Any
+accepted by native `Answer <questionId>` replies and `fugato answer`. Guidance
+is queued for the worker and delivered with its next parent-bridge tool result
+as `[Chair denial guidance]`. If agy then ends the turn normally and every
+blocker is such a guided denial, the job completes with `deniedActions`
+(`[{ code, guidance }]`) and a notice instead of `blocked`. Otherwise (agy
+stops the turn, a plain `Deny`, or any other blocker) Fugato reports the job as
+blocked with `approval_denied`, recording `guidance` on that blocker. Any
 answer other than `Allow once`, the exact displayed job-grant option, `Deny`,
 or `Deny: <guidance>` denies the request.
 
@@ -298,6 +302,34 @@ without a shell, reject path/symlink escapes and untrusted git config hooks or
 pagers, cap output size and runtime, and are auto-allowed one call at a time
 with argument-free `permissionAutoAllowed` audit entries in job activity.
 Codex bridges do not expose these tools. [`workspace-read-tools.mjs`](../plugins/codex/scripts/lib/workspace-read-tools.mjs)
+
+The bridge also exposes two confined write tools, auto-allowed the same way.
+`workspace_edit({ path, target, replacement, replace_all?, expected_occurrences? })`
+changes exactly one match by default and returns an error with the match count
+and line numbers (leaving the file unchanged and the turn alive) for zero or
+several matches. `workspace_write({ path, content, mode? })` creates
+(default), overwrites or appends. Both accept only workspace-relative paths,
+refuse `..`, symlinks, any `.git` component and results over 256 KiB, write
+atomically, and record a `fileChange` entry (`Update(path) · +N −M` /
+`Write(path)`) whose path joins the turn's `touchedFiles`. Gemini workers are
+told to prefer them; the built-in `edit_file` and `write_file` still park.
+When a built-in `edit_file` would replace several matches, or finds none, its
+card starts with `AMBIGUOUS:` or `NO MATCH:`.
+[`workspace-write-tools.mjs`](../plugins/codex/scripts/lib/workspace-write-tools.mjs)
+
+Before any request parks, Fugato applies a fail-closed boundary policy.
+Inside the job's execution directory a request passes the gate, except a write
+to any `.git` path; passing is not approval. Outside it, reads and writes under
+`~/.claude`, `~/.codex`, `~/.gemini` or the isolated Fugato home (including
+sibling roundtable worktrees), writes to the worktree's `gitdir`/`commondir`, and
+any other write are denied locally without waking Claude. Commands that run
+`npm run build`, `npm run verify`, `npm publish`, `npm install`/`ci`,
+`git push`, a recursive `rm` of an absolute or parent path, or that reference a
+protected home are denied the same way. Each denial ends up as a blocker with
+its policy code (`protected_home`, `outside_workspace`, `git_metadata_write`,
+`forbidden_command`). Fugato gates only the tool calls agy submits through
+`session/request_permission`; it is not an operating-system sandbox.
+[`acp-policy.mjs`](../plugins/codex/scripts/lib/acp-policy.mjs)
 
 ## Reports, budgets and stopping
 
@@ -376,8 +408,8 @@ status <roomId>` reports pending and answered action approvals alongside token
 totals per member and for the room. Edits and commands still
 park for approval in agy's default mode, while parent-bridge calls
 (`ask_parent`, `forum_read`, `forum_post`, `workspace_list`, `workspace_grep`,
-`workspace_git_read`) are auto-allowed one call at a time and audited in job
-activity without arguments.
+`workspace_git_read`, `workspace_edit`, `workspace_write`) are auto-allowed one
+call at a time and audited in job activity without arguments.
 
 Terms note: roundtable seats run `agy acp` as a backend worker. Google's FAQ
 names Claude Code as third-party software, and an `antigravity-cli` collaborator
