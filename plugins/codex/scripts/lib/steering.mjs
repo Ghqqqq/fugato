@@ -223,7 +223,8 @@ export async function finalizeUnconsumedGeminiNotes(cwd, jobId) {
     }
     for (const row of inbox.deliveries) {
       if (row.status !== "queued" || typeof row.text !== "string") continue;
-      if (sanitizeGeminiText(row.text)) unconsumed.push({ id: row.deliveryId, text: row.text });
+      // Denial guidance already travels with its blocker or deniedActions entry.
+      if (row.source !== "denial-guidance" && sanitizeGeminiText(row.text)) unconsumed.push({ id: row.deliveryId, text: row.text });
       finish(row, "deferred", "turn_ended");
       row.fallbackClaimedAt = endedAt;
       changed = true;

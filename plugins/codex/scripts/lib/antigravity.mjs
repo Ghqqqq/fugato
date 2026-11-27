@@ -14,7 +14,7 @@ import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES
 import { approvalArtifactDir, stageApprovalArtifact, verifyApprovalArtifact } from "./approval-artifacts.mjs";
 import { classifyCommand } from "./command-classify.mjs";
 import { ACTION_APPROVAL_OPTIONS, actionApprovalOptions } from "./server-requests.mjs";
-import { finalizeUnconsumedGeminiNotes } from "./steering.mjs";
+import { finalizeUnconsumedGeminiNotes, queueGeminiNote } from "./steering.mjs";
 import { WORKSPACE_WRITE_TOOLS, WORKSPACE_WRITE_TOOL_NAMES } from "./workspace-write-tools.mjs";
 import { evaluateCommand, evaluatePath } from "./acp-policy.mjs";
 
@@ -568,9 +568,17 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
       return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
     if (call) call.permission = "denied";
+    const guidance = !review?.code && answer.guidance ? answer.guidance : null;
     blockers.push({ code: review?.code ?? "approval_denied", message: review?.message ?? "Antigravity tool permission was denied or could not be forwarded.",
-      method: "session/request_permission", kind: "acp-permission",
-      ...(!review?.code && answer.guidance ? { guidance: answer.guidance } : {}) });
+      method: "session/request_permission", kind: "acp-permission", ...(guidance ? { guidance } : {}) });
+    // Phase A: if agy continues after reject_once, the guidance reaches the worker
+    // at its next parent-bridge tool result; if agy ends the turn, the blocker keeps it.
+    const guidanceJob = options.jobId ?? options.parentBridge?.jobId ?? null;
+    if (guidance && guidanceJob) {
+      const tool = typeof call?.tool?.name === "string" ? call.tool.name : "that tool";
+      await queueGeminiNote(options.parentBridge?.cwd ?? workspaceRoot, guidanceJob, `The parent denied ${tool}. ${guidance}`, { source: "denial-guidance" })
+        .catch(() => { /* The blocker still carries the guidance. */ });
+    }
     return denyPermission(choices);
   } finally {
     for (const signal of [turnSignal, requestSignal]) signal?.removeEventListener("abort", abort);
@@ -918,6 +926,14 @@ export async function runAntigravityTurn(cwd, options = {}) {
     steeringNotice = `Could not finalize Gemini steering inbox at turn end (${steeringFinalizeError}); queued steering messages may be unconsumed—inspect steering state before resending.`;
     blockers.push({ code: "steering_finalize_failed", message: steeringNotice });
   }
+  // A guided denial the worker recovered from is soft: when the turn ended
+  // cleanly and every blocker is such a denial, report deniedActions instead.
+  const guidedDenials = blockers.filter(value => value?.kind === "acp-permission" && value.code === "approval_denied" && typeof value.guidance === "string");
+  const deniedActions = stopReason === "end_turn" && !failure && !cancelRequested && guidedDenials.length && guidedDenials.length === blockers.length
+    ? blockers.splice(0).map(value => ({ code: value.code, guidance: value.guidance })) : [];
+  const denialNotice = deniedActions.length
+    ? `${deniedActions.length} denied ${deniedActions.length === 1 ? "action" : "actions"} came with guidance; the worker continued and ended its turn normally.` : null;
+  const notice = [steeringNotice, denialNotice].filter(Boolean).join(" ") || null;
   const status = failure || ["cancelled", "max_tokens", "max_turn_requests"].includes(stopReason) ? 1 : 0;
   const turnStatus = stopReason === "cancelled" || cancelRequested ? "interrupted" : status ? "failed" : "completed";
   turnReturned = true;
@@ -928,7 +944,8 @@ export async function runAntigravityTurn(cwd, options = {}) {
     sandbox: "danger-full-access", approvalPolicy: options.onApprovalRequest ? "antigravity-rules+parent-once" : "antigravity-rules+deny",
     model, effort, ...(usage ? { usage } : {}),
     ...(unconsumedSteers.length ? { unconsumedSteers } : {}),
-    ...(steeringNotice ? { notice: steeringNotice } : {}),
+    ...(notice ? { notice } : {}),
+    ...(deniedActions.length ? { deniedActions } : {}),
     fileChanges, touchedFiles, commandExecutions,
     blockers, error: failure ? { message: failure.message } : null, stderr: client?.stderr ?? "", acpUsage };
   } finally {

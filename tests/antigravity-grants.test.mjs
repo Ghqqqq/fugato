@@ -254,9 +254,19 @@ test("fugato answer handles Deny: <guidance>, plain Deny, Allow once, and reject
       assert.equal(pending.status, "needs_answer");
       json(f.invoke(["answer", launch.jobId, "--question", pending.question.id, "--owner", launch.ownerId, "--json"], answerText));
       const waited = f.call("wait", launch.jobId, "--owner", launch.ownerId, "--json");
-      assert.equal(waited.status, expectedOutcome === "allow" ? 0 : 2, waited.stderr + waited.stdout);
+      // This fixture ends its turn normally after the reply, so a guided denial is soft.
+      const soft = expectedGuidance !== undefined;
+      assert.equal(waited.status, expectedOutcome === "allow" || soft ? 0 : 2, waited.stderr + waited.stdout);
       assert.deepEqual(f.acp.state().serverResponses.map(r => r.result.outcome.optionId), [expectedOutcome]);
       const job = f.stored(launch.jobId);
+      if (soft) {
+        assert.equal(job.status, "completed");
+        assert.deepEqual(job.result.blockers, []);
+        assert.deepEqual(job.result.deniedActions, [{ code: "approval_denied", guidance: expectedGuidance }]);
+        assert.match(job.result.notice, /denied action came with guidance/);
+        assert.equal(job.result.unconsumedSteers, undefined, "denial guidance is not reported as an unconsumed steer");
+        return;
+      }
       if (expectedOutcome === "allow") {
         assert.equal(job.status, "completed");
         assert.deepEqual(job.result.blockers, []);
@@ -411,7 +421,7 @@ function nativeHarness(t, acpBehavior) {
 }
 
 test("native adapter validator accepts Deny: <guidance> and job grants while refusing invalid answers", async t => {
-  await t.test("refuses invalid bodies and accepts Deny: <guidance> with recorded blocker guidance", async () => {
+  await t.test("refuses invalid bodies and accepts Deny: <guidance> as a soft denial with recorded guidance", async () => {
     const h = nativeHarness(t, "grant-single-test");
     const q = await h.runTurn("Run one test command.");
     assert.equal(q.status, "needs_answer");
@@ -428,12 +438,13 @@ test("native adapter validator accepts Deny: <guidance> and job grants while ref
     assert.deepEqual(h.acp.state().serverResponses, []);
 
     const denied = await h.runTurn(`Answer ${q.question.id}\nDeny: use workspace_grep instead`);
-    assert.equal(denied.status, "blocked");
-    assert.equal(denied.blockers[0].code, "approval_denied");
+    // The fixture ends its turn normally after the denial: a soft, guided denial.
+    assert.equal(denied.status, "completed");
+    assert.match(denied.notice, /denied action came with guidance/);
     assert.deepEqual(h.acp.state().serverResponses.map(r => r.result.outcome.optionId), ["deny"]);
     const job = h.stored(q.jobId);
-    assert.equal(job.result.blockers[0].guidance, "use workspace_grep instead");
-    assert.equal(job.report.blockers[0].guidance, "use workspace_grep instead");
+    assert.deepEqual(job.result.blockers, []);
+    assert.deepEqual(job.result.deniedActions, [{ code: "approval_denied", guidance: "use workspace_grep instead" }]);
   });
 
   await t.test("accepts displayed job-grant option, auto-allows match, and refuses grant answer on two-option card", async () => {
