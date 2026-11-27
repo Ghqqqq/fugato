@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.11.0
 
 - Cut routine Gemini approvals. The parent bridge adds confined
   `workspace_edit` (one exact match unless `replace_all` or

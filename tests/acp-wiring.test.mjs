@@ -63,7 +63,9 @@ test("boundary policy denies protected homes, forbidden commands and out-of-work
     ["FILE:// uri", { name: "read_file", kind: "read", rawInput: { uri: `FILE://${gemini}` } }, "protected_home"],
     ["read Cwd home relative", { name: "read_file", kind: "read", rawInput: { Cwd: f.home, Path: ".gemini/oauth_creds.json" } }, "protected_home"],
     ["apply_patch kind other", { name: "apply_patch", kind: "other", rawInput: { path: path.join(f.repo, ".git", "hooks", "pre-commit") } }, "git_metadata_write"],
-    ["copy_file outside", { name: "copy_file", rawInput: { source: "a.txt", destination: path.join(f.outside, "x.txt") } }, "outside_workspace"]
+    ["copy_file outside", { name: "copy_file", rawInput: { source: "a.txt", destination: path.join(f.outside, "x.txt") } }, "outside_workspace"],
+    ["read-like name with edit kind", { name: "read_and_write", kind: "edit", rawInput: { path: path.join(f.outside, "x.txt") } }, "outside_workspace"],
+    ["readwrite name", { name: "readwrite_file", kind: "other", rawInput: { path: path.join(f.outside, "x.txt") } }, "outside_workspace"]
   ]) assert.equal(deny(tool)?.code, code, label);
   fs.mkdirSync(path.join(f.repo, "sub"));
   assert.equal(deny({ name: "edit_file", kind: "edit", rawInput: { Cwd: path.join(f.repo, "sub"), Path: "../a.txt", Target: "x", Replacement: "y" } }), null);

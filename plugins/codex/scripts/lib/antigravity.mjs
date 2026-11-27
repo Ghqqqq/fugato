@@ -248,7 +248,9 @@ const POLICY_PATH_KEYS = new Set(["path", "paths", "absolutepath", "file", "file
 const POLICY_CWD_KEYS = new Set(["cwd", "workingdirectory", "workdir"]);
 const POLICY_COMMAND_KEYS = new Set(["commandline", "command", "cmd", "script", "shellcommand"]);
 const READ_KINDS = new Set(["read", "search", "fetch", "think"]);
-const READ_NAME = /^(?:read|view|list|search|grep|find|glob|get|cat|fetch|open)(?:_|$|[A-Z])/i;
+const WRITE_KINDS = new Set(["edit", "delete", "move"]);
+// Case-sensitive on purpose: a verb must end at "_", the name's end or a camelCase boundary.
+const READ_NAME = /^(?:read|view|list|search|grep|find|glob|cat|fetch|Read|View|List|Search|Grep|Find|Glob|Cat|Fetch)(?:_|$|[A-Z])/;
 function policyPathValue(value) {
   if (/^file:/i.test(value)) return fileURLToPath(new URL(value));
   return value;
@@ -312,7 +314,7 @@ export function acpPolicyDenial(tool, executionCwd, env = process.env) {
         if (!verdict.allowed) return deny(verdict.code, verdict.reason);
       }
     }
-    const readOnly = !execute && !diffs.length && (READ_KINDS.has(tool.kind) || READ_NAME.test(String(tool.name ?? "")));
+    const readOnly = !execute && !diffs.length && !WRITE_KINDS.has(tool.kind) && (READ_KINDS.has(tool.kind) || READ_NAME.test(String(tool.name ?? "")));
     const access = execute || readOnly ? "read" : "write";
     for (const value of [...new Set(fields.paths)]) {
       const target = resolvePolicyPath(base, value);
