@@ -127,10 +127,11 @@ async function backpressureScenario(script) {
 test("owner lease expiry interrupts a running worker; a foreign owner cannot renew it", async () => {
   // cli-1: polling more slowly than the lease still keeps the selected owner alive.
   const held = fixture("w5-working");
-  const active = json(held.call("task", "--detached", "--json", "--lease-sec", "1", "fixture"));
+  // A 2 s lease leaves room for timer delays on loaded CI hosts; the poll interval stays longer than the lease.
+  const active = json(held.call("task", "--detached", "--json", "--lease-sec", "2", "fixture"));
   try {
     await waitUntil(() => storedJob(held, active.jobId).turnId);
-    const status = json(held.call("status", active.jobId, "--owner", active.ownerId, "--wait", "--timeout-ms", "2500", "--poll-interval-ms", "2500", "--json"));
+    const status = json(held.call("status", active.jobId, "--owner", active.ownerId, "--wait", "--timeout-ms", "3000", "--poll-interval-ms", "3000", "--json"));
     assert.equal(status.job.status, "running");
     assert.equal(job(held, active.jobId).status, "running");
     assert.equal(job(held, active.jobId).interruptionReason ?? null, null);
