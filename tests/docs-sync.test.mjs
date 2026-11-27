@@ -122,7 +122,7 @@ const MODEL_SLUG_ALLOWLIST = new Set([
   "gpt-5-4-prompting"
 ]);
 
-test("model slugs cited in docs, commands, skills and prompts are all known", () => {
+test("model slugs cited in docs, commands, skills, prompts and agents are all known", () => {
   const known = new Set([
     ...Object.values(BUILTIN_ROLES).flatMap(row => [row.model, row.fallback?.model].filter(Boolean)),
     HIGH_STAKES.model,
@@ -137,7 +137,8 @@ test("model slugs cited in docs, commands, skills and prompts are all known", ()
     ...walkFiles("docs", [".md", ".mjs", ".js", ".py", ".sh", ".json"]),
     ...walkFiles("plugins/codex/commands", [".md"]),
     ...walkFiles("plugins/codex/skills", [".md"]),
-    ...walkFiles("plugins/codex/prompts", [".md"])
+    ...walkFiles("plugins/codex/prompts", [".md"]),
+    ...walkFiles("plugins/codex/agents", [".md"])
   ];
   const unknown = [];
   for (const rel of files) {
@@ -153,12 +154,13 @@ test("model slugs cited in docs, commands, skills and prompts are all known", ()
 
 const slugifyHeading = text => text.toLowerCase().replace(/[^\w\s-]/g, "").trim().replace(/\s+/g, "-");
 
-test("no doc, command, skill or prompt references removed protocol path or legacy journal show", () => {
+test("no doc, command, skill, prompt or agent references removed protocol path or legacy journal show", () => {
   const files = [
     ...walkFiles("docs", [".md"]),
     ...walkFiles("plugins/codex/commands", [".md"]),
     ...walkFiles("plugins/codex/skills", [".md"]),
-    ...walkFiles("plugins/codex/prompts", [".md"])
+    ...walkFiles("plugins/codex/prompts", [".md"]),
+    ...walkFiles("plugins/codex/agents", [".md"])
   ];
   const badProtocol = [], badJournal = [], brokenLinks = [];
   for (const rel of files) {
@@ -180,7 +182,7 @@ test("no doc, command, skill or prompt references removed protocol path or legac
   assert.deepEqual(brokenLinks, [], `Broken protocol links: ${brokenLinks.join(", ")}`);
 });
 
-test("documented Gemini capabilities stay aligned in native-agent, protocol core and package.json", () => {
+test("documented Gemini capabilities stay aligned in native-agent, protocol core, agents and package.json", () => {
   const nativeAgent = read("plugins/codex/hooks/native-agent.mjs");
   const ready = nativeAgent.match(/^const READY = (.+);$/m)?.[1] ?? "";
   const guide = nativeAgent.match(/^const NATIVE_GUIDE = (.+);$/m)?.[1] ?? "";
@@ -190,6 +192,29 @@ test("documented Gemini capabilities stay aligned in native-agent, protocol core
   const core = read("plugins/codex/prompts/protocol/core.md");
   assert.equal(core.includes("persistent Codex personas"), false, "Roundtable line must cover Codex or Gemini personas");
   assert.ok(core.includes("acp-permission") && core.includes("Answer <questionId>") && core.includes("Allow once"));
+
+  const agentFiles = walkFiles("plugins/codex/agents", [".md"]);
+  assert.ok(agentFiles.includes("plugins/codex/agents/gemini-native.md"), "agents scan must include gemini-native.md");
+  const staleAgents = [], brokenAgentLinks = [];
+  for (const rel of agentFiles) {
+    const text = read(rel);
+    if (/denies\s+questions\s+over\s+the\s+16\s+KiB/i.test(text)) staleAgents.push(rel);
+    for (const match of text.matchAll(/\]\((?!https?:\/\/)([^)#]+\.md)(#[^)]+)?\)/g)) {
+      const target = path.resolve(path.dirname(path.join(ROOT, rel)), match[1]);
+      if (!fs.existsSync(target)) { brokenAgentLinks.push(`${rel} -> ${match[1]}`); continue; }
+      if (match[2]) {
+        const anchor = match[2].slice(1);
+        const headings = [...fs.readFileSync(target, "utf8").matchAll(/^#{1,6}\s+(.+)$/gm)].map(h => slugifyHeading(h[1]));
+        if (!headings.includes(anchor)) brokenAgentLinks.push(`${rel} -> ${match[1]}#${anchor}`);
+      }
+    }
+  }
+  assert.deepEqual(staleAgents, [], `Stale 16 KiB denial text in agent docs: ${staleAgents.join(", ")}`);
+  assert.deepEqual(brokenAgentLinks, [], `Broken relative doc links in agent docs: ${brokenAgentLinks.join(", ")}`);
+
+  const geminiAgent = read("plugins/codex/agents/gemini-native.md");
+  assert.ok(geminiAgent.includes("16 KiB") && geminiAgent.includes("staged") && geminiAgent.includes("Exact operation") && geminiAgent.includes("operation-too-large-to-display-exactly"),
+    "gemini-native.md must describe staged >16 KiB approvals");
 
   const pkg = JSON.parse(read("package.json"));
   assert.match(pkg.description, /Codex/i);

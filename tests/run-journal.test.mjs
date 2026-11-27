@@ -288,20 +288,26 @@ test("journal validation is read-only and passed close preserves state until ver
   const displayed = f.call(["journal", "show"]).stdout.match(/K7:.*?…/)[0];
   // Duplicate declarations do not make a unique criterion ambiguous.
   addEntry(f.cwd, SESSION, "criteria", { criteria: [canonical] }, undefined, f.env);
-  for (const criterion of [displayed, "K7", "K7:", canonical]) {
+  for (const criterion of [displayed, "K7", "K7:", "1", "#1", "1.", "K7: Recover durable...", canonical]) {
     addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: [{ criterion, evidence: "Observed canonical evidence", result: "not_met" }] }, undefined, f.env);
     assert.equal(f.rows(matching).at(-1).criteria[0].criterion, canonical);
     const checked = JSON.parse(f.journal(["validate"]).stdout);
     assert.deepEqual(checked.issues.filter(issue => issue.kind === "unmet_criterion").map(issue => issue.criterion), [canonical]);
     assert.equal(checked.issues.some(issue => issue.kind === "unchecked_criterion" && issue.criterion === canonical), false);
   }
+  for (const criterion of ["2", "#2", "2.", "K70: A separate..."]) {
+    addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: [{ criterion, evidence: "Observed second criterion", result: "met" }] }, undefined, f.env);
+    assert.equal(f.rows(matching).at(-1).criteria[0].criterion, "K70: A separate criterion");
+  }
   for (const stableId of ["S1", "R12", "ABCD2"]) for (const criterion of [stableId, `${stableId}:`]) {
     addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: [{ criterion, evidence: "Observed ID match", result: "met" }] }, undefined, f.env);
     assert.equal(f.rows(matching).at(-1).criteria[0].criterion, criteria.find(text => text.startsWith(`${stableId}:`)));
   }
   const matched = snapshot(f.stateRoot);
-  for (const [criterion, code] of [["K404", "UNKNOWN_CRITERION"], ["Unregistered", "UNKNOWN_CRITERION"], ["…", "UNKNOWN_CRITERION"],
-    ["K9", "AMBIGUOUS_CRITERION"], ["K9: …", "AMBIGUOUS_CRITERION"], ["S2", "AMBIGUOUS_CRITERION"],
+  for (const [criterion, code] of [["K404", "UNKNOWN_CRITERION"], ["Unregistered", "UNKNOWN_CRITERION"], ["…", "UNKNOWN_CRITERION"], ["...", "UNKNOWN_CRITERION"],
+    ["0", "UNKNOWN_CRITERION"], ["#0", "UNKNOWN_CRITERION"], ["0.", "UNKNOWN_CRITERION"], ["-1", "UNKNOWN_CRITERION"],
+    ["99", "UNKNOWN_CRITERION"], ["#99", "UNKNOWN_CRITERION"], ["99.", "UNKNOWN_CRITERION"], ["#1.", "UNKNOWN_CRITERION"], ["01", "UNKNOWN_CRITERION"],
+    ["K9", "AMBIGUOUS_CRITERION"], ["K9: …", "AMBIGUOUS_CRITERION"], ["K9: ...", "AMBIGUOUS_CRITERION"], ["K7...", "AMBIGUOUS_CRITERION"], ["S2", "AMBIGUOUS_CRITERION"],
     ["ABCDE3", "UNKNOWN_CRITERION"], ["s1", "UNKNOWN_CRITERION"], ["S3", "UNKNOWN_CRITERION"]]) {
     const input = { ...verdict("alias-job"), criteria: [
       { criterion: "K7", evidence: "A valid item must not partially append", result: "met" },
@@ -312,6 +318,17 @@ test("journal validation is read-only and passed close preserves state until ver
     assert.equal(f.journal(["add", "verdict"], input).status, 1);
     assert.deepEqual(snapshot(f.stateRoot), matched);
   }
+  // Ordinals index active (non-withdrawn) criteria in renderRun order.
+  addEntry(f.cwd, SESSION, "withdraw", { criteria: [canonical], reason: "Temporarily withdrawn for ordinal check" }, undefined, f.env);
+  for (const selector of ["1", "#1", "1."]) {
+    addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: [{ criterion: selector, evidence: "Active index shifted after withdrawal", result: "met" }] }, undefined, f.env);
+    assert.equal(f.rows(matching).at(-1).criteria[0].criterion, "K70: A separate criterion");
+  }
+  assert.throws(() => addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: [{ criterion: String(criteria.length), evidence: "Shifted out of range", result: "met" }] }, undefined, f.env),
+    error => error.code === "UNKNOWN_CRITERION" && /out of range/i.test(error.message));
+  addEntry(f.cwd, SESSION, "criteria", { criteria: [canonical] }, undefined, f.env);
+  addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: [{ criterion: "1", evidence: "Restored at ordinal 1", result: "met" }] }, undefined, f.env);
+  assert.equal(f.rows(matching).at(-1).criteria[0].criterion, canonical);
   addEntry(f.cwd, SESSION, "verdict", { ...verdict("alias-job"), criteria: criteria.map(criterion => ({ criterion, evidence: "Verified exact criterion", result: "met" })) }, undefined, f.env);
   assert.deepEqual(f.rows(matching).at(-1).criteria.map(item => item.criterion), criteria);
   assert.deepEqual(validateRun(f.cwd, SESSION, undefined, f.env), { runId: matching, ok: true, issues: [] });
@@ -1083,6 +1100,58 @@ test("closed runs, finished links and missing or unreadable job records still ex
     assert.equal((await applyRetention(plan)).runsDeleted, 1, scenario);
     assert.equal(fs.existsSync(f.file(runId)), false);
   }
+});
+
+test("accepted continuation, follow-up and resolves verdicts clear no_verdict and open_rework on superseded ancestors only", () => {
+  const f = fixture(), runId = f.start("Clear superseded ancestor issues", ["Criterion A"]);
+  const linkAndFinish = (jobId, { status = "completed", threadId = "thread-1", continuationOf, followUpOf } = {}) => {
+    const job = { id: jobId, workspaceRoot: f.cwd, sessionId: SESSION, jobClass: "task", agentName: "Ada", title: jobId,
+      model: "fixture-model", effort: "high", sandbox: "read-only", status, threadId,
+      ...(continuationOf ? { continuationOf } : {}), ...(followUpOf ? { followUpOf } : {}) };
+    const linkedRun = linkJournalJob(job, `Brief for ${jobId}\n`, f.env);
+    assert.deepEqual(linkedRun, { runId, runStateDir: f.state });
+    assert.equal(finishJournalJob({ ...job, ...linkedRun }, { status, summary: `${jobId} ${status}` }, f.env), true);
+    return { ...job, ...linkedRun };
+  };
+
+  // Blocked parent (unjudged) -> interrupted middle continuation (unjudged) -> accepted child;
+  // plus an independent unjudged job sharing the same thread without lineage links.
+  const grandparent = linkAndFinish("job-blocked-parent", { status: "blocked", threadId: "thread-shared" });
+  const parent = linkAndFinish("job-interrupted-mid", { status: "interrupted", threadId: "thread-shared", continuationOf: grandparent.id });
+  const child = linkAndFinish("job-accepted-child", { status: "completed", threadId: "thread-shared", continuationOf: parent.id });
+  const independent = linkAndFinish("job-independent", { status: "completed", threadId: "thread-shared" });
+
+  // Non-acceptance on child does not clear no_verdict on unjudged ancestors.
+  addEntry(f.cwd, SESSION, "verdict", { jobId: child.id, verdict: "REWORK", criteria: [], reason: "Needs another pass" }, runId, f.env);
+  let checked = validateRun(f.cwd, SESSION, runId, f.env);
+  assert.deepEqual(checked.issues.filter(i => i.kind === "no_verdict").map(i => i.jobId), [grandparent.id, parent.id, independent.id]);
+  assert.deepEqual(checked.issues.filter(i => i.kind === "open_rework").map(i => i.jobId), [child.id]);
+
+  // Follow-up child accepted with ACCEPT clears no_verdict on unjudged ancestors AND open_rework on child.
+  const followUp = linkAndFinish("job-followup-accepted", { status: "completed", threadId: "thread-shared", followUpOf: child.id });
+  addEntry(f.cwd, SESSION, "verdict", { jobId: followUp.id, verdict: "ACCEPT", criteria: [{ criterion: "1", evidence: "Verified final continuation", result: "met" }], reason: "Accepted final continuation" }, runId, f.env);
+  checked = validateRun(f.cwd, SESSION, runId, f.env);
+  assert.deepEqual(checked.issues.map(i => [i.kind, i.jobId]), [["no_verdict", independent.id]]);
+  assert.deepEqual(showRun(f.cwd, SESSION, runId, f.env).openItems, [{ jobId: independent.id, reason: "no_verdict" }]);
+
+  // Explicit resolves with ACCEPT_WITH_GLUE also clears an unjudged superseded ancestor chain, leaving independent untouched.
+  const orphanAncestor = linkAndFinish("job-orphan-ancestor", { status: "blocked", threadId: "thread-other" });
+  const orphanChild = linkAndFinish("job-orphan-child", { status: "interrupted", threadId: "thread-other", continuationOf: orphanAncestor.id });
+  const replacement = linkAndFinish("job-replacement", { status: "completed", threadId: "thread-fresh" });
+  addEntry(f.cwd, SESSION, "verdict", { jobId: replacement.id, verdict: "ACCEPT_WITH_GLUE", criteria: [], reason: "Replaced interrupted chain", resolves: [orphanChild.id] }, runId, f.env);
+  checked = validateRun(f.cwd, SESSION, runId, f.env);
+  assert.deepEqual(checked.issues.map(i => [i.kind, i.jobId]), [["no_verdict", independent.id]]);
+
+  // A later rejection on a superseded parent reopens open_rework on that parent.
+  addEntry(f.cwd, SESSION, "verdict", { jobId: parent.id, verdict: "REWORK", criteria: [], reason: "Late finding on ancestor" }, runId, f.env);
+  checked = validateRun(f.cwd, SESSION, runId, f.env);
+  assert.deepEqual(checked.issues.map(i => [i.kind, i.jobId]), [["open_rework", parent.id], ["no_verdict", independent.id]]);
+
+  // Re-accepting the descendant and judging the independent job makes the run clean for passed close.
+  addEntry(f.cwd, SESSION, "verdict", { jobId: followUp.id, verdict: "ACCEPT", criteria: [], reason: "Resolved late finding" }, runId, f.env);
+  addEntry(f.cwd, SESSION, "verdict", { jobId: independent.id, verdict: "ACCEPT", criteria: [], reason: "Verified independent job" }, runId, f.env);
+  assert.deepEqual(validateRun(f.cwd, SESSION, runId, f.env), { runId, ok: true, issues: [] });
+  assert.deepEqual(closeRun(f.cwd, SESSION, { judgment: "passed", summary: "All lineages verified" }, runId, f.env).openIssues, []);
 });
 
 test("journal refuses symlinked run directories and files without touching their targets", () => {

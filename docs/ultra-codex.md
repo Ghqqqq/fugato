@@ -42,16 +42,18 @@ A normal prompt uses the active mode, with the same task-prefix override rule.
 `off` and `status` take no task text. See [the grammar](commands.md#fugatoultra-codex).
 The CLI accepts controls only and never starts workers.
 
-The `UserPromptSubmit` hook appends one versioned reminder to normal prompts.
+The `UserPromptSubmit` hook appends one compact versioned reminder to normal prompts.
 **Reminder template** (placeholders, not a current version or path):
 
 ```text
-Ultra-codex mode on (<scale>, max <n> workers (auto); roles: <role tuples>; high-stakes astra/xhigh; Gemini <availability>). Apply protocol core v<core-hash> + ultra v<mode-hash> to substantive tasks; re-read <absolute-core-path> (first line: <!-- Fugato protocol core v<core-hash> -->) and <absolute-ultra-path> (first line: <!-- Fugato protocol ultra v<mode-hash> -->) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Ultra mode (<scale>, max <n> auto; roles: default; Gemini <on|off>). Re-read core.md@<core-hash>, ultra.md@<mode-hash> in <protocol-dir> unless full text is in context (not mentions).
 ```
 
-An explicit integer renders `max <n> workers`. The `unlimited` setting renders
-`no worker cap`. Roles with the same model and effort are grouped. The Gemini
-status reads `on` or `off (Codex fallbacks)`.
+An explicit integer renders `max <n>`. The `unlimited` setting renders
+`no cap`. SessionStart prints the full role table; the reminder shows
+`roles: default` unless `--role-model` or legacy overrides are saved (listing
+only overridden roles, grouped by model/effort). The Gemini status reads `on`
+or `off`.
 Pair, duel and roundtable name their own mode file in their reminders. Run
 `fugato ultra-codex status --for-command` for both current paths and versions,
 or add `--json` for `protocolFile`/`protocolVersion` (the mode file) and
@@ -255,12 +257,14 @@ the journal and active pointer unchanged; blocked/abandoned closes record them.
 When a fresh worker resolves REWORK or REASSIGN, its verified `ACCEPT` or
 `ACCEPT_WITH_GLUE` verdict includes `resolves: ["<rejectedJobId>", ...]`.
 Jobs linked to that run can be resolved regardless of session; unknown IDs are
-rejected. Verdict criteria match declared exact text, a unique shown prefix
-ending in `…`, or a unique ID (`K7`, or `F3` before a colon) already present in a declared criterion.
-Unknown or ambiguous criteria are rejected; introduce new ones with
-`journal add criteria`. Accepted `followUpOf`/`continuationOf` descendants also
-resolve earlier rejections; same-thread follow-ups can discover that predecessor
-across worktrees. A later rejection reopens the work.
+rejected. Verdict criteria match declared exact text, a 1-based active criterion index
+(`1`, `#1`, or `1.`), a unique shown prefix ending in `…` or `...`, or a unique
+ID (`K7`, or `F3` before a colon) already present in a declared criterion.
+Unknown, out-of-range or ambiguous criteria are rejected; introduce new ones
+with `journal add criteria`. Accepted `followUpOf`/`continuationOf` descendants
+and `resolves` targets also clear earlier rejections and unjudged superseded
+ancestors; same-thread follow-ups can discover that predecessor across
+worktrees. A later rejection reopens the work.
 
 Keep the current run by default. Only for an unrelated task the user starts
 mid-run, `journal start --switch` leaves the old run open, selects the new one

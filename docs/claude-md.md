@@ -77,6 +77,6 @@ For orchestration in every fresh session without a CLAUDE.md, use
 ```
 
 Explicit user instructions and active mode protocols take precedence. Use
-`fugato setup --role-model id=model[:effort]` to save role settings. SessionStart
-explains role dispatch and mode reminders show the roles in use. See
+`fugato setup --role-model id=model[:effort]` to save role settings. SessionStart prints the full role table and explains role dispatch; mode
+reminders show Gemini availability and any role overrides. See
 [worker model configuration](configuration.md#default-worker-models).

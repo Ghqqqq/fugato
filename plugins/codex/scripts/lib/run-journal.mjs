@@ -239,14 +239,25 @@ export function validateTaskRun(cwd, runId, env = process.env) {
 // K<n> keeps its 1.4.5 forms; other ids need a colon, so a leading word such
 // as "S3 bucket" is not mistaken for an id.
 const criterionId = criterion => (/^(K\d+)(?=:|\s|$)/.exec(criterion) ?? /^([A-Z]{1,4}\d+)(?=:)/.exec(criterion))?.[1];
-function matchCriterion(criterion, known, runId) {
+function matchCriterion(criterion, known, runId, active = known) {
   if (known.includes(criterion)) return criterion;
+  const knownCriteriaIds = [...new Set(known.map(criterionId).filter(Boolean))];
+  const ordinalMatch = /^(?:#(-?\d+)|(-?\d+)\.?)$/.exec(criterion);
+  const ordinalRaw = ordinalMatch?.[1] ?? ordinalMatch?.[2];
+  if (ordinalRaw !== undefined && ordinalRaw === String(Number(ordinalRaw))) {
+    const index = Number(ordinalRaw);
+    if (Number.isInteger(index) && index >= 1 && index <= active.length) return active[index - 1];
+    const range = active.length ? `1..${active.length}` : "none";
+    throw Object.assign(new Error(`Criterion index out of range in run ${runId}: ${JSON.stringify(criterion)} (active criteria: ${range}). Known criteria IDs: ${knownCriteriaIds.join(", ") || "none (use exact criterion text)"}.`), {
+      code: "UNKNOWN_CRITERION", knownCriteriaIds
+    });
+  }
   const stableId = /^([A-Z]{1,4}\d+):?$/.exec(criterion)?.[1];
-  const prefix = criterion.endsWith("…") ? criterion.slice(0, -1) : "";
+  const prefix = criterion.endsWith("…") ? criterion.slice(0, -1)
+    : criterion.endsWith("...") ? criterion.slice(0, -3) : "";
   const matches = known.filter(text => stableId ? criterionId(text) === stableId
     : prefix && (text.startsWith(prefix) || text.replace(/\s+/g, " ").startsWith(prefix)));
   if (matches.length === 1) return matches[0];
-  const knownCriteriaIds = [...new Set(known.map(criterionId).filter(Boolean))];
   throw Object.assign(new Error(`${matches.length ? "Ambiguous" : "Unknown"} criterion in run ${runId}: ${JSON.stringify(criterion)}. Known criteria IDs: ${knownCriteriaIds.join(", ") || "none (use exact criterion text)"}. Use exact text for ambiguous matches; add new criteria with journal add criteria.`), {
     code: matches.length ? "AMBIGUOUS_CRITERION" : "UNKNOWN_CRITERION", knownCriteriaIds
   });
@@ -271,8 +282,14 @@ export function addEntry(cwd, sessionId, type, input, runId, env = process.env) 
     if (type === "verdict") {
       // Canonicalize new writes only. Historical verdict-only criteria remain
       // untouched and retain their existing validation/withdrawal behavior.
+      const withdrawn = new Set();
+      for (const row of rows) {
+        if (row.type === "criteria") for (const criterion of row.criteria) withdrawn.delete(criterion);
+        if (row.type === "criteria_withdrawn") for (const criterion of row.criteria) withdrawn.add(criterion);
+      }
       const criteria = [...new Set(rows.flatMap(row => row.type === "run_started" || row.type === "criteria" ? row.criteria : []))];
-      data.criteria = data.criteria.map(item => ({ ...item, criterion: matchCriterion(item.criterion, criteria, runId) }));
+      const active = criteria.filter(criterion => !withdrawn.has(criterion));
+      data.criteria = data.criteria.map(item => ({ ...item, criterion: matchCriterion(item.criterion, criteria, runId, active) }));
     }
     if (type === "verdict" && "resolves" in data && data.resolves?.length) {
       const known = new Set(rows.filter(row => row.type === "job_started").map(row => row.jobId));
@@ -475,20 +492,20 @@ function viewAt(stateDir, runId, rows, env, reports) {
     count.count++;
     activityCounts.set(key, count);
   }
-  // Explicit resolution or lineage resolves rework, never a shared thread. A
-  // later rejection reopens it; a previous acceptance cannot erase that.
+  // Explicit resolution or lineage resolves rework and superseded unjudged
+  // ancestors, never a shared thread. A later rejection reopens it; a previous
+  // acceptance cannot erase that.
   const resolved = new Set();
+  const supersedes = (childId, targetId) => !verdictOrder.has(targetId) || verdictOrder.get(childId) > verdictOrder.get(targetId);
   for (const job of linked) {
     if (!started.has(job.jobId) || !["ACCEPT", "ACCEPT_WITH_GLUE"].includes(job.latestVerdict?.verdict)) continue;
-    for (const jobId of job.latestVerdict.resolves ?? []) {
-      if (started.has(jobId) && verdictOrder.get(job.jobId) > verdictOrder.get(jobId)) resolved.add(jobId);
-    }
-    const pending = [job.followUpOf, job.continuationOf], seen = new Set([job.jobId]);
+    const pending = [...(job.latestVerdict.resolves ?? []), job.followUpOf, job.continuationOf];
+    const seen = new Set([job.jobId]);
     while (pending.length) {
       const parentId = pending.pop(), parent = jobs.get(parentId);
       if (!parent || !started.has(parentId) || seen.has(parentId)) continue;
       seen.add(parentId);
-      if (verdictOrder.get(job.jobId) > verdictOrder.get(parentId)) resolved.add(parentId);
+      if (supersedes(job.jobId, parentId)) resolved.add(parentId);
       pending.push(parent.followUpOf, parent.continuationOf);
     }
   }
@@ -505,7 +522,7 @@ function viewAt(stateDir, runId, rows, env, reports) {
       kind: "unrecorded_finish", jobId, detail: `Linked job is ${job.status} without a recorded finish.`,
       nextAction: `Inspect fugato result ${jobId} --details to retry finish recording, then ${activity ? "check the saved activity report" : "verify the evidence and record a journal verdict"}.`
     });
-    if (!activity && (finished.has(jobId) || unrecordedFinish) && !job.latestVerdict) issues.push({
+    if (!activity && (finished.has(jobId) || unrecordedFinish) && !job.latestVerdict && !resolved.has(jobId)) issues.push({
       kind: "no_verdict", jobId, detail: "Finished job has no orchestrator verdict.",
       nextAction: "Inspect the saved report and verify its criteria, then record a journal verdict."
     });
@@ -531,7 +548,7 @@ function viewAt(stateDir, runId, rows, env, reports) {
   const withdrawnCriteria = [...withdrawn.values()];
   return { runId, directory: runDir(stateDir, runId), goal: rows[0].goal, criteria, withdrawnCriteria, jobs: linked, decisions,
     ...(activityCounts.size ? { activityCounts: [...activityCounts.values()] } : {}),
-    openItems: linked.filter(job => (!job.latestVerdict && job.purpose !== "roundtable") || (["REWORK", "REASSIGN"].includes(job.latestVerdict?.verdict) && !resolved.has(job.jobId))).map(job => ({ jobId: job.jobId, reason: job.latestVerdict?.verdict ?? "no_verdict" })),
+    openItems: linked.filter(job => ((!job.latestVerdict && job.purpose !== "roundtable") || ["REWORK", "REASSIGN"].includes(job.latestVerdict?.verdict)) && !resolved.has(job.jobId)).map(job => ({ jobId: job.jobId, reason: job.latestVerdict?.verdict ?? "no_verdict" })),
     criterionResults: [...criteria, ...withdrawnCriteria.map(item => item.criterion).filter(criterion => !criteria.includes(criterion))].map(criterion =>
       withdrawn.has(criterion) ? { ...criterionResults.get(criterion), ...withdrawn.get(criterion), result: "withdrawn" }
         : criterionResults.get(criterion) ?? { criterion, result: "unchecked", evidence: null }), issues,

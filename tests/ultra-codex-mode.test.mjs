@@ -4,9 +4,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { makeTempDir, initGitRepo, run, writeExecutable } from "./helpers.mjs";
 import { buildEnv } from "./fake-codex-fixture.mjs";
-import { clearMode, effectiveMaxWorkers, MODE_NAMES, pruneModes, readMode, setMode, modeFile, PROTOCOL_DIR, PROTOCOL_PARTS, protocolFile, protocolHeader, protocolParts, protocolVersion } from "../plugins/codex/scripts/lib/ultra-codex-mode.mjs";
+import { clearMode, effectiveMaxWorkers, MODE_NAMES, pruneModes, readMode, reminderText, setMode, modeFile, PROTOCOL_DIR, PROTOCOL_PARTS, protocolFile, protocolHeader, protocolParts, protocolVersion } from "../plugins/codex/scripts/lib/ultra-codex-mode.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
-import { defaultModeSetup, dispatchPreference, readNativeUnavailable, roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
+import { defaultModeSetup, dispatchPreference, effectiveRoleTable, readNativeUnavailable, roleModelsSetup } from "../plugins/codex/scripts/lib/setup-config.mjs";
 import { runWithRetainedStdin } from "./stdin-fixture.mjs";
 
 const script = new URL("../plugins/codex/scripts/codex-companion.mjs", import.meta.url).pathname;
@@ -95,12 +95,11 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
     assert.equal(fs.statSync(f.modeFile(SESSION)).mode & 0o777, 0o600);
     const reminder = f.prompt("substantive task").stdout.trim();
     assert.ok(reminder.length > 0);
-    assert.ok(reminder.includes(`core v${core.version} + ${mode.name} v${active.version}`));
-    assert.ok(reminder.includes(core.file));
-    assert.ok(reminder.includes(active.file));
-    assert.ok(reminder.includes(core.header));
-    assert.ok(reminder.includes(active.header));
-    assert.ok(reminder.includes("Reminder/preamble version mentions do not count."));
+    assert.ok(reminder.length <= 280, `${mode.name} reminder exceeded 280 chars (${reminder.length}): ${reminder}`);
+    assert.ok(reminder.includes(`core.md@${core.version}`));
+    assert.ok(reminder.includes(`${mode.name}.md@${active.version}`));
+    assert.ok(reminder.includes(PROTOCOL_DIR));
+    assert.match(reminder, /Re-read .* unless full text is in context \(not mentions\)\./);
     for (const otherMode of MODE_NAMES.filter(name => name !== mode.name)) {
       assert.equal(reminder.includes(protocolFile(otherMode)), false, `${mode.name} reminder must not name ${otherMode}`);
       assert.equal(reminder.includes(`${otherMode}.md`), false, `${mode.name} reminder must not name ${otherMode}.md`);
@@ -141,7 +140,7 @@ test("modes switch on and off across workspaces while reminders and lifecycle st
   assert.equal(fs.existsSync(recent.file), true);
 });
 
-test("ultra reminder groups equal role tuples and updates when agy becomes available", () => {
+test("ultra reminder stays compact and updates when agy becomes available", () => {
   const f = fixture();
   const fallbackSummary = "scan sol/low, implement|investigate|read|research sol/high, review sol/medium, " +
     "debug|architect|verify|judge|alt-design astra/xhigh, visual|media terra/medium; " +
@@ -155,36 +154,79 @@ test("ultra reminder groups equal role tuples and updates when agy becomes avail
   }
   setMode(f.repo, SESSION, { scale: "quick", maxWorkers: 2 }, f.env);
   const [core, ultra] = protocolParts("ultra");
-  const prefix = "Ultra-codex mode on (quick, max 2 workers; roles: ";
-  const suffix = `). Apply protocol core v${core.version} + ultra v${ultra.version} to substantive tasks`;
+  const suffix = `Re-read core.md@${core.version}, ultra.md@${ultra.version} in ${PROTOCOL_DIR} unless full text is in context (not mentions).`;
   const reminder = () => {
     const result = f.prompt("task");
     assert.equal(result.status, 0, result.stderr);
-    return result.stdout.split("; re-read")[0];
+    return result.stdout.trim();
   };
-  assert.equal(reminder(), prefix + fallbackSummary + suffix);
+  assert.equal(reminder(), `Ultra mode (quick, max 2; roles: default; Gemini off). ${suffix}`);
   writeExecutable(f.env.FUGATO_ANTIGRAVITY_BIN, "");
-  assert.equal(reminder(),
-    prefix + "scan sol/low, implement|investigate sol/high, review sol/medium, " +
-    "debug|architect|verify|judge astra/xhigh, visual terra/medium, read|media|research neon/high, " +
-    "alt-design neon/xhigh; high-stakes astra/xhigh; Gemini on" + suffix);
+  assert.equal(reminder(), `Ultra mode (quick, max 2; roles: default; Gemini on). ${suffix}`);
 });
 
-test("reminders show saved role settings and qualify model slugs that collide in the same line", () => {
+test("reminders list only overridden roles and qualify model slugs that collide with the role table", () => {
   const f = fixture();
   roleModelsSetup({ env: f.env, models: ["implement=gpt-6.1-sol:medium", "verify=gpt-6.2-sol:high",
     "architect=gpt-6.1-astra:xhigh"] });
-  const reminder = () => f.prompt("task").stdout;
+  const reminder = () => f.prompt("task").stdout.trim();
   setMode(f.repo, SESSION, { name: "ultra" }, f.env);
-  assert.match(reminder(), /scan gpt-6\.2-sol\/low, implement gpt-6\.1-sol\/medium, investigate\|verify\|read\|research gpt-6\.2-sol\/high/);
-  assert.match(reminder(), /architect gpt-6\.1-astra\/xhigh/);
-  assert.match(reminder(), /high-stakes gpt-6\.2-astra\/xhigh/);
+  const ultraReminder = reminder();
+  assert.match(ultraReminder, /^Ultra mode \(auto, max \d+ auto; roles: overrides implement gpt-6\.1-sol\/medium, architect gpt-6\.1-astra\/xhigh, verify gpt-6\.2-sol\/high; Gemini off\)\. Re-read /);
+  assert.equal(ultraReminder.includes("scan "), false, "compact reminder must omit non-overridden roles");
+  assert.equal(ultraReminder.includes("high-stakes"), false, "compact reminder must omit non-overridden high-stakes");
   setMode(f.repo, SESSION, { name: "pair" }, f.env);
-  assert.match(reminder(), /^Pair mode on \(executor role implement gpt-6\.1-sol\/medium, verifier role verify gpt-6\.2-sol\/high, max 2 rework rounds\)\. Apply pair protocol /);
+  const pairReminder = reminder();
+  assert.match(pairReminder, /^Pair mode \(max 2 rework; roles: overrides implement gpt-6\.1-sol\/medium, verify gpt-6\.2-sol\/high; Gemini off\)\. Re-read /);
+  assert.equal(pairReminder.includes("architect"), false, "pair reminder must list only pair-relevant overrides");
   setMode(f.repo, SESSION, { name: "duel", options: { rounds: 1 } }, f.env);
-  assert.match(reminder(), /^Duel mode on \(Codex builder implement gpt-6\.1-sol\/medium, breaker verify gpt-6\.2-sol\/high, analysis architect astra\/xhigh, max 1 rounds\)\. Apply duel protocol /);
+  assert.match(reminder(), /^Duel mode \(max 1 rounds; roles: overrides implement gpt-6\.1-sol\/medium, verify gpt-6\.2-sol\/high, architect gpt-6\.1-astra\/xhigh; Gemini off\)\. Re-read /);
   const resume = f.json(f.lifecycle("SessionStart", { source: "resume" }));
-  assert.ok(resume.hookSpecificOutput.additionalContext.endsWith(reminder().trim()));
+  assert.ok(resume.hookSpecificOutput.additionalContext.endsWith(reminder()));
+});
+
+test("compact reminderText stays <= 280 chars for all four modes with a >=100-char protocol path and stays hash-invalidated", () => {
+  const f = fixture();
+  const pad = Math.max(1, 100 - f.dir.length - "/protocol".length - 1);
+  const longDir = path.join(f.dir, "p".repeat(pad), "protocol");
+  assert.ok(longDir.length >= 100, `expected >=100-char protocolDir, got ${longDir.length}`);
+  fs.mkdirSync(longDir, { recursive: true });
+  for (const part of PROTOCOL_PARTS) fs.copyFileSync(protocolFile(part), protocolFile(part, longDir));
+
+  const tableOff = effectiveRoleTable({ env: f.env, cwd: f.repo });
+  writeExecutable(f.env.FUGATO_ANTIGRAVITY_BIN, "");
+  const tableOn = effectiveRoleTable({ env: f.env, cwd: f.repo });
+
+  const cases = [
+    { name: "ultra", options: { scale: "auto", maxWorkers: "auto" } },
+    { name: "ultra", options: { scale: "thorough", maxWorkers: "auto" } },
+    { name: "ultra", options: { scale: "quick", maxWorkers: "unlimited" } },
+    { name: "pair", options: {} },
+    { name: "duel", options: { rounds: 3 } },
+    { name: "roundtable", options: { intensity: "standard", roles: null } },
+    { name: "roundtable", options: { intensity: "deep", roles: ["steward", "critic", "improver"] } }
+  ];
+  for (const table of [tableOff, tableOn]) {
+    const geminiState = table.gemini.installed ? "Gemini on" : "Gemini off";
+    for (const mode of cases) {
+      const [core, active] = protocolParts(mode.name, longDir);
+      const text = reminderText(mode, longDir, table);
+      assert.ok(text.length <= 280, `${mode.name} (${geminiState}) length ${text.length} > 280: ${text}`);
+      assert.ok(text.includes(longDir), `${mode.name} must name protocol directory`);
+      assert.ok(text.includes(`core.md@${core.version}`), `${mode.name} must name core.md and its hash`);
+      assert.ok(text.includes(`${mode.name}.md@${active.version}`), `${mode.name} must name ${mode.name}.md and its hash`);
+      assert.ok(text.includes(geminiState), `${mode.name} must reflect ${geminiState}`);
+      assert.match(text, /Re-read .* unless full text is in context \(not mentions\)\./);
+    }
+  }
+
+  // Editing a protocol file must change the emitted version hash immediately.
+  const before = reminderText({ name: "pair", options: {} }, longDir, tableOff);
+  fs.appendFileSync(protocolFile("pair", longDir), "\nExtra protocol note.\n");
+  const [, updatedPair] = protocolParts("pair", longDir);
+  const after = reminderText({ name: "pair", options: {} }, longDir, tableOff);
+  assert.notEqual(after, before);
+  assert.ok(after.includes(`pair.md@${updatedPair.version}`));
 });
 
 test("mode replacement and targeted off leave running jobs and other sessions intact", () => {

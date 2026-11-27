@@ -7,8 +7,7 @@ primary Codex worker with `--role implement`. It defaults to
 (default `gpt-6.2-astra` / `xhigh`). Use `--normal` unless the user
 asks for fast speed. Apply the [high-stakes rule](ultra-codex.md#worker-roles)
 and honor explicit user model and effort choices. Change the rows with
-`fugato setup --role-model id=model[:effort]`. The mode reminder shows the
-effective executor and verifier settings.
+`fugato setup --role-model id=model[:effort]`. The mode reminder shows default or overridden executor and verifier settings.
 
 Back to the [README](../README.md). Compare [ultra](ultra-codex.md) for breadth
 and [duel](duel.md) for persistent adversarial work.
@@ -112,7 +111,7 @@ is versioned independently.
 **Reminder template** (placeholders):
 
 ```text
-Pair mode on (executor role implement <tuple>, verifier role verify <tuple>, max 2 rework rounds). Apply pair protocol core v<core-hash> + pair v<mode-hash> to substantive tasks; re-read <absolute-core-path> (first line: <!-- Fugato protocol core v<core-hash> -->) and <absolute-pair-path> (first line: <!-- Fugato protocol pair v<mode-hash> -->) unless each file's full text is already in context from an earlier Read. Reminder/preamble version mentions do not count.
+Pair mode (max 2 rework; roles: default; Gemini <on|off>). Re-read core.md@<core-hash>, pair.md@<mode-hash> in <protocol-dir> unless full text is in context (not mentions).
 ```
 
 Round limits are protocol-managed, not runtime counters. Native-first dispatch,
