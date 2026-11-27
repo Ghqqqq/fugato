@@ -466,6 +466,28 @@ export function directReport(payload, job = {}, env = process.env) {
   }
   if (full.assumptions?.length) report.assumptions = full.assumptions.slice(0, 12).map(brief);
   if (full.keyFindings?.length) report.keyFindings = full.keyFindings.slice(0, 12).map(brief);
+  const rawUnconsumed = Array.isArray(full.unconsumedSteers) ? full.unconsumedSteers
+    : Array.isArray(job.result?.unconsumedSteers) ? job.result.unconsumedSteers
+    : Array.isArray(job.unconsumedSteers) ? job.unconsumedSteers : [];
+  const validUnconsumed = rawUnconsumed
+    .filter(entry => entry && typeof entry === "object" && typeof entry.id === "string" && typeof entry.text === "string")
+    .map(entry => ({ id: truncate(brief(entry.id), 64), text: brief(entry.text) }))
+    .filter(entry => /^[A-Za-z0-9._:-]{1,64}$/.test(entry.id) && entry.text.length > 0);
+  const priorUnconsumedOmitted = Number.isSafeInteger(full.unconsumedSteersOmitted) && full.unconsumedSteersOmitted > 0
+    ? full.unconsumedSteersOmitted : 0;
+  const totalUnconsumed = validUnconsumed.length + priorUnconsumedOmitted;
+  const unconsumedSteers = validUnconsumed.slice(0, 3);
+  const unconsumedSteersOmitted = Math.max(0, totalUnconsumed - unconsumedSteers.length);
+  if (unconsumedSteers.length) report.unconsumedSteers = unconsumedSteers;
+  if (unconsumedSteersOmitted) report.unconsumedSteersOmitted = unconsumedSteersOmitted;
+  const rawNotice = typeof full.notice === "string" && full.notice.trim() ? full.notice
+    : typeof job.notice === "string" && job.notice.trim() ? job.notice : null;
+  const noticeText = rawNotice
+    ? truncate(redactActivity(rawNotice).replace(/\s+/g, " ").trim(), 600)
+    : totalUnconsumed
+      ? `${totalUnconsumed} mid-turn steering ${totalUnconsumed === 1 ? "message was" : "messages were"} not delivered before the Gemini turn ended; resend with SendMessage if still needed.`
+      : null;
+  if (noticeText) report.notice = noticeText;
   if (full.usage) {
     report.usage = full.usage;
     const model = job.result?.model ?? job.request?.model;
@@ -494,6 +516,22 @@ export function directReport(payload, job = {}, env = process.env) {
       }
     });
     report.next = nextCommand(command);
+  }
+  // Shrink or drop unconsumedSteers (preserving unconsumedSteersOmitted count)
+  // before fitDirectEnvelope trims changedFiles, checks or blocker messages.
+  while (envelopeBytes(report) > 2000 && report.unconsumedSteers?.length > 0) {
+    if (report.unconsumedSteers.length > 1) {
+      report.unconsumedSteers.pop();
+      report.unconsumedSteersOmitted = (report.unconsumedSteersOmitted ?? 0) + 1;
+    } else if (report.unconsumedSteers[0].text.length > 24) {
+      report.unconsumedSteers[0].text = `${truncate(report.unconsumedSteers[0].text, Math.floor(report.unconsumedSteers[0].text.length / 2))}…`;
+    } else {
+      delete report.unconsumedSteers;
+      report.unconsumedSteersOmitted = (report.unconsumedSteersOmitted ?? 0) + 1;
+    }
+  }
+  while (envelopeBytes(report) > 2000 && report.notice?.length > 48) {
+    report.notice = `${truncate(report.notice, Math.floor(report.notice.length / 2))}…`;
   }
   fitDirectEnvelope(report, checkPriorities);
   // Long workspace paths can exceed the fixed-field budget even after text
@@ -524,6 +562,10 @@ export function directReport(payload, job = {}, env = process.env) {
     const [blocker, key] = identifiers.sort(([a, ak], [b, bk]) => Buffer.byteLength(b[bk]) - Buffer.byteLength(a[ak]))[0];
     blocker[key] = truncate(blocker[key], Math.max(64, Math.floor(blocker[key].length / 2)));
   }
+  while (envelopeBytes(report) > 2000 && report.notice?.length > 16) {
+    report.notice = `${truncate(report.notice, Math.floor(report.notice.length / 2))}…`;
+  }
+  if (envelopeBytes(report) > 2000 && report.notice) delete report.notice;
   // A fresh task must keep its workspace. Omit a command that still cannot fit.
   if (envelopeBytes(report) > 2000) report.next = null;
   return report;

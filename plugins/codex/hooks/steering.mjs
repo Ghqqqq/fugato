@@ -2,10 +2,16 @@
 // SessionSendInput/Result). session.receive runs inside the recipient's turn;
 // it is not our interception point while turn.step owns that turn's wait.
 import { FRESH_ROLE_ERROR } from '../scripts/lib/command-options.mjs';
+import { cleanDisplayText } from '../scripts/lib/display-text.mjs';
 import { GEMINI_AGENT_TYPE, isNativeType } from './presets.mjs';
 export const GEMINI_BUSY = 'This Gemini worker is in the middle of a turn and cannot take new instructions. Wait for its report, then send again.';
-const UNKNOWN_REASON = 'Codex steering outcome unknown; the message may or may not have reached the running turn and will not be resent automatically. Inspect the Fugato job before resending.';
-async function deliveryId($, session, agentId) {
+const GEMINI_RESERVED_ANSWER = /^Answer\s+\S+/;
+const unknownReason = (label = 'Codex') => `${label} steering outcome unknown; the message may or may not have reached the running turn and will not be resent automatically. Inspect the Fugato job before resending.`;
+const geminiIdPart = value => String(value ?? '').replace(/[^A-Za-z0-9._-]/g, '').slice(0, 12) || 'x';
+async function deliveryId($, session, agentId, isGemini = false) {
+  if (isGemini) {
+    return `g:${geminiIdPart(session)}:${geminiIdPart(agentId)}:${(await $.clock.now()).toString(36)}:${Math.random().toString(36).slice(2, 12)}`;
+  }
   return `${session}:${agentId}:${await $.clock.now()}:${Math.random().toString(36).slice(2)}`;
 }
 function command($, state, args, input = '') {
@@ -22,26 +28,28 @@ async function resolveJob($, state) {
 }
 export function registerSteering(on, hasRoleHeader) {
   on('session.send', async ($, e, next) => {
-    let attempted = false;
+    let attempted = false, label = 'Codex';
     try {
       const agents = await $.agent.list();
       const matches = agents.filter(agent => agent.id === e.to || agent.name?.toLowerCase() === e.to.toLowerCase());
-      if (matches.length === 1 && matches[0].type === GEMINI_AGENT_TYPE) {
-        return matches[0].status === 'running' ? { isDelivered: false, reason: GEMINI_BUSY } : next(e);
-      }
       if (matches.length !== 1 || !isNativeType(matches[0].type) || matches[0].status !== 'running') return next(e);
+      const isGemini = matches[0].type === GEMINI_AGENT_TYPE;
+      label = isGemini ? 'Gemini' : 'Codex';
       // Only the main conversation steers. Subagent and teammate sends keep the
       // ordinary queue, where the teammate mailbox guard judges them.
       if (e.agentId || typeof e.text !== 'string' || !e.text.trim() || e.text.length > 65536) return next(e);
+      if (isGemini && (GEMINI_RESERVED_ANSWER.test(e.text.split(/\r?\n/, 1)[0].trim()) || !cleanDisplayText(e.text).trim())) return next(e);
       const session = await $.session.id();
       const state = await $.store.get(`native:v2:${session}:${matches[0].id}`);
-      if (!state || state.session !== session || state.bindingPending || state.status === 'needs_answer' || state.answer?.status === 'needs_answer') return next(e);
+      const parkedAtQuestion = state?.answer?.status === 'needs_answer'
+        || (state?.status === 'needs_answer' && !(isGemini && state.intent?.kind === 'answer' && !state.answer));
+      if (!state || state.session !== session || state.bindingPending || parkedAtQuestion) return next(e);
       if (hasRoleHeader(e.text)) return { isDelivered: false, reason: FRESH_ROLE_ERROR };
       // An early send can precede the progress lookup that publishes jobId.
       // Resolve its durable launch nonce; never spawn or mutate its binding.
       if (!state.jobId && state.intent?.kind === 'task') await resolveJob($, state);
       if (!state.jobId || !state.ownerId) return next(e);
-      const id = await deliveryId($, session, matches[0].id);
+      const id = await deliveryId($, session, matches[0].id, isGemini);
       const request = command($, state, ['steer', state.jobId, '--delivery-id', id, '--owner', state.ownerId], e.text);
       attempted = true;
       const result = await $.process.run(request.argv, { cwd: request.cwd, stdin: request.input, timeoutMs: 12000 });
@@ -49,16 +57,16 @@ export function registerSteering(on, hasRoleHeader) {
       const receipt = JSON.parse(result.stdout);
       if (receipt.jobId !== state.jobId || receipt.deliveryId !== id || !['queued', 'applied', 'deferred', 'failed', 'unknown'].includes(receipt.status)) throw new Error('Invalid steering receipt.');
       if (receipt.status === 'deferred' && receipt.fallback === true) return next(e);
-      const text = `Codex steering ${receipt.status}${receipt.status === 'unknown' ? '; acknowledgement missing, message will not be replayed' : ''}.`;
+      const text = `${label} steering ${receipt.status}${receipt.status === 'unknown' ? '; acknowledgement missing, message will not be replayed' : ''}.`;
       try { await $.session.append({ message: { type: 'system', content: [{ type: 'text', text }] } }); }
       catch { /* A notice failure cannot replay a durable delivery. */ }
-      if (receipt.status === 'unknown') return { isDelivered: false, reason: UNKNOWN_REASON };
+      if (receipt.status === 'unknown') return { isDelivered: false, reason: unknownReason(label) };
       return receipt.status === 'failed' ? { isDelivered: false,
-        reason: `Codex steering failed (${receipt.reason ?? 'steer_rejected'}); the message will not be resent automatically. Inspect the Fugato job before resending.` } : { isDelivered: true };
+        reason: `${label} steering failed (${receipt.reason ?? 'steer_rejected'}); the message will not be resent automatically. Inspect the Fugato job before resending.` } : { isDelivered: true };
     } catch {
       // After process launch a lost receipt is ambiguous. Never release that
-      // text to the host queue, which could start a second Codex turn.
-      return attempted ? { isDelivered: false, reason: UNKNOWN_REASON } : next(e);
+      // text to the host queue, which could start a second turn.
+      return attempted ? { isDelivered: false, reason: unknownReason(label) } : next(e);
     }
-  }).catch(() => ({ isDelivered: false, reason: UNKNOWN_REASON }));
+  }).catch(() => ({ isDelivered: false, reason: unknownReason() }));
 }

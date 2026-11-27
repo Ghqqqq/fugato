@@ -15,7 +15,7 @@ const object = value => value !== null && typeof value === "object" && !Array.is
 const strings = value => Array.isArray(value) && value.every(item => typeof item === "string");
 const count = value => Number.isSafeInteger(value) && value >= 0;
 const nullableString = value => value === null || typeof value === "string";
-const fields = new Set(["status", "worker", "jobId", "backend", "provider", "model", "summary", "summaryTruncated", "blockers", "question", "changedFiles", "changedFilesOmitted", "changedFilesShared", "changedFilesNote", "checks", "assumptions", "keyFindings", "usage", "next", "details"]);
+const fields = new Set(["status", "worker", "jobId", "backend", "provider", "model", "summary", "summaryTruncated", "blockers", "question", "changedFiles", "changedFilesOmitted", "changedFilesShared", "changedFilesNote", "checks", "assumptions", "keyFindings", "unconsumedSteers", "unconsumedSteersOmitted", "notice", "usage", "next", "details"]);
 const usageFields = ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"];
 const terminal = new Set(["completed", "needs_input", "blocked", "failed", "cancelled", "interrupted", "owner_stopped", "error"]);
 const noticeLimit = 5, graceMs = 10000;
@@ -208,6 +208,12 @@ export function isC2Report(value) {
   if ("changedFilesOmitted" in value && !count(value.changedFilesOmitted)) return false;
   if ("changedFilesShared" in value && value.changedFilesShared !== true) return false;
   if ("changedFilesNote" in value && (typeof value.changedFilesNote !== "string" || value.changedFilesNote.length > 600)) return false;
+  if ("notice" in value && (typeof value.notice !== "string" || !value.notice.trim() || value.notice.length > 600)) return false;
+  if ("unconsumedSteersOmitted" in value && !count(value.unconsumedSteersOmitted)) return false;
+  if ("unconsumedSteers" in value && (!Array.isArray(value.unconsumedSteers) || value.unconsumedSteers.length === 0 || value.unconsumedSteers.length > 3
+      || !value.unconsumedSteers.every(entry => object(entry) && Object.keys(entry).every(k => k === "id" || k === "text")
+        && typeof entry.id === "string" && /^[A-Za-z0-9._:-]{1,64}$/.test(entry.id)
+        && typeof entry.text === "string" && entry.text.trim().length > 0 && entry.text.length <= 240))) return false;
   if ("blockers" in value && (!Array.isArray(value.blockers) || !value.blockers.every(b => object(b) && typeof b.code === "string" && typeof b.message === "string"))) return false;
   if ("checks" in value && (!object(value.checks) || !strings(value.checks.ran) || !strings(value.checks.claimed) || !count(value.checks.omitted))) return false;
   if ("usage" in value && (!object(value.usage) || Object.keys(value.usage).length === 0

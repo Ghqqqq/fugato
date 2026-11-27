@@ -134,10 +134,10 @@ fallback. Escalating a resolved Gemini job that still fails after a rework is
 a separate step: a fresh `fugato:codex-native` dispatch with `--high-stakes`
 (see the protocol's Worker roles section).
 
-Wait for the worker's report before using `SendMessage`. A running turn
-refuses messages, even if a progress notice already shows a question.
-Once the turn finishes, send a plain brief to start the next assignment on
-the same session. Use `/tasks` to stop the worker.
+You can use `SendMessage` from the main conversation while a Gemini worker is
+running to steer the turn (see [Mid-turn steering](#mid-turn-steering)). Once
+the turn finishes, send a plain brief to start the next assignment on the same
+session. Use `/tasks` to stop the worker.
 [Message routing](../plugins/codex/hooks/steering.mjs)
 
 If the report says `needs_answer`, its `next` field shows the exact reply
@@ -157,6 +157,37 @@ characters. Fugato checks the ID against the job's actual pending question.
 It refuses replies with a missing header, a stale or mismatched ID, or an
 invalid body. Those replies start no work.
 [`geminiAnswerNext` and `geminiMessageRefusal`](../plugins/codex/hooks/native-agent.mjs)
+
+## Mid-turn steering
+
+ACP v1 has no `turn/steer` RPC, so Fugato delivers mid-turn steering to a
+running Gemini worker at parent-bridge tool boundaries.
+
+- When the chair sends `SendMessage` to a running `fugato:gemini-native` worker
+  that has no pending question, Fugato persists the note immediately in
+  `<jobId>.steering.json`, returns delivered without waiting on the Codex 6 s
+  poll loop, and records a `Gemini steering queued.` notice.
+- On the worker's next parent-bridge tool call (`workspace_*`, `forum_*`, or
+  `ask_parent`, including non-roundtable jobs and `forum_read`), the bridge
+  atomically drains all queued notes, marks them `applied` with `appliedAt`,
+  and appends them once to the tool reply framed as
+  `[Chair steering update — apply immediately]` (or `[Chair denial guidance]`
+  for denial guidance). Subsequent tool replies never repeat already-applied
+  notes.
+- Delivery happens only at parent-bridge tool boundaries. During a
+  pure-reasoning stretch or local tool sequence with no parent-bridge calls,
+  queued notes stay undrained until the turn ends. At turn end, Fugato marks
+  any remaining queued notes terminal so they are never delivered twice, and
+  surfaces them on the job report in `unconsumedSteers` (`[{ id, text }]`,
+  bounded to 3 clipped entries plus `unconsumedSteersOmitted`) alongside a
+  warning `notice` telling the chair to resend with `SendMessage` if still
+  needed.
+- If a question or approval is pending (`needs_answer`), steering defers and
+  `Answer <questionId>` routing is unchanged. Active Gemini roundtable seats
+  continue to receive forum unread notices via bridge tool footers rather than
+  the steering queue.
+  [Steering queue](../plugins/codex/scripts/lib/steering.mjs) ·
+  [Bridge footer drain](../plugins/codex/scripts/parent-bridge-mcp.mjs)
 
 ## Companion CLI
 

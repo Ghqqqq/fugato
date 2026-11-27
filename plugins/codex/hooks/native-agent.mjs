@@ -674,7 +674,7 @@ const UNSETTLED = [...ACTIVE, ...RECOVERY_STATUSES];
 const REPORT_STATUSES = new Set([...ACTIVE, ...RECOVERY_STATUSES, 'completed', 'needs_input', 'needs_answer', 'blocked',
   'failed', 'interrupted', 'cancelled', 'owner_stopped', 'ownership_moved']);
 const REPORT_FIELDS = new Set(['status', 'worker', 'jobId', 'backend', 'provider', 'model', 'summary', 'summaryTruncated', 'blockers',
-  'question', 'changedFiles', 'changedFilesShared', 'changedFilesNote', 'checks', 'assumptions', 'keyFindings', 'usage', 'next', 'details', 'notice',
+  'question', 'changedFiles', 'changedFilesShared', 'changedFilesNote', 'checks', 'assumptions', 'keyFindings', 'unconsumedSteers', 'unconsumedSteersOmitted', 'usage', 'next', 'details', 'notice',
   'changedFilesOmitted', 'keyFindingsOmitted', 'assumptionsOmitted', 'blockersOmitted',
   'verificationOmitted', 'claimedVerificationOmitted', 'touchedFilesOmitted', 'preExistingChangesOmitted',
   'approvedBrowserOriginsOmitted', 'approvedComputerAppsOmitted']);

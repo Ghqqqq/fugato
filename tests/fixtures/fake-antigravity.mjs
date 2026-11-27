@@ -216,6 +216,7 @@ input.on("line", line => {
       if (behavior === "unknown-request") { send({ id: "1", method: "fs/write_text_file", params: { sessionId, path: "/outside", content: "denied" } }); break; }
       if (behavior === "foreign-session") update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "FOREIGN MESSAGE" } }, "other-session");
       if (startGrantSequence()) break;
+      if (behavior === "steer-bridge") { runSteerBridge(); break; }
       finish(); break;
     case "session/cancel":
       if (behavior !== "ignore-cancel") finish("cancelled");
@@ -268,4 +269,37 @@ function handleGrantReply(message) {
     ...(approved ? { rawOutput: { exitCode: 0, stdout: "ok" } } : {}) });
   sendNextGrantCommand();
   return true;
+}
+async function runSteerBridge() {
+  while (promptGate && !fs.existsSync(promptGate)) await new Promise(resolve => setTimeout(resolve, 10));
+  const server = mcpServers[0];
+  if (!server) { finish(); return; }
+  const { spawn } = await import("node:child_process");
+  const childEnv = { ...process.env, ...Object.fromEntries((server.env ?? []).map(({ name, value }) => [name, value])) };
+  const child = spawn(server.command, server.args ?? [], { env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+  const pending = new Map();
+  let nextId = 1;
+  readline.createInterface({ input: child.stdout }).on("line", line => {
+    try {
+      const msg = JSON.parse(line);
+      const waiter = pending.get(msg.id);
+      if (waiter) { pending.delete(msg.id); waiter(msg); }
+    } catch {}
+  });
+  const call = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Bridge timeout: ${method}`)); }, 10000);
+    pending.set(id, msg => { clearTimeout(timer); resolve(msg); });
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+  });
+  try {
+    await call("initialize", { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "fake-agy", version: "1" } });
+    const first = await call("tools/call", { name: "workspace_list", arguments: { depth: 1 } });
+    const second = await call("tools/call", { name: "workspace_list", arguments: { depth: 1 } });
+    save(value => { value.steerBridgeReplies = [first.result, second.result]; });
+  } finally {
+    try { child.stdin.end(); } catch {}
+    try { child.kill(); } catch {}
+  }
+  finish();
 }

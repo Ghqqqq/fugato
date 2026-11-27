@@ -7,6 +7,16 @@ import { classifyBrowserBlocker, classifyCodexError, classifyKnownBlockers, dedu
 export { classifyBrowserBlocker };
 
 const shorten = (text, max = 240) => redactActivity(text).replace(/\s+/g, " ").trim().slice(0, max);
+const MAX_UNCONSUMED_STEERS = 3;
+const GEMINI_STEER_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+const unconsumedSteersNotice = count => `${count} mid-turn steering ${count === 1 ? "message was" : "messages were"} not delivered before the Gemini turn ended; resend with SendMessage if still needed.`;
+function storedJobSteeringFallback(meta) {
+  if (typeof meta?.resultFile !== "string" || !meta.resultFile.endsWith(".result.json")) return null;
+  try {
+    const job = JSON.parse(fs.readFileSync(meta.resultFile.replace(/\.result\.json$/, ".json"), "utf8"));
+    return job && typeof job === "object" && (!meta.jobId || job.id === meta.jobId) ? job : null;
+  } catch { return null; }
+}
 const lines = text => String(text ?? "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
 const unfinishedOpening = /^(?:I(?:'ll| will|’ll)|I(?: am|'m|’m) (?:working|starting|going|waiting)|Let me|Next I|Working on|Still (?:working|running)|Starting|In progress|我将|我会|正在)/i;
 
@@ -73,7 +83,7 @@ export function taskArtifactPaths(workspaceRoot, jobId) {
 const blockerEntry = blocker => Object.fromEntries(Object.entries({ ...blocker, ...(typeof blocker.message === "string" ? { message: shorten(blocker.message) } : {}) }).filter(([, v]) => v !== null && v !== undefined));
 export const REPORT_LINE_BUDGET = 60;
 /** @type {[string, string | null, number][]} */
-const BUDGET_LISTS = [["touchedFiles", "touchedFilesOmitted", 1], ["keyFindings", null, 1], ["verification", null, 1], ["claimedVerification", null, 1], ["preExistingChanges", "preExistingChangesOmitted", 1], ["assumptions", null, 0], ["blockers", "blockersOmitted", 1]];
+const BUDGET_LISTS = [["touchedFiles", "touchedFilesOmitted", 1], ["keyFindings", null, 1], ["verification", null, 1], ["claimedVerification", null, 1], ["preExistingChanges", "preExistingChangesOmitted", 1], ["assumptions", null, 0], ["unconsumedSteers", "unconsumedSteersOmitted", 0], ["blockers", "blockersOmitted", 1]];
 const reportLines = report => `${JSON.stringify(report, null, 2)}\n`.split("\n").length;
 // Trim lists (longest first, blockers last) until the pretty-printed report
 // fits the budget; omitted counters account for every dropped entry.
@@ -84,6 +94,7 @@ function fitBudget(report) {
     const [key, omitted] = candidates.reduce((best, entry) => report[entry[0]].length > report[best[0]].length ? entry : best, candidates[0]);
     report[key] = report[key].slice(0, -1);
     if (omitted) report[omitted] = (report[omitted] ?? 0) + 1;
+    if (key === "unconsumedSteers" && !report[key].length) delete report[key];
   }
   return report;
 }
@@ -107,9 +118,13 @@ export function buildWorkerReport(payload, meta = {}) {
   const runtimeBlocker = payload.interruptionReason === "codex_runtime_restarted"
     ? { code: "codex_runtime_restarted", message: "The Codex runtime exited mid-turn (for example, during an app update). The thread and saved work persist; only the running turn was interrupted. Continue this worker when the runtime is available." }
     : payload.status !== 0 ? classifyCodexError(payload.codexErrorInfo, payload.error) : null;
+  const storedSteering = !Array.isArray(payload.unconsumedSteers) && !payload.notice ? storedJobSteeringFallback(meta) : null;
+  const finalizeBlocker = storedSteering?.steeringFinalizeError
+    ? { code: "steering_finalize_failed", message: `Could not finalize Gemini steering inbox at turn end (${storedSteering.steeringFinalizeError}); inspect steering state before resending.` }
+    : null;
   // Classified turn failures also block a non-zero turn. Other captured refusals
   // and final-answer signatures retain their existing zero-exit precedence.
-  const known = dedupeBlockers([...(runtimeBlocker ? [runtimeBlocker] : []), ...(payload.blockers ?? []), ...classifyKnownBlockers(text)]);
+  const known = dedupeBlockers([...(runtimeBlocker ? [runtimeBlocker] : []), ...(finalizeBlocker ? [finalizeBlocker] : []), ...(payload.blockers ?? []), ...classifyKnownBlockers(text)]);
   const status = runtimeBlocker ? "blocked" : payload.status !== 0 ? "failed" : known.length ? "blocked" : structured ? declaredStatus(structured) : classifyWorkerOutcome(payload.rawOutput, payload.status);
   // Blockers Codex declared itself; a declared "blocked" without any entry still
   // names the summary so the parent sees why.
@@ -132,6 +147,19 @@ export function buildWorkerReport(payload, meta = {}) {
   const assumptionIndex = structured ? -1 : findings.findIndex(line => /^(?:#+\s*)?(?:\*\*)?assumptions?\b/i.test(line));
   const assumptions = structured ? structured.assumptions.slice(0, 3).map(s => shorten(s)) : assumptionIndex < 0 ? [] : findings.slice(assumptionIndex, assumptionIndex + 2).map(s => shorten(s));
   const omittedBlockers = Math.max(known.length, declared.length) - 3;
+  const unconsumedSource = Array.isArray(payload.unconsumedSteers) ? payload.unconsumedSteers
+    : Array.isArray(storedSteering?.unconsumedSteers) ? storedSteering.unconsumedSteers : [];
+  const rawUnconsumedSteers = unconsumedSource
+    .filter(entry => entry && typeof entry === "object" && typeof entry.id === "string" && typeof entry.text === "string")
+    .map(entry => ({ id: shorten(entry.id, 64), text: shorten(entry.text) }))
+    .filter(entry => GEMINI_STEER_ID.test(entry.id) && entry.text.length > 0);
+  const unconsumedSteers = rawUnconsumedSteers.slice(0, MAX_UNCONSUMED_STEERS);
+  const unconsumedSteersOmitted = Math.max(0, rawUnconsumedSteers.length - unconsumedSteers.length);
+  const steerNotice = rawUnconsumedSteers.length ? unconsumedSteersNotice(rawUnconsumedSteers.length) : null;
+  const baseNotice = typeof payload.notice === "string" && payload.notice.trim() ? payload.notice
+    : typeof storedSteering?.notice === "string" && storedSteering.notice.trim() ? storedSteering.notice : null;
+  const notice = [baseNotice ? shorten(baseNotice, 600) : null, steerNotice]
+    .filter(Boolean).join(" ") || null;
   return fitBudget({
     ...(budgetReason(payload.interruptionReason) ? { reason: budgetReason(payload.interruptionReason) } : {}),
     status: status === "completed" && blockers.length ? "blocked" : status,
@@ -171,6 +199,9 @@ export function buildWorkerReport(payload, meta = {}) {
     findingsBasis: payload.backend === "antigravity" ? "Reported by the Antigravity worker; parent has not independently verified."
       : structured ? "Declared by Codex in its structured report, not independently verified; the summary is in the raw output file." : "Codex-reported, not independently verified; full output includes any omitted assumptions and details.",
     assumptions,
+    ...(unconsumedSteers.length ? { unconsumedSteers } : {}),
+    ...(unconsumedSteersOmitted ? { unconsumedSteersOmitted } : {}),
+    ...(notice ? { notice } : {}),
     ...(browserBlocker ? { browserBlocker } : {}),
     blockers,
     ...(omittedBlockers > 0 ? { blockersOmitted: omittedBlockers } : {}),
