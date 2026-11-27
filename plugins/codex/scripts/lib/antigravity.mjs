@@ -9,12 +9,14 @@ import { executableOnPath } from "./process.mjs";
 import { resolveIsolatedCodexHome } from "./codex-home.mjs";
 import { acquireConcurrency } from "./concurrency.mjs";
 import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runtime.mjs";
-import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
+import { readJobFile, resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
 import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES } from "./workspace-read-tools.mjs";
 import { approvalArtifactDir, stageApprovalArtifact, verifyApprovalArtifact } from "./approval-artifacts.mjs";
 import { classifyCommand } from "./command-classify.mjs";
 import { ACTION_APPROVAL_OPTIONS, actionApprovalOptions } from "./server-requests.mjs";
 import { finalizeUnconsumedGeminiNotes } from "./steering.mjs";
+import { WORKSPACE_WRITE_TOOLS, WORKSPACE_WRITE_TOOL_NAMES } from "./workspace-write-tools.mjs";
+import { evaluateCommand, evaluatePath } from "./acp-policy.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
 export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
@@ -182,7 +184,7 @@ export function parentBridgeToolKeys(toolName) {
   if (toolName === "ask_parent") return new Set([...Object.keys(ASK_PARENT.inputSchema.properties), "toolSummary"]);
   if (toolName === "forum_read") return new Set(["resource", "after", "thread", "limit", "toolSummary"]);
   if (toolName === "forum_post") return new Set(["kind", "body", "title", "thread", "reply_to", "label", "refs", "mentions", "toolSummary"]);
-  const workspaceTool = WORKSPACE_READ_TOOLS.find(tool => tool.name === toolName);
+  const workspaceTool = [...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS].find(tool => tool.name === toolName);
   if (workspaceTool) return new Set([...Object.keys(workspaceTool.inputSchema.properties), "toolSummary"]);
   return null;
 }
@@ -203,7 +205,7 @@ export function autoAllowedParentBridgeTool(call, bridge) {
   const listed = [
     "ask_parent",
     ...(bridge.roundtable ? ["forum_read", "forum_post"] : []),
-    ...(bridge.backend === "antigravity" ? WORKSPACE_READ_TOOL_NAMES : [])
+    ...(bridge.backend === "antigravity" ? [...WORKSPACE_READ_TOOL_NAMES, ...WORKSPACE_WRITE_TOOL_NAMES] : [])
   ];
   const toolName = typeof tool.name === "string"
     ? listed.find(name => tool.name === `mcp_${bridge.serverName}_${name}`)
@@ -234,7 +236,70 @@ function parentBridgeServers(cwd, options) {
 }
 
 export const GEMINI_WORKSPACE_GUIDANCE =
-  "Read files with read_file, and use workspace_list, workspace_grep and workspace_git_read instead of shell commands for directory listing, code search and git inspection. These read-only tools stay inside the job execution directory and run without shell approval.";
+  "Read files with read_file, and use workspace_list, workspace_grep and workspace_git_read instead of shell commands for directory listing, code search and git inspection. Edit files with workspace_edit (it changes exactly one match unless you set replace_all or expected_occurrences) and create or overwrite files with workspace_write instead of the built-in edit_file and write_file. These workspace tools stay inside the job execution directory and run without approval; built-in edits and shell commands each wait for the parent's approval.";
+
+// Fugato's fail-closed boundary gate for tool calls agy submits through
+// session/request_permission. Passing it is not approval: an allowed built-in
+// call still parks for the parent unless the bridge or a job grant allows it.
+const POLICY_PATH_KEYS = /^(?:path|absolutepath|file|filepath|filename|targetfile|directory|dirpath|searchpath|searchdirectory|cwd|workingdirectory|source|destination|uri)$/i;
+function policyToolPaths(tool) {
+  const paths = [];
+  for (const location of Array.isArray(tool.locations) ? tool.locations : []) if (typeof location?.path === "string" && location.path) paths.push(location.path);
+  const input = isPlainObject(tool.rawInput) ? tool.rawInput : {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value !== "string" || !value || !POLICY_PATH_KEYS.test(key)) continue;
+    paths.push(value.startsWith("file://") ? fileURLToPath(value) : value);
+  }
+  return [...new Set(paths)];
+}
+const policyWriteName = /write|edit|delete|remove|move|rename|create|replace/i;
+export function acpPolicyDenial(tool, executionCwd, env = process.env) {
+  if (!tool || typeof tool !== "object" || !executionCwd) return null;
+  const name = typeof tool.name === "string" && tool.name ? tool.name : String(tool.kind ?? "tool");
+  try {
+    const input = isPlainObject(tool.rawInput) ? tool.rawInput : {};
+    const execute = tool.name === "run_command" || tool.kind === "execute";
+    if (execute) {
+      const commandLine = typeof input.CommandLine === "string" ? input.CommandLine : typeof input.command === "string" ? input.command : null;
+      if (commandLine) {
+        const verdict = evaluateCommand(commandLine, { executionCwd, env });
+        if (!verdict.allowed) return { tool: name, code: verdict.code, reason: verdict.reason };
+      }
+    }
+    const access = !execute && (["edit", "delete", "move"].includes(tool.kind) || policyWriteName.test(String(tool.name ?? ""))) ? "write" : "read";
+    for (const target of policyToolPaths(tool)) {
+      const verdict = evaluatePath({ target, executionCwd, access, env });
+      if (!verdict.allowed) return { tool: name, code: verdict.code, reason: verdict.reason };
+    }
+    return null;
+  } catch (error) {
+    return { tool: name, code: "policy_error", reason: `Boundary check failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+// agy's built-in edit_file replaces every occurrence of Target. Warn on the card;
+// never auto-allow, and never reject a typo outright (that would end the turn).
+const MAX_EDIT_SCAN_BYTES = 4 * 1024 * 1024;
+export function editAmbiguityWarning(tool, executionCwd) {
+  if (!tool || tool.name !== "edit_file" || !executionCwd) return null;
+  const input = isPlainObject(tool.rawInput) ? tool.rawInput : {};
+  const target = typeof input.Target === "string" ? input.Target : typeof input.TargetContent === "string" ? input.TargetContent : null;
+  const file = [input.Path, input.TargetFile, input.AbsolutePath, tool.locations?.[0]?.path].find(value => typeof value === "string" && value);
+  if (!target || !file) return null;
+  const root = path.resolve(executionCwd), absolute = path.resolve(root, file), relative = path.relative(root, absolute);
+  if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
+  let content;
+  try {
+    const stat = fs.statSync(absolute);
+    if (!stat.isFile() || stat.size > MAX_EDIT_SCAN_BYTES) return null;
+    content = fs.readFileSync(absolute, "utf8");
+  } catch { return null; }
+  let count = 0;
+  for (let from = content.indexOf(target); from !== -1; from = content.indexOf(target, from + target.length)) count += 1;
+  if (count > 1) return `AMBIGUOUS: edit_file replaces all ${count} occurrences of Target in ${relative}; prefer workspace_edit.`;
+  if (count === 0) return `NO MATCH: Target was not found in ${relative}; check the text or prefer workspace_edit.`;
+  return null;
+}
 
 function promptContent(options) {
   const prompt = options.prompt?.trim() || options.defaultPrompt?.trim();
@@ -453,6 +518,16 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
       });
       return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
+    const policy = call && binding.turnId ? acpPolicyDenial(call.tool, executionCwd, options.env ?? process.env) : null;
+    if (policy) {
+      call.permission = "denied";
+      const message = `Fugato boundary policy denied ${policy.tool} (${policy.code}): ${policy.reason}`;
+      blockers.push({ code: policy.code, message, method: "session/request_permission", kind: "acp-policy" });
+      report(options, message, "working", {
+        activity: [{ type: "permissionAutoDenied", lifecycle: "completed", status: "denied", tool: policy.tool, code: policy.code, text: message }]
+      });
+      return denyPermission(choices);
+    }
     const grantPrefix = call && binding.turnId && allow ? runCommandPrefix(call, executionCwd) : null;
     if (grantPrefix && jobGrants?.has(grantPrefix)) {
       if (call.permission !== "denied") call.permission = "approved";
@@ -465,6 +540,8 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
     let answer = { decision: "deny" };
     const staging = workspaceRoot && options.jobId ? { workspaceRoot, jobId: options.jobId, env: options.env } : null;
     let review = call && binding.turnId && allow ? permissionReview(call.tool, staging) : null;
+    const editWarning = review?.question ? editAmbiguityWarning(call.tool, executionCwd) : null;
+    if (editWarning) review = { ...review, question: `${editWarning}\n${review.question}` };
     if (review?.question && options.onApprovalRequest) {
       const request = { kind: "acp-permission", question: review.question,
         options: grantPrefix ? actionApprovalOptions(grantPrefix) : ACTION_APPROVAL_OPTIONS,
@@ -827,7 +904,14 @@ export async function runAntigravityTurn(cwd, options = {}) {
       blockers.push({ code: "approval_denied", message: "Antigravity denied permission to run the command.", method: "session/request_permission", kind: "acp-permission" });
     } else commandExecutions.push(commandResult(tool));
   }
-  const touchedFiles = [...new Set(fileChanges.flatMap(tool => changedPaths(tool)))];
+  let bridgeTouchedFiles = [];
+  if (steeringJobId) {
+    try {
+      const stored = readJobFile(resolveJobFile(steeringCwd, steeringJobId));
+      if (Array.isArray(stored.bridgeTouchedFiles)) bridgeTouchedFiles = stored.bridgeTouchedFiles.filter(value => typeof value === "string" && value).map(value => path.resolve(executionCwd, value));
+    } catch { /* A missing job record has no bridge edits to merge. */ }
+  }
+  const touchedFiles = [...new Set([...fileChanges.flatMap(tool => changedPaths(tool)), ...bridgeTouchedFiles])];
   await finalizeSteering();
   let steeringNotice = null;
   if (steeringFinalizeError) {

@@ -11,14 +11,28 @@ import { createJsonLineReader } from "./lib/app-server.mjs";
 import { jobBackend } from "./lib/backends.mjs";
 import { ACTIVE, ASK_PARENT, PARENT_BRIDGE_ENV, recordedThreadJobs, askParentQuestion } from "./lib/job-runtime.mjs";
 import { readRoom, assertChair, readIndex, readThread, readResource, postEvent, renderForum, unreadFooter, EVENT_KINDS } from "./lib/forum.mjs";
-import { readJobFile, resolveJobFile } from "./lib/state.mjs";
+import { readJobFile, resolveJobFile, updateJob } from "./lib/state.mjs";
+import { appendActivity } from "./lib/activity.mjs";
 import { drainGeminiNotes } from "./lib/steering.mjs";
 import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, resolveWorkspaceExecRoot, callWorkspaceReadTool } from "./lib/workspace-read-tools.mjs";
+import { WORKSPACE_WRITE_TOOLS, WORKSPACE_WRITE_TOOL_NAMES, callWorkspaceWriteTool } from "./lib/workspace-write-tools.mjs";
 
 const cwd = process.env[PARENT_BRIDGE_ENV.cwd], envThread = process.env[PARENT_BRIDGE_ENV.threadId], envJob = process.env[PARENT_BRIDGE_ENV.jobId];
 const backend = process.env.CODEX_COMPANION_BRIDGE_BACKEND ?? "codex";
 const workspaceRoot = backend === "antigravity" ? resolveWorkspaceExecRoot(process.env[WORKSPACE_EXEC_CWD_ENV]) : null;
-const workspaceTools = workspaceRoot ? WORKSPACE_READ_TOOLS : [];
+const workspaceTools = workspaceRoot ? [...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS] : [];
+const MAX_BRIDGE_TOUCHED_FILES = 500;
+// Record a confined bridge edit as a file change, so native logs and
+// fugato-live show Update/Write(path) and the turn's touchedFiles include it.
+function recordBridgeFileChange(job, change) {
+  try {
+    updateJob(job.workspaceRoot, job.id, current => ({
+      ...appendActivity(current, [{ type: "fileChange", lifecycle: "completed", status: "completed", path: change.path,
+        kind: change.kind === "create" ? "add" : "update", added: change.added, removed: change.removed }]),
+      bridgeTouchedFiles: [...new Set([...(Array.isArray(current.bridgeTouchedFiles) ? current.bridgeTouchedFiles : []), change.path])].slice(-MAX_BRIDGE_TOUCHED_FILES)
+    }));
+  } catch { /* The edit already happened; a lost activity entry must not fail the tool call. */ }
+}
 const caller = { pid: process.pid, nonce: randomUUID() };
 const validThread = id => typeof id === "string" && /^[A-Za-z0-9._-]{1,120}$/.test(id);
 // Match the job filename alphabet used by retention, with a bounded length.
@@ -189,6 +203,12 @@ process.stdin.on("data", createJsonLineReader(async line => {
           ? await jobForTurn(threadId, validTurn(turnId) ? turnId : null) : null;
         if (!job) { send({ id: message.id, result: { ...result("No Fugato task is listening on this thread right now. Proceed on a conservative assumption within the authorized scope and report it."), isError: true } }); break; }
         activeJob = job;
+        if (workspaceTool && WORKSPACE_WRITE_TOOL_NAMES.includes(name)) {
+          const outcome = callWorkspaceWriteTool(name, args === undefined ? {} : args, workspaceRoot, { env: process.env });
+          if (!outcome.result.isError && outcome.fileChange) recordBridgeFileChange(job, outcome.fileChange);
+          send({ id: message.id, result: await withSteeringFooter(withUnreadFooter(outcome.result, name, job), job) });
+          break;
+        }
         if (workspaceTool) {
           send({ id: message.id, result: await withSteeringFooter(withUnreadFooter(await callWorkspaceReadTool(name, args === undefined ? {} : args, workspaceRoot), name, job), job) });
           break;
@@ -220,7 +240,7 @@ process.stdin.on("data", createJsonLineReader(async line => {
     }
   } catch (error) {
     const label = message.params?.name?.startsWith("forum_") ? "Roundtable forum"
-      : message.params?.name?.startsWith("workspace_") ? "Workspace read tool" : "Parent question";
+      : message.params?.name?.startsWith("workspace_") ? "Workspace tool" : "Parent question";
     const payload = { ...result(`${label} unavailable (${error instanceof Error ? error.message : String(error)}). Proceed conservatively and report missing essential input.`), isError: true };
     send({ id: message.id, result: message.method === "tools/call" ? await withSteeringFooter(withUnreadFooter(payload, message.params?.name, activeJob), activeJob) : payload });
   }
