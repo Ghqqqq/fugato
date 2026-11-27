@@ -270,7 +270,8 @@ test("D8 refuses auto-allow on every negative condition and preserves the normal
     ["wrong server suffix", { roundtable: true, req: { server: "duet_parent_000000000000", tool: "ask_parent", rawInput: { question: "q", toolSummary: "s" } }, reviewable: true }],
     ["collision/substring name", { roundtable: true, req: { tool: "ask_parent", nameSuffix: "_extra", rawInput: { question: "q", toolSummary: "s" } }, reviewable: true }],
     ["kind execute", { roundtable: true, req: { tool: "ask_parent", kind: "execute", rawInput: { question: "q", toolSummary: "s" } }, reviewable: false }],
-    ["non-empty locations", { roundtable: true, req: { tool: "forum_read", locations: [{ path: "/tmp/file" }], rawInput: { toolSummary: "s" } }, reviewable: true }],
+    // The boundary policy denies a location outside the job directory before review.
+    ["non-empty locations", { roundtable: true, req: { tool: "forum_read", locations: [{ path: "/tmp/file" }], rawInput: { toolSummary: "s" } }, reviewable: false }],
     ["non-empty content", { roundtable: true, req: { tool: "forum_read", content: [{ type: "content", content: { type: "text", text: "x" } }], rawInput: { toolSummary: "s" } }, reviewable: true }],
     ["extra rawInput key", { roundtable: true, req: { tool: "forum_read", rawInput: { resource: "post/1", extra: "bad", toolSummary: "s" } }, reviewable: true }],
     ["missing allow_once", { roundtable: true, req: { tool: "ask_parent", rawInput: { question: "q", toolSummary: "s" }, options: [{ optionId: "always", name: "Always", kind: "allow_always" }, { optionId: "deny", name: "Deny", kind: "reject_once" }] }, reviewable: false }],
