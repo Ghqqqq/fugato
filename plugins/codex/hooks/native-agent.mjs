@@ -779,7 +779,7 @@ function reportMarkdown(props, e = {}, lineLimit = 60) {
   const options = strings(question?.options).map((option, index) => `${index + 1}. ${option}`);
   if (count(question?.optionsOmitted)) options.push(`+${question.optionsOmitted} more`);
   if (report.backend === 'antigravity' && report.notice) add('notice', [[span(plain(report.notice), 'warning')]], 'warning');
-  if (report.backend === 'antigravity' && question?.kind === 'action-approval' && typeof question.text === 'string') {
+  if (question?.kind === 'action-approval' && typeof question.text === 'string') {
     // Keep the operation and its choices together. Let the host wrap literal
     // text so fact clipping cannot change a path or hide the end of an edit.
     groups.push({ label: 'question', rows: [{ type: 'Box', props: { flexDirection: 'column' }, children: [

@@ -1,5 +1,5 @@
 import { fileURLToPath } from "node:url";
-import { snippet, activityReader, redactActivity } from "./activity.mjs";
+import { snippet, activityReader, redactActivity, recordApprovalResolution } from "./activity.mjs";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -681,11 +681,17 @@ async function askParentQuestionSlot(cwd, id, { question, options = [], kind = "
   // requests have no ask_parent item. Never guess a missing ID from question
   // order, text, or the MCP transport's independent request ID.
   callId = kind === "question" ? callId : null;
-  const historyPatch = (current, resolution, answer = undefined) => ({ questionHistory: [...(current.questionHistory ?? []).slice(-19), {
-    id: questionId, callId, kind, text: question, options, askedAt, ...(binding ? { binding: { ...binding, jobId: id } } : {}),
-    answeredAt: answer === undefined ? null : new Date(Date.now()).toISOString(),
-    answer: answer === undefined ? null : answer.slice(0, 2000), resolution
-  }] });
+  const historyPatch = (current, resolution, answer = undefined) => {
+    const entry = {
+      id: questionId, callId, kind, text: question, options, askedAt, ...(binding ? { binding: { ...binding, jobId: id } } : {}),
+      answeredAt: answer === undefined ? null : new Date(Date.now()).toISOString(),
+      answer: answer === undefined ? null : answer.slice(0, 2000), resolution
+    };
+    return {
+      questionHistory: [...(current.questionHistory ?? []).slice(-19), entry],
+      ...recordApprovalResolution(current, entry)
+    };
+  };
   let admission;
   const admittedJob = updateJob(cwd, id, current => {
     let patch = {};
@@ -705,13 +711,15 @@ async function askParentQuestionSlot(cwd, id, { question, options = [], kind = "
     // that was not retried must not block every subsequent question forever.
     if (previous && Date.now() >= previous.expiresAt && (previous.answer === undefined || callerGone)) {
       const resolution = previous.answer === undefined ? "expired" : "orphaned";
+      const archived = {
+        id: previous.id, callId: previous.callId ?? null, kind: previous.kind ?? "question",
+        text: previous.text, options: previous.options, askedAt: previous.askedAt,
+        answeredAt: null, answer: previous.answer?.slice(0, 2000) ?? null, resolution
+      };
       patch = { pendingQuestion: null, phase: current.cancelRequested ? "interrupting" : "running",
         lastQuestion: { id: previous.id, resolution },
-        questionHistory: [...(current.questionHistory ?? []).slice(-19), {
-          id: previous.id, callId: previous.callId ?? null, kind: previous.kind ?? "question",
-          text: previous.text, options: previous.options, askedAt: previous.askedAt,
-          answeredAt: null, answer: previous.answer?.slice(0, 2000) ?? null, resolution
-        }] };
+        questionHistory: [...(current.questionHistory ?? []).slice(-19), archived],
+        ...recordApprovalResolution(current, archived) };
       current = { ...current, ...patch };
     }
     if (!ACTIVE.has(current.status) || current.cancelRequested || (turnId && current.turnId !== turnId)) admission = "interrupted";

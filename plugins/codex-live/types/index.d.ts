@@ -28,6 +28,12 @@ export type CodexLiveUsage = {
 };
 export type CodexLiveUsageEntry = { model: string; usage: CodexLiveUsage; sessionId?: string; backend?: CodexLiveBackend };
 
+export type CodexLiveJobApprovals = {
+  pending: number;
+  answered: number;
+  expiresAt?: number;
+};
+
 export type CodexLiveEvent = {
   seq: number;
   at?: string;
@@ -93,6 +99,7 @@ export type CodexLiveJob = {
   detailsOmitted?: boolean;
   toolUses?: number;
   lastUpdateMs?: number;
+  approvals?: CodexLiveJobApprovals;
 };
 
 // Derived from flat persisted jobs; live/unresolved owners outrank later refusals.
@@ -136,6 +143,7 @@ export type ForumRoom = {
   status: 'open' | 'paused' | 'closed';
   intensity: string;
   members: string[];
+  memberJobIds?: Record<string, string[]>;
   createdAt: string;
   postCount: number;
   viewedPosts?: number;
@@ -183,6 +191,8 @@ export type CodexLiveState = {
   // Per-turn snapshots keyed by job, replaced rather than accumulated on polls.
   usageByJob?: Record<string, CodexLiveUsageEntry>;
   usagePartial?: boolean;
+  // Per-job action-approval snapshots keyed by job, replaced on polls.
+  approvalsByJob?: Record<string, CodexLiveJobApprovals>;
 };
 
 declare module 'claude-code' {
