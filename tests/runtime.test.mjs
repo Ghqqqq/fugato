@@ -8,7 +8,7 @@ import { spawnOwned as spawn } from "../plugins/codex/scripts/lib/process.mjs";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv as fixtureEnv, installFakeCodex as generateFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo as initializeGitRepo, makeTempDir, run, requireLocalSockets, readyBroker } from "./helpers.mjs";
+import { initGitRepo, linkStaticExecutable, makeTempDir, run, requireLocalSockets, readyBroker } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir, upsertJob, updateJob, writeJobFile, setConfig } from "../plugins/codex/scripts/lib/state.mjs";
 import { resolveClaudeSessionPath } from "../plugins/codex/scripts/lib/claude-session-transfer.mjs";
@@ -24,50 +24,53 @@ const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "codex-companion.mjs");
 const STOP_HOOK = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 const SESSION_HOOK = path.join(PLUGIN_ROOT, "scripts", "session-lifecycle-hook.mjs");
 
-// Reuse executable bytes across fixtures; only their state files differ. On
-// macOS the first execution of each new script dominates these short runs.
-const executableCache = new Map();
+// Reuse one static read-only executable inode across all non-mutable fixtures;
+// per-fixture behavior and state live in fake-codex-config.json and env vars.
+const FAKE_CODEX_FIXTURE = fileURLToPath(new URL("./fixtures/fake-codex.cjs", import.meta.url));
 const cacheRoot = makeTempDir("runtime-codex-");
-let gitTemplate;
-function initGitRepo(cwd) {
-  if (fs.existsSync(path.join(cwd, ".git"))) return initializeGitRepo(cwd);
-  if (!gitTemplate) {
-    gitTemplate = path.join(cacheRoot, "repo");
-    fs.mkdirSync(gitTemplate);
-    initializeGitRepo(gitTemplate);
+let runtimeFakeCodexFixture = null;
+function ensureRuntimeFakeCodexFixture() {
+  if (!runtimeFakeCodexFixture) {
+    const original = fs.readFileSync(FAKE_CODEX_FIXTURE, "utf8");
+    const source = original.replace("function taskPayload(prompt, resume) {",
+      "function taskPayload(prompt, resume) { if (process.env.CODEX_FIXTURE_TASK_OUTPUT !== undefined) return process.env.CODEX_FIXTURE_TASK_OUTPUT;");
+    assert.notEqual(source, original);
+    runtimeFakeCodexFixture = path.join(cacheRoot, "fake-codex-runtime.cjs");
+    fs.writeFileSync(runtimeFakeCodexFixture, source, { encoding: "utf8", mode: 0o755 });
   }
-  // A separate empty repository per fixture; no objects, refs or worktrees
-  // are shared. Git initialization/configuration is setup, not this contract.
-  fs.cpSync(path.join(gitTemplate, ".git"), path.join(cwd, ".git"), { recursive: true });
+  return runtimeFakeCodexFixture;
 }
 const fixtureStatePath = dir => path.join(dir, "fake-codex-state.json");
 function installFakeCodex(dir, behavior = "review-ok", { mutable = false } = {}) {
   if (mutable) return generateFakeCodex(dir, behavior, { mutable: true });
-  if (!executableCache.has(behavior)) {
-    const cached = fs.mkdtempSync(path.join(cacheRoot, "bin-"));
-    generateFakeCodex(cached, behavior, { mutable: true });
-    const file = path.join(cached, "codex"), original = fs.readFileSync(file, "utf8");
-    const literal = JSON.stringify(fixtureStatePath(cached));
-    const source = original.replace(`const STATE_PATH = ${literal};`,
-      "const STATE_PATH = process.env.CODEX_FIXTURE_STATE_PATH;").replace("function taskPayload(prompt, resume) {",
-      "function taskPayload(prompt, resume) { if (process.env.CODEX_FIXTURE_TASK_OUTPUT !== undefined) return process.env.CODEX_FIXTURE_TASK_OUTPUT;");
-    assert.notEqual(source, original);
-    fs.writeFileSync(file, source);
-    executableCache.set(behavior, file);
+  const statePath = fixtureStatePath(dir);
+  fs.writeFileSync(path.join(dir, "fake-codex-config.json"), JSON.stringify({ statePath, behavior }), "utf8");
+  linkStaticExecutable(path.join(dir, "codex"), ensureRuntimeFakeCodexFixture());
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(dir, "codex.cmd"), `@echo off\r\nnode "%~dp0codex" %*\r\n`, { encoding: "utf8" });
   }
-  const file = path.join(dir, "codex");
-  fs.rmSync(file, { force: true });
-  fs.symlinkSync(executableCache.get(behavior), file);
 }
 const buildEnv = dir => ({ ...fixtureEnv(dir), CODEX_FIXTURE_STATE_PATH: fixtureStatePath(dir) });
+
+let committedRepoTemplate = null;
+function initCommittedRepo(repo) {
+  if (!committedRepoTemplate) {
+    committedRepoTemplate = path.join(cacheRoot, "committed-repo");
+    fs.mkdirSync(committedRepoTemplate, { recursive: true });
+    initGitRepo(committedRepoTemplate);
+    fs.writeFileSync(path.join(committedRepoTemplate, "README.md"), "hello\n");
+    const add = run("git", ["add", "README.md"], { cwd: committedRepoTemplate });
+    assert.equal(add.status, 0, add.stderr);
+    const commit = run("git", ["commit", "-m", "init"], { cwd: committedRepoTemplate });
+    assert.equal(commit.status, 0, commit.stderr);
+  }
+  fs.cpSync(committedRepoTemplate, repo, { recursive: true });
+}
 
 function runtimeFixture(behavior = "review-ok") {
   const repo = makeTempDir(), binDir = makeTempDir();
   installFakeCodex(binDir, behavior);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
+  initCommittedRepo(repo);
   return { repo, binDir, env: buildEnv(binDir) };
 }
 
@@ -783,7 +786,8 @@ test("transfer and fork sweep abandoned private copies but preserve fresh and un
     assert.equal(fs.readFileSync(path.join(unrelated, "keep.txt"), "utf8"), "unrelated");
     assert.equal(fs.readFileSync(backupFile, "utf8"), "user backup");
   }
-  assert.equal(fs.realpathSync(path.join(fixtures[0].directory, "codex")), fs.realpathSync(path.join(fixtures[1].directory, "codex")));
+  const codexStats = fixtures.map(f => fs.statSync(path.join(f.directory, "codex")));
+  assert.deepEqual([codexStats[0].dev, codexStats[0].ino], [codexStats[1].dev, codexStats[1].ino]);
   assert.notEqual(fs.realpathSync(fixtureStatePath(fixtures[0].directory)), fs.realpathSync(fixtureStatePath(fixtures[1].directory)));
   for (const f of fixtures) {
     assert.equal(f.state().externalAgentImports.length, 1);
@@ -1448,10 +1452,7 @@ test("cancel confirms turn interruption through the shared app-server", async (t
   const binDir = makeTempDir();
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "interruptible-slow-task");
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
+  initCommittedRepo(repo);
 
   const env = buildEnv(binDir);
   const broker = await readyBroker(repo, env); t.after(broker.close);
@@ -1511,10 +1512,7 @@ test("cancel confirms turn interruption through the shared app-server", async (t
 
 test("session end requests scoped interrupts and retains history without killing legacy PIDs", async (t) => {
   const repo = makeTempDir();
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
+  initCommittedRepo(repo);
 
   const stateDir = resolveStateDir(repo);
   const jobsDir = path.join(stateDir, "jobs");
@@ -1587,10 +1585,7 @@ test("stop hook blocks on findings once and skips review when stop_hook_active i
     CODEX_FIXTURE_TASK_OUTPUT: "BLOCK: Missing empty-state guard in src/app.js:4-6.\nHandle empty input.\nPreserve retries.\nAdd a regression check.\nOmitted fifth line." };
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "refreshable-auth");
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
+  initCommittedRepo(repo);
 
   const setup = run("node", [SCRIPT, "setup", "--enable-review-gate", "--json"], {
     cwd: repo,
@@ -1927,10 +1922,7 @@ test("review, adversarial review, setup and status reuse one ready shared app-se
   const fakeStatePath = path.join(binDir, "fake-codex-state.json");
 
   installFakeCodex(binDir);
-  initGitRepo(repo);
-  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
-  run("git", ["add", "README.md"], { cwd: repo });
-  run("git", ["commit", "-m", "init"], { cwd: repo });
+  initCommittedRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
 
   const env = buildEnv(binDir);

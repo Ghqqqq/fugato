@@ -18,6 +18,8 @@
     "test:live": "claude plugin test plugins/codex-live",
     "test:native": "node --test plugins/codex/tests/native-integration.mjs",
     "test:plugin": "claude plugin test plugins/codex",
+    "test:hooks": "npm run test:plugin && npm run test:live",
+    "test:fast": "npm run check-version && node --test tests/docs-sync.test.mjs && npm run test:hooks",
     "verify": "npm run check-version && npm run build && npm run test:runtime && npm run test:live && npm run test:native && npm run test:plugin"
   },
   "devDependencies": {

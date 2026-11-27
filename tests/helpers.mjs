@@ -95,12 +95,47 @@ export function run(command, args, options = {}) {
   });
 }
 
+const STATIC_GIT_CONFIG = "[user]\n\tname = Codex Plugin Tests\n\temail = tests@example.com\n[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n";
+let gitTemplateDir = null;
+let gitTemplateCleanupRegistered = false;
+let gitConfigWritten = false;
+function ensureStaticGitConfig() {
+  if (gitConfigWritten) return;
+  gitConfigWritten = true;
+  const globalConfig = process.env.GIT_CONFIG_GLOBAL;
+  if (globalConfig && !fs.existsSync(globalConfig)) {
+    fs.mkdirSync(path.dirname(globalConfig), { recursive: true });
+    fs.writeFileSync(globalConfig, STATIC_GIT_CONFIG, "utf8");
+  }
+}
+function ensureGitTemplate() {
+  ensureStaticGitConfig();
+  if (!gitTemplateDir || !fs.existsSync(path.join(gitTemplateDir, ".git"))) {
+    gitTemplateDir = makeTempDir("git-template-");
+    const result = run("git", ["init", "-q", "-b", "main"], { cwd: gitTemplateDir });
+    if (result.status !== 0) throw new Error(result.stderr || "git init failed");
+    fs.appendFileSync(path.join(gitTemplateDir, ".git", "config"), `\n${STATIC_GIT_CONFIG}`, "utf8");
+    if (!gitTemplateCleanupRegistered) {
+      gitTemplateCleanupRegistered = true;
+      process.on("exit", () => {
+        if (gitTemplateDir) {
+          try { fs.rmSync(gitTemplateDir, { recursive: true, force: true }); } catch {}
+        }
+      });
+    }
+  }
+  return gitTemplateDir;
+}
+
 export function initGitRepo(cwd) {
-  run("git", ["init", "-b", "main"], { cwd });
-  run("git", ["config", "user.name", "Codex Plugin Tests"], { cwd });
-  run("git", ["config", "user.email", "tests@example.com"], { cwd });
-  run("git", ["config", "commit.gpgsign", "false"], { cwd });
-  run("git", ["config", "tag.gpgsign", "false"], { cwd });
+  ensureStaticGitConfig();
+  if (fs.existsSync(path.join(cwd, ".git"))) {
+    run("git", ["init", "-q", "-b", "main"], { cwd });
+    return;
+  }
+  // A separate empty repository per fixture; no objects, refs or worktrees are
+  // shared. Static git identity/signing config is written once.
+  fs.cpSync(path.join(ensureGitTemplate(), ".git"), path.join(cwd, ".git"), { recursive: true });
 }
 
 // Establish a real listener before a transport assertion. A live socket pins the
