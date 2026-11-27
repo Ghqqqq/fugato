@@ -92,6 +92,26 @@ export function parseApprovalAnswer(answer) {
 }
 
 export const ACTION_APPROVAL_OPTIONS = ["Allow once", "Deny"];
+export const MAX_DENY_GUIDANCE_CHARS = 1000;
+const JOB_GRANT_OPTION = /^Allow "[^"\r\n]+" for this job$/;
+export const jobGrantOption = prefix => `Allow "${prefix}" for this job`;
+export const isJobGrantOption = option => typeof option === "string" && JOB_GRANT_OPTION.test(option);
+export const actionApprovalOptions = (prefix = null) => prefix ? ["Allow once", jobGrantOption(prefix), "Deny"] : ACTION_APPROVAL_OPTIONS;
+export function parseActionApprovalAnswer(answer, options = ACTION_APPROVAL_OPTIONS) {
+  const text = typeof answer === "string" ? answer.trim() : "";
+  if (text === "Allow once") return { valid: true, decision: "once" };
+  if (Array.isArray(options) && options.some(option => isJobGrantOption(option) && text === option)) {
+    return { valid: true, decision: "job_grant" };
+  }
+  if (text === "Deny") return { valid: true, decision: "deny" };
+  if (text.startsWith("Deny:")) {
+    const guidance = text.slice("Deny:".length).trim();
+    if (guidance.length >= 1 && guidance.length <= MAX_DENY_GUIDANCE_CHARS) {
+      return { valid: true, decision: "deny", guidance };
+    }
+  }
+  return { valid: false, decision: "deny" };
+}
 export const isActionApproval = message => ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"].includes(message.method);
 // JSON quoting keeps whitespace and control characters visible and exact. Bidi
 // formatting and C1 controls must also be visible, not affect the parent's UI.

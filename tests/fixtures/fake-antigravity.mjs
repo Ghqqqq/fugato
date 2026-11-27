@@ -116,6 +116,7 @@ input.on("line", line => {
       if (++scriptedReplies === mcpPermissionRequests.length) finish();
       return;
     }
+    if (handleGrantReply(message)) return;
     if (serverRequests.length) {
       if (++scriptedReplies === serverRequests.length) finish();
     } else if (message.id === "1" && behavior !== "permission-cancel") finish();
@@ -214,6 +215,7 @@ input.on("line", line => {
       }
       if (behavior === "unknown-request") { send({ id: "1", method: "fs/write_text_file", params: { sessionId, path: "/outside", content: "denied" } }); break; }
       if (behavior === "foreign-session") update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "FOREIGN MESSAGE" } }, "other-session");
+      if (startGrantSequence()) break;
       finish(); break;
     case "session/cancel":
       if (behavior !== "ignore-cancel") finish("cancelled");
@@ -224,3 +226,46 @@ input.on("line", line => {
 });
 input.on("close", () => { output.finally(() => process.exit(0)); });
 process.stdout.on("error", () => process.exit(0));
+
+let grantQueue = null;
+function grantCommandCall(toolCallId, command) {
+  const rawInput = { CommandLine: command, WaitMsBeforeAsync: 5000, toolSummary: "Run " + command };
+  return { toolCallId, name: "run_command", kind: "execute", title: command, args: rawInput, rawInput };
+}
+function sendNextGrantCommand() {
+  if (!grantQueue || grantQueue.index >= grantQueue.commands.length) { grantQueue = null; finish(); return; }
+  const idx = grantQueue.index++;
+  const reqId = "grant-" + (idx + 1);
+  const call = grantCommandCall("grant-cmd-" + (idx + 1), grantQueue.commands[idx]);
+  grantQueue.active = { reqId, call };
+  const options = [
+    { optionId: "allow", name: "Allow", kind: "allow_once" },
+    { optionId: "deny", name: "Deny", kind: "reject_once" }
+  ];
+  update({ sessionUpdate: "tool_call", ...call, status: "in_progress" });
+  update({ sessionUpdate: "tool_call_update", ...call, status: "pending" });
+  send({ id: reqId, method: "session/request_permission", params: { sessionId, toolCall: { sessionUpdate: "tool_call", ...call, status: "pending" }, options } });
+}
+function startGrantSequence() {
+  const sequences = {
+    "grant-sequence": ["node --test tests/a.test.mjs", "node --test tests/b.test.mjs", "node --test a.mjs && rm -rf /"],
+    "grant-single-test": ["node --test tests/c.test.mjs"],
+    "grant-cross-prefix": ["node --test tests/a.test.mjs", "git diff --stat"],
+    "grant-escape-after-grant": ["node --test tests/a.test.mjs", "node --test ../outside.test.mjs"]
+  };
+  const commands = sequences[behavior];
+  if (!commands) return false;
+  grantQueue = { commands, index: 0, active: null };
+  sendNextGrantCommand();
+  return true;
+}
+function handleGrantReply(message) {
+  if (!grantQueue?.active || message.id !== grantQueue.active.reqId) return false;
+  const { call } = grantQueue.active;
+  grantQueue.active = null;
+  const approved = message.result?.outcome?.outcome === "selected" && message.result.outcome.optionId === "allow";
+  update({ ...call, sessionUpdate: "tool_call_update", status: approved ? "completed" : "failed",
+    ...(approved ? { rawOutput: { exitCode: 0, stdout: "ok" } } : {}) });
+  sendNextGrantCommand();
+  return true;
+}

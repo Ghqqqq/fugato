@@ -202,11 +202,32 @@ assign disjoint paths or start each CLI task in a separately prepared worktree.
 In agy's default mode, every edit and command prompts for permission. The
 report card shows the full approval text with its whitespace preserved.
 Claude reviews the operation and follows the report's `next` instructions.
-The answer applies only to the operation shown. If the operation changes
-while the answer is pending, or if agy's `rawInput` and its `args` copy
-disagree, Fugato denies the request with `operation-changed-before-approval`.
-After `Deny`, agy usually ends the turn and Fugato reports the job as blocked
-with `approval_denied`.
+`Allow once` applies only to the operation shown. For a safe, parseable
+`run_command` matching the parsed-argv allowlist (`node --test <relative files>`,
+`claude plugin test <relative dir>`, `git diff|status|log|show [flags] [relative paths]`,
+`npm test`, or `npm run test` / `npm run test:<name>`) with no shell operators,
+expansions, globs, or leading `VAR=value` overrides and with every path-like
+argument relative and resolving inside the job execution directory, the card
+also offers a third option: `Allow "<prefix>" for this job`. Answering that
+exact option allows the command and grants that prefix in memory for the
+current job only—never written to `config.toml` or the job file and never
+inherited by `--continue`, `--to`, `--thread`, or a new job. Later matching
+`run_command` calls in the same job auto-allow without parking and emit an
+argument-free `permissionAutoAllowed` activity entry
+(`job grant auto-allowed: <prefix>`). Commands with shell operators,
+expansions, non-allowlisted verbs, or escaping/absolute paths offer only
+`Allow once` and `Deny`.
+[Command classification](../plugins/codex/scripts/lib/command-classify.mjs)
+
+If the operation changes while the answer is pending, or if agy's `rawInput`
+and its `args` copy disagree, Fugato denies the request with
+`operation-changed-before-approval`. You may deny either with plain `Deny` or
+with `Deny: <guidance>` (1–1,000 trimmed characters after `Deny:`); both are
+accepted by native `Answer <questionId>` replies and `fugato answer`. After a
+denial, agy usually ends the turn and Fugato reports the job as blocked with
+`approval_denied`, recording `guidance` on that blocker when supplied. Any
+answer other than `Allow once`, the exact displayed job-grant option, `Deny`,
+or `Deny: <guidance>` denies the request.
 
 For a CLI task, run the `fugato answer` command in the report's `next` field.
 The command already targets the displayed question ID. Pass just the answer

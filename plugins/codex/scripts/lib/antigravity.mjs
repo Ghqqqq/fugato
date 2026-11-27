@@ -12,6 +12,8 @@ import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runti
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
 import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES } from "./workspace-read-tools.mjs";
 import { approvalArtifactDir, stageApprovalArtifact, verifyApprovalArtifact } from "./approval-artifacts.mjs";
+import { classifyCommand } from "./command-classify.mjs";
+import { ACTION_APPROVAL_OPTIONS, actionApprovalOptions } from "./server-requests.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
 export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
@@ -385,7 +387,45 @@ function permissionReview(tool, staging = null) {
   return tooLarge;
 }
 
-async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call, bridge, workspaceRoot = null) {
+function runCommandPrefix(call, executionCwd) {
+  if (!call?.tool || !executionCwd) return null;
+  const tool = call.tool;
+  if (tool.name !== "run_command") return null;
+  if (tool.kind != null && tool.kind !== "execute") return null;
+  if (call.diffs?.length || toolDiffs(tool).length) return null;
+  const input = tool.rawInput;
+  if (!isPlainObject(input) || !isDeepStrictEqual(input, tool.args)) return null;
+  if (input.IsDaemon === true) return null;
+  const commandLine = typeof input.CommandLine === "string" ? input.CommandLine
+    : input.CommandLine === undefined && typeof input.command === "string" ? input.command : null;
+  if (!commandLine) return null;
+  if (typeof input.CommandLine === "string" && input.command !== undefined && input.command !== input.CommandLine) return null;
+  if (input.Cwd !== undefined && input.cwd !== undefined && input.Cwd !== input.cwd) return null;
+  let effectiveCwd = path.resolve(executionCwd);
+  const rawCwd = input.Cwd ?? input.cwd;
+  if (rawCwd !== undefined) {
+    if (typeof rawCwd !== "string" || !rawCwd.trim()) return null;
+    const base = effectiveCwd;
+    const candidate = path.resolve(base, rawCwd);
+    const rel = path.relative(base, candidate);
+    if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+    effectiveCwd = candidate;
+  }
+  const classified = classifyCommand(commandLine, { cwd: effectiveCwd });
+  return classified.eligible ? classified.prefix : null;
+}
+
+function normalizeApprovalResult(value) {
+  if (value === "once") return { decision: "once" };
+  if (value && typeof value === "object" && ["once", "job_grant", "deny"].includes(value.decision)) {
+    const guidance = value.decision === "deny" && typeof value.guidance === "string" && value.guidance.trim()
+      ? value.guidance.trim() : undefined;
+    return { decision: value.decision, ...(guidance ? { guidance } : {}) };
+  }
+  return { decision: "deny" };
+}
+
+async function permissionDecision(options, params, binding, turnSignal, requestSignal, blockers, call, bridge, workspaceRoot = null, executionCwd = workspaceRoot, jobGrants = null) {
   const choices = Array.isArray(params.options) ? params.options : [];
   const allow = choices.find(value => value?.kind === "allow_once" && typeof value.optionId === "string");
   const controller = new AbortController();
@@ -406,34 +446,47 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
       });
       return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
-    let answer = "deny";
+    const grantPrefix = call && binding.turnId && allow ? runCommandPrefix(call, executionCwd) : null;
+    if (grantPrefix && jobGrants?.has(grantPrefix)) {
+      if (call.permission !== "denied") call.permission = "approved";
+      const message = `job grant auto-allowed: ${grantPrefix}`;
+      report(options, message, "working", {
+        activity: [{ type: "permissionAutoAllowed", lifecycle: "completed", status: "approved", tool: "run_command", prefix: grantPrefix, text: message }]
+      });
+      return { outcome: { outcome: "selected", optionId: allow.optionId } };
+    }
+    let answer = { decision: "deny" };
     const staging = workspaceRoot && options.jobId ? { workspaceRoot, jobId: options.jobId, env: options.env } : null;
     let review = call && binding.turnId && allow ? permissionReview(call.tool, staging) : null;
     if (review?.question && options.onApprovalRequest) {
-      const request = { kind: "acp-permission", question: review.question, options: ["Allow once", "Deny"],
+      const request = { kind: "acp-permission", question: review.question,
+        options: grantPrefix ? actionApprovalOptions(grantPrefix) : ACTION_APPROVAL_OPTIONS,
         binding: { ...binding }, signal: controller.signal, toolCall: call.tool };
-      answer = await Promise.race([
-        Promise.resolve().then(() => options.onApprovalRequest(request)).catch(() => "deny"),
-        new Promise(resolve => { onCancelled = () => resolve("deny"); controller.signal.addEventListener("abort", onCancelled, { once: true }); })
+      const rawAnswer = await Promise.race([
+        Promise.resolve().then(() => options.onApprovalRequest(request)).catch(() => ({ decision: "deny" })),
+        new Promise(resolve => { onCancelled = () => resolve({ decision: "deny" }); controller.signal.addEventListener("abort", onCancelled, { once: true }); })
       ]);
+      answer = normalizeApprovalResult(rawAnswer);
       // Bind the answer to the displayed values and any staged artifact.
       if (!controller.signal.aborted && (!isDeepStrictEqual(permissionReview(call.tool, { stage: false })?.fields, review.fields)
           || (review.artifact && !verifyApprovalArtifact(review.artifact)))) {
         review = changedOperation;
-        answer = "deny";
+        answer = { decision: "deny" };
       }
     }
     if (controller.signal.aborted) {
       if (call) call.permission = "denied";
       return cancelledOutcome();
     }
-    if (answer === "once" && allow) {
+    if ((answer.decision === "once" || (answer.decision === "job_grant" && grantPrefix)) && allow) {
+      if (answer.decision === "job_grant") jobGrants?.add(grantPrefix);
       if (call.permission !== "denied") call.permission = "approved";
       return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
     if (call) call.permission = "denied";
     blockers.push({ code: review?.code ?? "approval_denied", message: review?.message ?? "Antigravity tool permission was denied or could not be forwarded.",
-      method: "session/request_permission", kind: "acp-permission" });
+      method: "session/request_permission", kind: "acp-permission",
+      ...(!review?.code && answer.guidance ? { guidance: answer.guidance } : {}) });
     return denyPermission(choices);
   } finally {
     for (const signal of [turnSignal, requestSignal]) signal?.removeEventListener("abort", abort);
@@ -568,7 +621,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
   let turnEnded = false, stopReason = null, failure = null, promptPromise = null, cancellationTimer = null;
   let cancelRequested = false, resolveCancelTimeout;
   const cancellationTimeout = new Promise(resolve => { resolveCancelTimeout = resolve; });
-  const turnAbort = new AbortController(), tools = new Map(), blockers = [];
+  const turnAbort = new AbortController(), tools = new Map(), blockers = [], jobGrants = new Set();
   let unsupportedBlockers = 0;
   const activityStarts = new Map(), activityLifecycles = new Map(), activityDescriptors = new Map();
   // Named messages can resume until the turn ends. Keep pending messages
@@ -609,7 +662,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
           // ACP permits ToolCallUpdate here, including only toolCallId. Merge
           // with this session's observed call so approval shows its real scope.
           const call = params.sessionId === threadId && typeof partial?.toolCallId === "string" ? observeTool(tools, partial) : null;
-          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call, parentBridge, cwd);
+          return permissionDecision(options, params, { threadId, turnId }, turnAbort.signal, signal, blockers, call, parentBridge, cwd, executionCwd, jobGrants);
         }
         if (unsupportedBlockers < MAX_UNSUPPORTED_BLOCKERS) {
           const method = `unrecognized:${createHash("sha256").update(message.method).digest("hex").slice(0, 16)}`;
