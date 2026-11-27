@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing';
-import { captures as recordedCaptures } from './native-captures.mjs';
+import { captures } from './native-captures.mjs';
 import { register as registerNative, logEntry, foldEntries, eventRow, logRows, proseRows, headerRow, statusRow, reportMarkdown, textWidth } from '../hooks/native-agent.mjs';
 import { cleanCommand } from '../hooks/command-display.mjs';
 import { PRESETS, applyPreset, isNativeType } from '../hooks/presets.mjs';
@@ -230,19 +230,6 @@ test('action-approval cards show the full literal operation before the decisions
   expect(content.indexOf('1. Allow once  2. Deny') > content.indexOf(text)).toBe(true);
 });
 
-// Migrate captured display labels and the expanded flag help; preserve the
-// recorded execution, requests and lifecycle ordering.
-const captures = recordedCaptures.map(capture => {
-  const started = capture.notices.find((notice: any) => notice.message.content[0].text.includes('started · job '));
-  const model = started?.message.content[0].text.match(/ · ([^ ]+) \/ /)?.[1] ?? 'unknown';
-  return JSON.parse(JSON.stringify(capture)
-    .replaceAll('Invalid DUET header. Allowed flags: --model,', 'Invalid DUET header. Allowed flags: --backend, --role, --high-stakes, --model,')
-    .replaceAll('Presets inherit saved model/effort/speed defaults.', 'Presets inherit saved worker defaults. Use --role <id> or --high-stakes on a fresh dispatch to select its model and effort.')
-    .replaceAll('Codex usage · 150 input (40 cached) · 30 output tokens',
-      `Codex tokens (provider: OpenAI Codex, model ${model}) · 150 input · 40 cached · 30 output · 180 total`)
-    .replaceAll('Codex usage · 12,345 input (8,000 cached) · 678 output tokens',
-      `Codex tokens (provider: OpenAI Codex, model ${model}) · 12,345 input · 8,000 cached · 678 output · 13,023 total`));
-});
 async function drain(stream: any) {
   const chunks = []; let item;
   do { item = await stream.next(); if (!item.done) chunks.push(item.value); } while (!item.done);

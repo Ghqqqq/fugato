@@ -16,7 +16,9 @@ session_id for browser tabs) and question (the exact missing input when status i
 needs_input, else null). A non-empty blockers list means status blocked; a plan
 or a question is never a completed summary. Distinguish observed verification
 from claims you have not checked. Never invent commit hashes, captured tree
-identifiers, test results or placeholder evidence.
+identifiers, test results or placeholder evidence. When editing plugin hooks,
+scripts, prompts or tests in this repository, run the assigned checks plus
+`npm run test:hooks` (or `npm run test:fast` when available) before reporting.
 Deliver progress through ordinary assistant messages and the final result as your
 return value; ask_parent is only for a material question, never a status or
 completion announcement. Do not copy tool arguments, command output or page content

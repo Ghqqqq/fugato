@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
-import { installFakeCodex as generateFakeCodex } from '../../../tests/fake-codex-fixture.mjs';
+import { installFakeCodex as installStaticFakeCodex } from '../../../tests/fake-codex-fixture.mjs';
 import { installFakeAntigravity } from '../../../tests/fake-antigravity-fixture.mjs';
 import { register } from '../hooks/register.mjs';
 import { AGENT_TYPE } from '../hooks/native-agent.mjs';
@@ -28,7 +28,6 @@ const roots = [];
 // bytes are shared. No broker, job, adapter store or Codex thread is shared.
 const suiteRoot = process.env.CODEX_COMPANION_TEST_ROOT;
 const cacheRoot = fs.mkdtempSync(path.join(suiteRoot, 'native-codex-'));
-const executableCache = new Map();
 let gitTemplate;
 function initGitRepo(cwd) {
   if (!gitTemplate) {
@@ -40,20 +39,7 @@ function initGitRepo(cwd) {
   fs.cpSync(path.join(gitTemplate, '.git'), path.join(cwd, '.git'), { recursive: true });
 }
 function installFakeCodex(dir, behavior, mutable) {
-  if (mutable) return generateFakeCodex(dir, behavior, { mutable: true });
-  if (!executableCache.has(behavior)) {
-    const cached = fs.mkdtempSync(path.join(cacheRoot, 'bin-'));
-    generateFakeCodex(cached, behavior, { mutable: true });
-    const file = path.join(cached, 'codex'), original = fs.readFileSync(file, 'utf8');
-    const literal = JSON.stringify(path.join(cached, 'fake-codex-state.json'));
-    const source = original.replace(`const STATE_PATH = ${literal};`,
-      'const STATE_PATH = process.env.CODEX_FIXTURE_STATE_PATH;');
-    assert.notEqual(source, original);
-    assert.equal(source.replace('process.env.CODEX_FIXTURE_STATE_PATH', literal), original);
-    fs.writeFileSync(file, source);
-    executableCache.set(behavior, file);
-  }
-  fs.symlinkSync(executableCache.get(behavior), path.join(dir, 'codex'));
+  return installStaticFakeCodex(dir, behavior, { mutable: Boolean(mutable) });
 }
 const clone = value => JSON.parse(JSON.stringify(value));
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -78,6 +64,7 @@ function fixture(behavior, name = 'native-worker', { mutable = false, memoryStor
   Object.assign(env, { HOME: `${root}/home`, USERPROFILE: `${root}/home`, CODEX_HOME: `${root}/normal`,
     CODEX_SQLITE_HOME: `${root}/normal`, CODEX_COMPANION_NORMAL_HOME: `${root}/normal`, CODEX_COMPANION_NORMAL_SQLITE_HOME: `${root}/normal`,
     CODEX_COMPANION_HOME: `${root}/isolated`, CODEX_COMPANION_BIN: `${root}/bin/codex`,
+    FUGATO_ANTIGRAVITY_BIN: `${root}/bin/missing-agy`,
     CLAUDE_PLUGIN_DATA: `${root}/data`, CODEX_COMPANION_TEST_MODE: '1', CODEX_COMPANION_TEST_ROOT: suiteRoot,
     CODEX_FIXTURE_STATE_PATH: `${root}/bin/fake-codex-state.json`,
     CODEX_COMPANION_TEST_PROCESSES: `${root}/processes`, CODEX_COMPANION_BROKER_IDLE_SEC: '2' });
@@ -4735,7 +4722,178 @@ test('native starts leave a delayed unavailable observation intact without helpe
     helpers: ['native-unavailable', 'dispatch-status'] });
 });
 
-function replayCaptures() {
+function normalizeCaptureText(text) {
+  return text
+    .replace(/\btask-[a-z0-9]+-[a-z0-9]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, 'task-<id>-<uuid>')
+    .replace(/\btask-[a-z0-9]+-[a-z0-9]+\b/g, 'task-<id>')
+    .replace(/\bquestion-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, 'question-<uuid>')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, '<uuid>')
+    .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g, '<iso>')
+    .replace(/\/duet\/state\/([^/'"\s]+)-[0-9a-f]{16}\//g, '/duet/state/$1-<hash>/')
+    .replace(/unix:[^\s"']+?\/broker\.sock/g, 'unix:<broker.sock>')
+    .replace(/waiting for parent · \d+m\d+s/g, 'waiting for parent · <elapsed>')
+    .replace(/Startup timing: (\S+) \{[^}]+\}/g, 'Startup timing: $1 {<timing>}');
+}
+
+function normalizeCaptureString(value) {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object') return JSON.stringify(normalizeCaptureValue(parsed));
+    } catch { /* fall through to line/text normalization */ }
+  }
+  if (value.includes('\n')) {
+    return value.split('\n').map(line => {
+      const t = line.trim();
+      if (t.startsWith('{') && t.endsWith('}')) {
+        try {
+          const parsed = JSON.parse(t);
+          if (parsed && typeof parsed === 'object') return JSON.stringify(normalizeCaptureValue(parsed));
+        } catch { /* plain text line */ }
+      }
+      return normalizeCaptureText(line);
+    }).join('\n');
+  }
+  return normalizeCaptureText(value);
+}
+
+const VOLATILE_PID_KEYS = new Set(['pid', 'launcherPid', 'ownerWaitPid']);
+const VOLATILE_MS_KEYS = new Set(['leaseRenewedAt', 'leaseExpiresAt', 'ownerAttachedAt', 'ownerDetachedAt', 'expiresAt']);
+const VOLATILE_SEC_KEYS = new Set(['expiresInSec', 'leaseRemainingSec']);
+const VOLATILE_HASH_KEYS = new Set(['snapshotHash', 'renderedHash']);
+const STATUS_JOB_CONTRACT_KEYS = [
+  'id', 'kind', 'kindLabel', 'title', 'workspaceRoot', 'jobClass', 'write', 'sessionId',
+  'reportTracking', 'dispatchSessionId', 'ownerId', 'leaseSec', 'questionTimeoutSec',
+  'dispatchNonce', 'sandbox', 'approvalPolicy', 'approvedBrowserOrigins',
+  'approvedComputerApps', 'rawOutputFile', 'resultFile', 'agentName', 'direct',
+  'logFile', 'request',
+];
+
+function coalesceChunks(chunks) {
+  const out = [];
+  for (const chunk of chunks) {
+    if (out.length && out.at(-1).stream === chunk.stream) out.at(-1).text += chunk.text;
+    else out.push({ ...chunk });
+  }
+  return out;
+}
+
+function coalesceTimeline(timeline) {
+  const out = [];
+  for (const step of timeline) {
+    if (step.chunk && out.length && out.at(-1).chunk && out.at(-1).chunk.stream === step.chunk.stream) {
+      out.at(-1).chunk = { ...out.at(-1).chunk, text: out.at(-1).chunk.text + step.chunk.text };
+    } else {
+      out.push(step.chunk ? { chunk: { ...step.chunk } } : { ...step });
+    }
+  }
+  return out;
+}
+
+function normalizeStatusJob(job) {
+  if (!job || typeof job !== 'object') return job;
+  const out = {};
+  for (const field of STATUS_JOB_CONTRACT_KEYS) {
+    if (field in job) out[field] = normalizeCaptureValue(job[field], field);
+  }
+  return out;
+}
+
+function normalizeStatusStdout(stdout) {
+  if (typeof stdout !== 'string') return stdout;
+  let parsed;
+  try { parsed = JSON.parse(stdout); } catch { return normalizeCaptureString(stdout); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return normalizeCaptureValue(parsed);
+  const out = {};
+  for (const [k, v] of Object.entries(parsed)) {
+    if (k === 'sessionRuntime') {
+      out[k] = '<sessionRuntime>';
+    } else if (k === 'usageTotals') {
+      out[k] = '<usageTotals>';
+    } else if (k === 'roles' && v && typeof v === 'object') {
+      out[k] = { ...normalizeCaptureValue(v), gemini: '<hostGemini>' };
+    } else if (k === 'job') {
+      out[k] = normalizeStatusJob(v);
+    } else if (k === 'running' || k === 'latestFinished' || k === 'recent') {
+      continue;
+    } else {
+      out[k] = normalizeCaptureValue(v, k);
+    }
+  }
+  if ('running' in parsed || 'latestFinished' in parsed || 'recent' in parsed) {
+    // Live status polls race with concurrently finishing tasks across running/latestFinished.
+    const seen = new Set();
+    const jobs = [];
+    for (const item of [...(parsed.running || []), ...(parsed.latestFinished ? [parsed.latestFinished] : []), ...(parsed.recent || [])]) {
+      if (!item || typeof item !== 'object') continue;
+      const key = item.id || JSON.stringify(item);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      jobs.push(normalizeStatusJob(item));
+    }
+    out.jobs = jobs;
+  }
+  return JSON.stringify(out);
+}
+
+function normalizeCaptureProcess(proc) {
+  const normalized = normalizeCaptureValue(proc);
+  if (proc?.kind === 'run' && proc?.request?.argv?.[2] === 'status' && proc?.value && typeof proc.value.stdout === 'string') {
+    normalized.value = { ...normalized.value, stdout: normalizeStatusStdout(proc.value.stdout) };
+  }
+  return normalized;
+}
+
+function normalizeCaptureValue(value, key = null) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') {
+    if ((key === 'elapsed' || key === 'duration') && /^\d+[smh]/.test(value)) return '<dur>';
+    if (VOLATILE_HASH_KEYS.has(key) && /^[0-9a-f]{64}$/.test(value)) return '<hash>';
+    return normalizeCaptureString(value);
+  }
+  if (typeof value === 'number') {
+    if (VOLATILE_PID_KEYS.has(key)) return '<pid>';
+    if (VOLATILE_MS_KEYS.has(key)) return '<ms>';
+    if (VOLATILE_SEC_KEYS.has(key)) return '<sec>';
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (key === 'chunks') return coalesceChunks(value).map(item => normalizeCaptureValue(item));
+    if (key === 'timeline') return coalesceTimeline(value).map(item => normalizeCaptureValue(item));
+    if (key === 'progressPreview') return '<progressPreview>';
+    return value.map(item => normalizeCaptureValue(item));
+  }
+  if (typeof value === 'object') {
+    if (key === 'startupTimings') return Object.keys(value).length ? '<startupTimings>' : {};
+    if (key === 'activityCursors') {
+      const normalized = {};
+      for (const [cursorKey, cursorVal] of Object.entries(value)) {
+        normalized[/^[0-9a-f]{64}$/.test(cursorKey) ? '<ownerHash>' : cursorKey] = cursorVal;
+      }
+      return normalized;
+    }
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (k === 'phase' && value.status === 'running' && (v === 'starting' || v === 'running')) {
+        out[k] = '<activePhase>';
+      } else {
+        out[k] = normalizeCaptureValue(v, k);
+      }
+    }
+    return out;
+  }
+  return value;
+}
+
+function normalizeCapture(capture) {
+  return {
+    ...normalizeCaptureValue({ ...capture, processes: undefined }),
+    processes: (capture.processes || []).map(normalizeCaptureProcess),
+  };
+}
+
+async function replayCaptures() {
   if (captures.length === 8) {
     const source = '// Generated by native-integration.mjs from the real companion + fake Codex. Do not hand-edit.\n' +
       `export const captures = ${JSON.stringify(captures, null, 2)};\n`;
@@ -4747,19 +4905,27 @@ function replayCaptures() {
       fs.copyFileSync(`${plugin}/.claude-plugin/plugin.json`, `${copy}/.claude-plugin/plugin.json`);
       fs.cpSync(`${plugin}/types`, `${copy}/types`, { recursive: true });
       fs.cpSync(`${plugin}/hooks`, `${copy}/hooks`, { recursive: true });
-      fs.mkdirSync(`${copy}/scripts/lib`, { recursive: true });
-      for (const name of ['agent-name-pool', 'command-options', 'display-text', 'roles', 'roundtable-personas']) {
-        fs.copyFileSync(`${plugin}/scripts/lib/${name}.mjs`, `${copy}/scripts/lib/${name}.mjs`);
-      }
+      fs.cpSync(`${plugin}/scripts/lib`, `${copy}/scripts/lib`, { recursive: true });
       fs.copyFileSync(`${plugin}/tests/native-agent.test.ts`, `${copy}/tests/native-agent.test.ts`);
       fs.writeFileSync(`${copy}/tests/native-captures.mjs`, source);
-      // Captures contain varying job ids, timings and process chunk boundaries.
-      // Replay the actual fresh evidence through Claude's hook engine instead
-      // of weakening a snapshot comparison by removing those fields.
+      // Replay the fresh captures through Claude's hook engine before updating
+      // or comparing against the committed capture artifact.
       const replay = spawnSync('claude', ['plugin', 'test', copy], { encoding: 'utf8', timeout: 60000 });
       assert.equal(replay.status, 0, replay.error?.message || `${replay.stdout}\n${replay.stderr}`);
+      const committedUrl = new URL('./native-captures.mjs', import.meta.url);
       if (process.env.UPDATE_NATIVE_CAPTURES === '1') {
-        fs.writeFileSync(new URL('./native-captures.mjs', import.meta.url), source);
+        fs.writeFileSync(committedUrl, source);
+      } else {
+        const { captures: committed } = await import(`${committedUrl.href}?check=${Date.now()}`);
+        const driftMessage = 'Committed plugins/codex/tests/native-captures.mjs drifted from fresh captures. Rerun with UPDATE_NATIVE_CAPTURES=1 npm run test:native to update it.';
+        assert.equal(captures.length, committed.length, driftMessage);
+        for (let index = 0; index < captures.length; index++) {
+          assert.deepEqual(
+            normalizeCapture(captures[index]),
+            normalizeCapture(committed[index]),
+            `Capture ${index + 1} (${captures[index].behavior}): ${driftMessage}`
+          );
+        }
       }
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   }
@@ -4788,7 +4954,7 @@ async function cleanupFixtures() {
 }
 
 after(async () => {
-  try { replayCaptures(); }
+  try { await replayCaptures(); }
   finally {
     try { await cleanupFixtures(); }
     finally { fs.rmSync(cacheRoot, { recursive: true, force: true }); }
