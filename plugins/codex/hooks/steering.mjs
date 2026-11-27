@@ -35,20 +35,24 @@ export function registerSteering(on, hasRoleHeader) {
       if (matches.length !== 1 || !isNativeType(matches[0].type) || matches[0].status !== 'running') return next(e);
       const isGemini = matches[0].type === GEMINI_AGENT_TYPE;
       label = isGemini ? 'Gemini' : 'Codex';
+      // A running Gemini worker keeps refusing anything it cannot steer, as before
+      // mid-turn steering; only `Answer <id>` reaches the ordinary queue.
+      const ordinary = () => isGemini ? { isDelivered: false, reason: GEMINI_BUSY } : next(e);
       // Only the main conversation steers. Subagent and teammate sends keep the
       // ordinary queue, where the teammate mailbox guard judges them.
-      if (e.agentId || typeof e.text !== 'string' || !e.text.trim() || e.text.length > 65536) return next(e);
-      if (isGemini && (GEMINI_RESERVED_ANSWER.test(e.text.split(/\r?\n/, 1)[0].trim()) || !cleanDisplayText(e.text).trim())) return next(e);
+      if (isGemini && typeof e.text === 'string' && GEMINI_RESERVED_ANSWER.test(e.text.split(/\r?\n/, 1)[0].trim())) return next(e);
+      if (e.agentId || typeof e.text !== 'string' || !e.text.trim() || e.text.length > 65536) return ordinary();
+      if (isGemini && !cleanDisplayText(e.text).trim()) return ordinary();
       const session = await $.session.id();
       const state = await $.store.get(`native:v2:${session}:${matches[0].id}`);
       const parkedAtQuestion = state?.answer?.status === 'needs_answer'
         || (state?.status === 'needs_answer' && !(isGemini && state.intent?.kind === 'answer' && !state.answer));
-      if (!state || state.session !== session || state.bindingPending || parkedAtQuestion) return next(e);
+      if (!state || state.session !== session || state.bindingPending || parkedAtQuestion) return ordinary();
       if (hasRoleHeader(e.text)) return { isDelivered: false, reason: FRESH_ROLE_ERROR };
       // An early send can precede the progress lookup that publishes jobId.
       // Resolve its durable launch nonce; never spawn or mutate its binding.
       if (!state.jobId && state.intent?.kind === 'task') await resolveJob($, state);
-      if (!state.jobId || !state.ownerId) return next(e);
+      if (!state.jobId || !state.ownerId) return ordinary();
       const id = await deliveryId($, session, matches[0].id, isGemini);
       const request = command($, state, ['steer', state.jobId, '--delivery-id', id, '--owner', state.ownerId], e.text);
       attempted = true;
@@ -56,7 +60,10 @@ export function registerSteering(on, hasRoleHeader) {
       if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error('Steering receipt unavailable.');
       const receipt = JSON.parse(result.stdout);
       if (receipt.jobId !== state.jobId || receipt.deliveryId !== id || !['queued', 'applied', 'deferred', 'failed', 'unknown'].includes(receipt.status)) throw new Error('Invalid steering receipt.');
-      if (receipt.status === 'deferred' && receipt.fallback === true) return next(e);
+      // A running Gemini turn that cannot take a steer (no submitted turn, a
+      // pending question, sealed inbox) refuses as before instead of queuing a
+      // host delivery that would be refused later or start a second turn.
+      if (receipt.status === 'deferred' && receipt.fallback === true) return ordinary();
       const text = `${label} steering ${receipt.status}${receipt.status === 'unknown' ? '; acknowledgement missing, message will not be replayed' : ''}.`;
       try { await $.session.append({ message: { type: 'system', content: [{ type: 'text', text }] } }); }
       catch { /* A notice failure cannot replay a durable delivery. */ }

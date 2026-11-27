@@ -362,10 +362,10 @@ test("hooks/steering routes running Gemini to steer with <=64 char IDs, passes r
   }
   assert.equal(h.runs.length, runsBeforeReserved, "Reserved Answer syntax must return next(e) before any steer call");
 
-  // ANSI-only text for Gemini also skips steer instead of producing an unknown failure.
+  // ANSI-only text for a running Gemini worker is refused without a steer call.
   const ansiForwarded = [];
-  assert.deepEqual(await h.invoke({ to: "Curie", text: "\x1b[31m" }, async e => { ansiForwarded.push(e.text); return { isDelivered: true }; }), { isDelivered: true });
-  assert.deepEqual(ansiForwarded, ["\x1b[31m"]);
+  assert.deepEqual(await h.invoke({ to: "Curie", text: "\x1b[31m" }, async e => { ansiForwarded.push(e.text); return { isDelivered: true }; }), { isDelivered: false, reason: GEMINI_BUSY });
+  assert.deepEqual(ansiForwarded, []);
   assert.equal(h.runs.length, runsBeforeReserved);
 
   // Role headers on a running Gemini worker are refused with FRESH_ROLE_ERROR.
@@ -391,7 +391,7 @@ test("hooks/steering routes running Gemini to steer with <=64 char IDs, passes r
   assert.match(unknown.reason, /^Gemini steering outcome unknown;/);
   assert.equal(fallbackCalls, 0);
 
-  // Parked needs_answer bypasses steering for ordinary messages too.
+  // Parked needs_answer never steers ordinary messages.
   const runsBeforeAnswer = h.runs.length;
   for (const [agentStatus, statePatch] of [
     ["running", { status: "needs_answer" }],
@@ -402,8 +402,14 @@ test("hooks/steering routes running Gemini to steer with <=64 char IDs, passes r
     h.store.set(key, { session: longSession, cwd: "/repo", jobId: "task-gem-1", ownerId: "owner-gem-1", ...statePatch });
     const forwarded = [];
     const res = await h.invoke({ to: "Curie", text: "Ordinary parked message." }, async e => { forwarded.push(e.text); return { isDelivered: true }; });
-    assert.deepEqual(res, { isDelivered: true });
-    assert.deepEqual(forwarded, ["Ordinary parked message."]);
+    // A still-running Gemini turn refuses non-Answer text; once the agent is idle it takes the ordinary queue.
+    if (agentStatus === "running") {
+      assert.deepEqual(res, { isDelivered: false, reason: GEMINI_BUSY });
+      assert.deepEqual(forwarded, []);
+    } else {
+      assert.deepEqual(res, { isDelivered: true });
+      assert.deepEqual(forwarded, ["Ordinary parked message."]);
+    }
   }
   assert.equal(h.runs.length, runsBeforeAnswer, "needs_answer routing must bypass fugato steer");
 

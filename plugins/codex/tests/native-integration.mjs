@@ -1101,7 +1101,7 @@ test('running Codex workers refuse role headers before steering or queuing a del
   for (const text of ['DUET: --role debug\nReview again.', '  DUET:\t--normal --high-stakes\r\nCheck this.',
     'DUET: --role=debug\nReview again.', 'DUET: --role debug --cwd "unfinished']) assert.deepEqual(await send(text), refused);
   agent.type = 'fugato:gemini-native';
-  assert.deepEqual(await send('DUET: --high-stakes\nReview again.'), busyGemini);
+  assert.deepEqual(await send('DUET: --high-stakes\nReview again.'), refused);
   assert.deepEqual(steered, []);
   agent.type = AGENT_TYPE;
   const literal = ['Use these settings as an example:\nDUET: --role debug', 'DUET: --cwd "/tmp/example --role debug"\nKeep working.'];
