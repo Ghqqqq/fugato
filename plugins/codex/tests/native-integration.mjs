@@ -4732,6 +4732,8 @@ function normalizeCaptureText(text) {
     .replace(/\/duet\/state\/([^/'"\s]+)-[0-9a-f]{16}\//g, '/duet/state/$1-<hash>/')
     .replace(/unix:[^\s"']+?\/broker\.sock/g, 'unix:<broker.sock>')
     .replace(/waiting for parent · \d+m\d+s/g, 'waiting for parent · <elapsed>')
+    // Activity results show elapsed time only past one second, which varies by host.
+    .replace(/ · (Done|Error(?:: exit -?\d+)?) \((?:\d+(?:\.\d)?s|\d+m \d+s)\)/g, ' · $1')
     .replace(/Startup timing: (\S+) \{[^}]+\}/g, 'Startup timing: $1 {<timing>}');
 }
 
