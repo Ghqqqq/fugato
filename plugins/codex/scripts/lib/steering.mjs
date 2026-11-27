@@ -5,6 +5,7 @@ import { resolveJobFile, tryAcquirePidLock } from "./state.mjs";
 
 const ACTIVE = new Set(["queued", "running"]);
 const TERMINAL = new Set(["applied", "deferred", "failed", "unknown"]);
+const GEMINI_SOURCES = new Set(["chair-steer", "denial-guidance"]);
 const MAX_DELIVERIES = 256;
 const digest = text => createHash("sha256").update(text).digest("hex");
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -27,8 +28,9 @@ function persist(file, value) {
   } finally { fs.rmSync(temporary, { force: true }); }
 }
 
-async function locked(jobFile, action) {
+async function locked(jobFile, action, { requireJob = true, createDir = false } = {}) {
   const file = inboxPath(jobFile), deadline = Date.now() + 2000;
+  if (createDir) fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   let release;
   while (!(release = tryAcquirePidLock(`${file}.lock`))) {
     if (Date.now() >= deadline) throw new Error("Fugato steering inbox is busy.");
@@ -44,7 +46,13 @@ async function locked(jobFile, action) {
     for (const row of inbox.deliveries) if (TERMINAL.has(row.status) && typeof row.text === "string") {
       redact(row); compacted = true;
     }
-    const result = action(inbox, read(jobFile));
+    let job = null;
+    if (requireJob) job = read(jobFile);
+    else {
+      try { job = read(jobFile); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+    }
+    const result = action(inbox, job);
     if (result.changed || compacted) persist(file, inbox);
     return result.value;
   } finally { release(); }
@@ -74,11 +82,123 @@ function endedRejection(error) {
     && /\bno active turn\b|\bturn (?:has |already )?(?:ended|completed|finished)\b|expected[_ ]?turn[_ ]?id.*(?:mismatch|does not match)|(?:mismatch|does not match).*expected[_ ]?turn[_ ]?id/i.test(error.message);
 }
 
+function validateGeminiNoteText(text) {
+  if (typeof text !== "string" || !text.trim() || text.length > 65536) {
+    throw new Error("Gemini note requires non-empty text of at most 65536 characters.");
+  }
+}
+
+function validateGeminiSource(source) {
+  if (!GEMINI_SOURCES.has(source)) {
+    throw new Error(`Unsupported Gemini note source: ${String(source)}.`);
+  }
+}
+
+export async function queueGeminiNote(cwd, jobId, text, { source = "chair-steer", deliveryId = null, sessionId = null, ownerId = null, handoff = false } = {}) {
+  validateGeminiNoteText(text);
+  validateGeminiSource(source);
+  const id = deliveryId ?? randomUUID();
+  if (typeof id !== "string" || !id.trim() || id.length > 512) {
+    throw new Error("Gemini note delivery ID must be at most 512 characters.");
+  }
+  const jobFile = resolveJobFile(cwd, jobId);
+  return locked(jobFile, (inbox, job) => {
+    if (handoff && (job.sessionId !== sessionId || (ownerId && job.ownerId !== ownerId))) {
+      throw new Error("Fugato steering job ownership changed.");
+    }
+    const existing = inbox.deliveries.find(row => row.deliveryId === id);
+    if (existing) {
+      if ((existing.textHash ?? digest(existing.text)) !== digest(text)) {
+        throw new Error("Steering delivery ID already belongs to different text.");
+      }
+      if (handoff) {
+        const fallback = existing.status === "deferred" && !existing.fallbackClaimedAt;
+        if (fallback) existing.fallbackClaimedAt = now();
+        return { changed: fallback, value: receipt(jobId, existing, fallback) };
+      }
+      return {
+        changed: false,
+        value: { id: existing.deliveryId, deliveryId: existing.deliveryId, status: existing.status, source: existing.source ?? source, at: existing.at ?? null, reason: existing.reason ?? null }
+      };
+    }
+    if (inbox.deliveries.length >= MAX_DELIVERIES) {
+      const full = { deliveryId: id, status: "failed", reason: "inbox_full" };
+      return { changed: false, value: handoff ? receipt(jobId, full) : { id, ...full, source, at: now() } };
+    }
+    const at = now();
+    const row = {
+      deliveryId: id, text, at, status: "queued", source,
+      sessionId: sessionId ?? job?.sessionId ?? null,
+      ownerId: ownerId ?? job?.ownerId ?? null
+    };
+    let fallback = false;
+    if (handoff) {
+      if (job.request?.permissionPolicy) finish(row, "deferred", "permission_mapping");
+      else if (pendingQuestion(job)) finish(row, "deferred", "pending_question");
+      else if (!ACTIVE.has(job.status)) finish(row, "deferred", "no_active_turn");
+      if (row.status === "deferred") {
+        row.fallbackClaimedAt = now();
+        fallback = true;
+      }
+    }
+    inbox.deliveries.push(row);
+    return {
+      changed: true,
+      value: handoff
+        ? receipt(jobId, row, fallback)
+        : { id: row.deliveryId, deliveryId: row.deliveryId, status: row.status, source: row.source, at: row.at, reason: row.reason ?? null }
+    };
+  }, { requireJob: handoff, createDir: !handoff });
+}
+
+export async function drainGeminiNotes(cwd, jobId) {
+  if (!cwd || !jobId) return [];
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (!fs.existsSync(inboxPath(jobFile))) return [];
+  return locked(jobFile, inbox => {
+    const drained = [];
+    const appliedAt = now();
+    for (const row of inbox.deliveries) {
+      if (row.status !== "queued" || typeof row.text !== "string" || !row.text.trim()) continue;
+      drained.push({
+        id: row.deliveryId,
+        text: row.text,
+        source: GEMINI_SOURCES.has(row.source) ? row.source : "chair-steer",
+        at: row.at ?? appliedAt
+      });
+      Object.assign(row, { status: "applied", reason: null, appliedAt, updatedAt: appliedAt });
+      redact(row);
+    }
+    return { changed: drained.length > 0, value: drained };
+  }, { requireJob: false });
+}
+
+export async function finalizeUnconsumedGeminiNotes(cwd, jobId) {
+  if (!cwd || !jobId) return [];
+  const jobFile = resolveJobFile(cwd, jobId);
+  if (!fs.existsSync(inboxPath(jobFile))) return [];
+  return locked(jobFile, inbox => {
+    const unconsumed = [];
+    const endedAt = now();
+    for (const row of inbox.deliveries) {
+      if (row.status !== "queued" || typeof row.text !== "string" || !row.text.trim()) continue;
+      unconsumed.push({ id: row.deliveryId, text: row.text });
+      finish(row, "deferred", "turn_ended");
+      row.fallbackClaimedAt = endedAt;
+    }
+    return { changed: unconsumed.length > 0, value: unconsumed };
+  }, { requireJob: false });
+}
+
 export async function handoffSteering(cwd, jobId, { deliveryId, text, sessionId, ownerId }) {
   if (typeof deliveryId !== "string" || !deliveryId.trim() || deliveryId.length > 512) throw new Error("steer requires a delivery ID of at most 512 characters.");
   if (typeof text !== "string" || !text.trim() || text.length > 65536) throw new Error("steer requires non-empty stdin of at most 65536 characters.");
   if (!sessionId) throw new Error("steer requires the owning Claude session.");
   const jobFile = resolveJobFile(cwd, jobId);
+  const targetJob = read(jobFile);
+  if ((targetJob.request?.backend ?? targetJob.backend) === "antigravity") {
+    return queueGeminiNote(cwd, jobId, text, { source: "chair-steer", deliveryId, sessionId, ownerId, handoff: true });
+  }
   const refused = await locked(jobFile, (inbox, job) => {
     if (job.sessionId !== sessionId || (ownerId && job.ownerId !== ownerId)) throw new Error("Fugato steering job ownership changed.");
     const existing = inbox.deliveries.find(row => row.deliveryId === deliveryId);
@@ -89,8 +209,7 @@ export async function handoffSteering(cwd, jobId, { deliveryId, text, sessionId,
     if (inbox.deliveries.length >= MAX_DELIVERIES) return { changed: false,
       value: receipt(jobId, { deliveryId, status: "failed", reason: "inbox_full" }) };
     const row = { deliveryId, text, at: now(), status: "queued", sessionId, ownerId: job.ownerId };
-    if (job.request?.backend === "antigravity") finish(row, "deferred", "backend_unsupported");
-    else if (job.request?.permissionPolicy) finish(row, "deferred", "permission_mapping");
+    if (job.request?.permissionPolicy) finish(row, "deferred", "permission_mapping");
     else if (pendingQuestion(job)) finish(row, "deferred", "pending_question");
     else if (!ACTIVE.has(job.status) || !job.threadId || !job.turnId) finish(row, "deferred", "no_active_turn");
     inbox.deliveries.push(row);

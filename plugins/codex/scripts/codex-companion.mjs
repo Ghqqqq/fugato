@@ -1286,6 +1286,7 @@ function buildTaskExecution(result, request, taskMetadata = { title: "Codex Task
     blockers: result.blockers ?? [],
     commandExecutions: boundCommandOutput(result.commandExecutions ?? []),
     ...(result.usage ? { usage: result.usage } : {}),
+    ...(result.unconsumedSteers?.length ? { unconsumedSteers: result.unconsumedSteers } : {}),
     reasoningSummary: result.reasoningSummary,
     startupTimings: result.startupTimings ?? {}, startupWarning: result.startupWarning ?? null,
     turnEnded: Boolean(result.turnEnded),

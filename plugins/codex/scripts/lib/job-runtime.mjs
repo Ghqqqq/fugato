@@ -466,6 +466,19 @@ export function directReport(payload, job = {}, env = process.env) {
   }
   if (full.assumptions?.length) report.assumptions = full.assumptions.slice(0, 12).map(brief);
   if (full.keyFindings?.length) report.keyFindings = full.keyFindings.slice(0, 12).map(brief);
+  const rawUnconsumed = Array.isArray(full.unconsumedSteers) ? full.unconsumedSteers
+    : Array.isArray(job.result?.unconsumedSteers) ? job.result.unconsumedSteers : [];
+  const unconsumedSteers = rawUnconsumed
+    .filter(entry => entry && typeof entry === "object" && typeof entry.id === "string" && entry.id.trim() && typeof entry.text === "string" && entry.text.trim())
+    .slice(0, 10)
+    .map(entry => ({ id: brief(entry.id), text: brief(entry.text) }));
+  if (unconsumedSteers.length) report.unconsumedSteers = unconsumedSteers;
+  const noticeText = typeof full.notice === "string" && full.notice.trim()
+    ? truncate(redactActivity(full.notice).replace(/\s+/g, " ").trim(), 600)
+    : unconsumedSteers.length
+      ? `${rawUnconsumed.length} mid-turn steering ${rawUnconsumed.length === 1 ? "message was" : "messages were"} not delivered before the Gemini turn ended; resend with SendMessage if still needed.`
+      : null;
+  if (noticeText) report.notice = noticeText;
   if (full.usage) {
     report.usage = full.usage;
     const model = job.result?.model ?? job.request?.model;
@@ -496,6 +509,13 @@ export function directReport(payload, job = {}, env = process.env) {
     report.next = nextCommand(command);
   }
   fitDirectEnvelope(report, checkPriorities);
+  while (envelopeBytes(report) > 2000 && report.unconsumedSteers?.length > 1) report.unconsumedSteers.pop();
+  while (envelopeBytes(report) > 2000 && report.unconsumedSteers?.[0]?.text.length > 16) {
+    report.unconsumedSteers[0].text = `${truncate(report.unconsumedSteers[0].text, Math.floor(report.unconsumedSteers[0].text.length / 2))}…`;
+  }
+  while (envelopeBytes(report) > 2000 && report.notice?.length > 16) {
+    report.notice = `${truncate(report.notice, Math.floor(report.notice.length / 2))}…`;
+  }
   // Long workspace paths can exceed the fixed-field budget even after text
   // fitting. Exact IDs resolve across stored workspaces without a cwd hint.
   if (cwdOption && jobId && envelopeBytes(report) > 2000) {

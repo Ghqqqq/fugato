@@ -12,6 +12,7 @@ import { ASK_PARENT, PARENT_BRIDGE_ENV, PARENT_BRIDGE_SERVER } from "./job-runti
 import { resolveJobFile, tryAcquirePidLock, updateJob } from "./state.mjs";
 import { WORKSPACE_EXEC_CWD_ENV, WORKSPACE_READ_TOOLS, WORKSPACE_READ_TOOL_NAMES } from "./workspace-read-tools.mjs";
 import { approvalArtifactDir, stageApprovalArtifact, verifyApprovalArtifact } from "./approval-artifacts.mjs";
+import { finalizeUnconsumedGeminiNotes } from "./steering.mjs";
 
 const manifest = JSON.parse(fs.readFileSync(new URL("../../.claude-plugin/plugin.json", import.meta.url), "utf8"));
 export const ANTIGRAVITY_DEFAULT_MODEL = "gemini-4-neon";
@@ -752,6 +753,10 @@ export async function runAntigravityTurn(cwd, options = {}) {
     } else commandExecutions.push(commandResult(tool));
   }
   const touchedFiles = [...new Set(fileChanges.flatMap(tool => changedPaths(tool)))];
+  const steeringJobId = options.jobId ?? options.parentBridge?.jobId ?? null;
+  const unconsumedSteers = steeringJobId
+    ? await finalizeUnconsumedGeminiNotes(options.parentBridge?.cwd ?? cwd, steeringJobId).catch(() => [])
+    : [];
   const status = failure || ["cancelled", "max_tokens", "max_turn_requests"].includes(stopReason) ? 1 : 0;
   const turnStatus = stopReason === "cancelled" || cancelRequested ? "interrupted" : status ? "failed" : "completed";
   return { provider: "antigravity", status, threadId, turnId, finalMessage, reasoningSummary: thought ? [thought] : [],
@@ -760,6 +765,7 @@ export async function runAntigravityTurn(cwd, options = {}) {
     interruptionConfirmed: stopReason === "cancelled", acpProcessExited: cleanupConfirmed,
     sandbox: "danger-full-access", approvalPolicy: options.onApprovalRequest ? "antigravity-rules+parent-once" : "antigravity-rules+deny",
     model, effort, ...(usage ? { usage } : {}),
+    ...(unconsumedSteers.length ? { unconsumedSteers } : {}),
     fileChanges, touchedFiles, commandExecutions,
     blockers, error: failure ? { message: failure.message } : null, stderr: client?.stderr ?? "", acpUsage };
 }
