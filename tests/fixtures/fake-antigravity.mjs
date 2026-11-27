@@ -43,6 +43,9 @@ let sessionId = null, model = currentModel ?? (["non-gemini-default", "no-gemini
 let thought = currentEffort ?? "high", promptRequest = null, thinkingOverride = null;
 let scriptedReplies = 0, mcpServers = [], activeMcpCalls = new Map();
 let pendingLoad = null;
+// Permission fixtures edit a file inside the session's directory, as agy does;
+// Fugato's boundary policy denies writes outside the job execution directory.
+let sessionCwd = null;
 const configs = () => [
   { id: modelId, category: "model", name: "Model", type: "select", currentValue: model,
     options: behavior === "dynamic-selectors" ? [{ group: "models", name: "Models", options: available }] : available },
@@ -65,8 +68,8 @@ function sessionReply(id, loaded = false) {
     sendBatch(behavior === "config-after-" + suffix ? [response, notification] : [notification, response]);
   } else send(response);
 }
-function editCall(toolCallId) {
-  const rawInput = { Path: "/fixture/calc.py", Target: "    return a - b", Replacement: "    return a + b" };
+function editCall(toolCallId, root = "/fixture") {
+  const rawInput = { Path: path.join(root, "calc.py"), Target: "    return a - b", Replacement: "    return a + b" };
   return { toolCallId, name: "edit_file", title: "Correct the calculation", kind: "edit", args: rawInput, rawInput,
     locations: [{ path: rawInput.Path }], content: [{ type: "diff", path: rawInput.Path, oldText: rawInput.Target, newText: rawInput.Replacement }] };
 }
@@ -134,12 +137,14 @@ input.on("line", line => {
     case "session/new": {
       if (behavior === "auth-required") { send({ id: message.id, error: { code: -32000, message: "Authentication required" } }); break; }
       mcpServers = Array.isArray(message.params?.mcpServers) ? message.params.mcpServers : [];
+      if (typeof message.params?.cwd === "string") sessionCwd = message.params.cwd;
       save(value => { sessionId = "agy-session-" + value.nextSession++; value.sessions.push({ sessionId, cwd: message.params.cwd }); });
       sessionReply(message.id);
       break;
     }
     case "session/load":
       sessionId = message.params.sessionId;
+      if (typeof message.params?.cwd === "string") sessionCwd = message.params.cwd;
       mcpServers = Array.isArray(message.params?.mcpServers) ? message.params.mcpServers : [];
       update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OLD REPLAY MUST BE EXCLUDED" } });
       update({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "OLD REASONING" } });
@@ -202,7 +207,7 @@ input.on("line", line => {
       if (behavior === "stdout-eof") { output.then(() => process.stdout.end()); break; }
       if (["hold", "ignore-cancel"].includes(behavior)) break;
       if (["permission", "mixed-permission", "permission-cancel", "foreign-permission", "only-always", "permission-partial", "permission-unscoped"].includes(behavior)) {
-        const toolCall = { sessionUpdate: "tool_call", ...editCall("edit-1"), status: "pending" };
+        const toolCall = { sessionUpdate: "tool_call", ...editCall("edit-1", sessionCwd ?? "/fixture"), status: "pending" };
         if (behavior === "permission-partial") update(toolCall);
         const options = [];
         if (["mixed-permission", "only-always"].includes(behavior)) options.push({ optionId: "trust-forever", name: "Always allow", kind: "allow_always" });
@@ -249,7 +254,7 @@ function sendNextGrantCommand() {
 }
 function startGrantSequence() {
   const sequences = {
-    "grant-sequence": ["node --test tests/a.test.mjs", "node --test tests/b.test.mjs", "node --test a.mjs && rm -rf /"],
+    "grant-sequence": ["node --test tests/a.test.mjs", "node --test tests/b.test.mjs", "node --test a.mjs && echo done"],
     "grant-single-test": ["node --test tests/c.test.mjs"],
     "grant-cross-prefix": ["node --test tests/a.test.mjs", "claude plugin test plugins/codex"],
     "grant-escape-after-grant": ["node --test tests/a.test.mjs", "node --test ../outside.test.mjs"]

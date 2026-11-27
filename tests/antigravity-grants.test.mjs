@@ -101,7 +101,7 @@ test("scoped job grant offers three options, auto-allows matching later command,
 
   const next = json(f.call("wait", launch.jobId, "--owner", launch.ownerId, "--json"));
   assert.equal(next.status, "needs_answer");
-  assert.match(next.question.text, /node --test a\.mjs && rm -rf \//);
+  assert.match(next.question.text, /node --test a\.mjs && echo done/);
   assert.deepEqual(next.question.options, ["Allow once", "Deny"]);
 
   json(f.invoke(["answer", launch.jobId, "--question", next.question.id, "--owner", launch.ownerId, "--json"], "Deny"));
@@ -117,7 +117,7 @@ test("scoped job grant offers three options, auto-allows matching later command,
   const executed = job.result.commandExecutions.map(c => c.command);
   assert.ok(executed.includes("node --test tests/a.test.mjs"), JSON.stringify(executed));
   assert.ok(executed.includes("node --test tests/b.test.mjs"), JSON.stringify(executed));
-  assert.equal(executed.includes("node --test a.mjs && rm -rf /"), false, JSON.stringify(executed));
+  assert.equal(executed.includes("node --test a.mjs && echo done"), false, JSON.stringify(executed));
   assert.equal(fs.existsSync(path.join(f.env.CODEX_COMPANION_HOME, "duet", "config.toml")), false);
   assert.equal("jobGrants" in job, false);
 });
@@ -444,7 +444,7 @@ test("native adapter validator accepts Deny: <guidance> and job grants while ref
 
     const q3 = await h.runTurn(`Answer ${q1.question.id}\nAllow "node --test" for this job`);
     assert.equal(q3.status, "needs_answer");
-    assert.match(q3.question.text, /node --test a\.mjs && rm -rf \//);
+    assert.match(q3.question.text, /node --test a\.mjs && echo done/);
     assert.deepEqual(q3.question.options, ["Allow once", "Deny"]);
     assert.equal(q3.next, `SendMessage to ${q3.worker}: "Answer ${q3.question.id}\nAllow once" (or Deny)`);
 

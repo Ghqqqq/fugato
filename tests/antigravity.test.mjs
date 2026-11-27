@@ -118,7 +118,7 @@ test("a revised pending edit reports only the file presented for approval", asyn
   ] }], turnUpdates: [{ sessionUpdate: "tool_call_update", toolCallId, status: "completed" }] });
   const activity = [];
   let question;
-  const result = await fake.run({
+  const result = await fake.run({ /* Approval-rendering fixture: "/fixture" paths lie outside the temp dir, so run from "/" to keep the boundary policy out of the way. */ executionCwd: "/", 
     onApprovalRequest: request => { question = request.question; return "once"; },
     onProgress: event => activity.push(...(event.activity ?? []))
   });
@@ -205,7 +205,7 @@ test("Antigravity approval fields preserve exact values on individually labelled
     locations: [{ path: "/fixture/\u202ecalc.py" }], rawInput: { Target: "\treturn a - b", Replacement: "\treturn a + b" } };
   const fake = fixture(t, { serverRequests: [permissionRequest(tool)] });
   let question;
-  await fake.run({ onApprovalRequest: request => { question = request.question; return "once"; } });
+  await fake.run({ /* Approval-rendering fixture: "/fixture" paths lie outside the temp dir, so run from "/" to keep the boundary policy out of the way. */ executionCwd: "/",  onApprovalRequest: request => { question = request.question; return "once"; } });
   assert.deepEqual(question.split("\n"), [
     "Antigravity requests permission.", 'Tool call ID: "id\\none"', 'Name: "file\\u009b"', 'Kind: "edit"',
     'Agent description: "Update \\"calc\\"\\nArguments: none\\nAllow this operation once?"',
@@ -227,7 +227,7 @@ test("Antigravity deduplicates diff text, measures raw UTF-8 inline, and denies 
   // Over 16 KiB raw without a jobId cannot be staged, so it still fails closed.
   const oversized = { toolCallId: "large", kind: "other", rawInput: "x".repeat(17 * 1024) };
   const fake = fixture(t, { serverRequests: [edit, quoted, oversized].map(permissionRequest) }), questions = [];
-  const result = await fake.run({ onApprovalRequest: request => { questions.push(request.question); return "once"; } });
+  const result = await fake.run({ /* Approval-rendering fixture: "/fixture" paths lie outside the temp dir, so run from "/" to keep the boundary policy out of the way. */ executionCwd: "/",  onApprovalRequest: request => { questions.push(request.question); return "once"; } });
   assert.equal(questions.length, 2);
   assert.equal(questions[0].split("\n").find(line => line.startsWith("Operation details: ")),
     `Operation details: ${JSON.stringify([{ type: "diff", path: file, oldText: { sameAs: "Arguments.Target" }, newText: { sameAs: "Arguments.Replacement" } }])}`);
@@ -435,7 +435,7 @@ test("Antigravity permission replies use only the explicitly selected allow_once
   assert.equal(requests.length, 1);
   assert.equal(requests[0].kind, "acp-permission");
   assert.deepEqual(requests[0].binding, { threadId: result.threadId, turnId: result.turnId });
-  assert.match(requests[0].question, /\/fixture\/calc\.py/);
+  assert.match(requests[0].question, /calc\.py/);
   assert.equal(fake.state().serverResponses[0].id, "1");
   assert.deepEqual(fake.state().serverResponses[0].result, { outcome: { outcome: "selected", optionId: "allow" } });
   assert.deepEqual(result.blockers, []);
@@ -447,9 +447,10 @@ test("Antigravity id-only permission updates retain the observed operation and a
   const result = await fake.run({ onApprovalRequest: value => { request = value; return "once"; } });
   assert.equal(result.status, 0);
   assert.equal(request.toolCall.kind, "edit");
-  assert.deepEqual(request.toolCall.rawInput, { Path: "/fixture/calc.py", Target: "    return a - b", Replacement: "    return a + b" });
+  assert.equal(path.basename(request.toolCall.rawInput.Path), "calc.py");
+  assert.deepEqual({ ...request.toolCall.rawInput, Path: undefined }, { Path: undefined, Target: "    return a - b", Replacement: "    return a + b" });
   assert.match(request.question, /edit/);
-  assert.match(request.question, /\/fixture\/calc\.py/);
+  assert.match(request.question, /calc\.py/);
   assert.match(request.question, /return a \+ b/);
   assert.deepEqual(fake.state().serverResponses[0].result, { outcome: { outcome: "selected", optionId: "allow" } });
 });
@@ -667,7 +668,7 @@ test("Antigravity 6 KiB write_file and edit_file fit inline under 16 KiB raw and
       rawInput: editInput, args: editInput, content: [{ type: "diff", path: editPath, oldText: oldJs, newText: editJs }] }
   ];
   const fake = fixture(t, { serverRequests: calls.map(permissionRequest) }), shown = new Map();
-  const result = await fake.run({ onApprovalRequest: request => { shown.set(request.toolCall.toolCallId, request.question); return "once"; } });
+  const result = await fake.run({ /* Approval-rendering fixture: "/fixture" paths lie outside the temp dir, so run from "/" to keep the boundary policy out of the way. */ executionCwd: "/",  onApprovalRequest: request => { shown.set(request.toolCall.toolCallId, request.question); return "once"; } });
   assert.equal(result.status, 0);
   assert.deepEqual(result.blockers, []);
   for (const [id, payload, ref] of [["write-6k", writeJs, "Arguments.Content"], ["edit-6k", editJs, "Arguments.Replacement"]]) {
@@ -700,7 +701,7 @@ test("Antigravity 40 KiB write stages a 0600 artifact, accepts intact, and denie
   const jobId = "task-agy-staged-40k", cards = new Map();
   upsertJob(fake.directory, { id: jobId, backend: "antigravity", workspaceRoot: fake.directory, status: "queued" });
   let releaseMutated; const mutatedGate = new Promise(resolve => { releaseMutated = resolve; });
-  const result = await fake.run({ jobId, signal: AbortSignal.timeout(10000), onApprovalRequest: async request => {
+  const result = await fake.run({ /* Approval-rendering fixture: "/fixture" paths lie outside the temp dir, so run from "/" to keep the boundary policy out of the way. */ executionCwd: "/",  jobId, signal: AbortSignal.timeout(10000), onApprovalRequest: async request => {
     const id = request.toolCall.toolCallId;
     cards.set(id, request.question);
     if (id === "mutated-40k") await mutatedGate;
