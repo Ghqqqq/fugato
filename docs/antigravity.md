@@ -179,8 +179,9 @@ running Gemini worker at parent-bridge tool boundaries.
   queued notes stay undrained until the turn ends. At turn end, Fugato marks
   any remaining queued notes terminal so they are never delivered twice, and
   surfaces them on the job report in `unconsumedSteers` (`[{ id, text }]`,
-  bounded to 10 clipped entries) alongside a warning `notice` telling the chair
-  to resend with `SendMessage` if still needed.
+  bounded to 3 clipped entries plus `unconsumedSteersOmitted`) alongside a
+  warning `notice` telling the chair to resend with `SendMessage` if still
+  needed.
 - If a question or approval is pending (`needs_answer`), steering defers and
   `Answer <questionId>` routing is unchanged. Active Gemini roundtable seats
   continue to receive forum unread notices via bridge tool footers rather than

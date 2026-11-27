@@ -553,6 +553,22 @@ export async function listAntigravityModels(cwd, options = {}) {
 }
 
 export async function runAntigravityTurn(cwd, options = {}) {
+  const steeringJobId = options.jobId ?? options.parentBridge?.jobId ?? null;
+  const steeringCwd = options.parentBridge?.cwd ?? cwd;
+  let unconsumedSteers = [];
+  let steeringFinalizeError = null;
+  let steeringFinalized = false;
+  const finalizeSteering = async () => {
+    if (steeringFinalized || !steeringJobId) return;
+    steeringFinalized = true;
+    try {
+      unconsumedSteers = await finalizeUnconsumedGeminiNotes(steeringCwd, steeringJobId);
+    } catch (error) {
+      steeringFinalizeError = error instanceof Error ? error.message : String(error);
+    }
+  };
+  let turnReturned = false;
+  try {
   const executionCwd = path.resolve(options.executionCwd ?? cwd);
   const content = promptContent(options);
   if (options.sandbox && options.sandbox !== "danger-full-access") throw notStarted(new Error("Antigravity ACP does not implement Fugato's Codex sandbox modes. Select danger-full-access explicitly; Antigravity's own permission rules still apply."));
@@ -753,12 +769,15 @@ export async function runAntigravityTurn(cwd, options = {}) {
     } else commandExecutions.push(commandResult(tool));
   }
   const touchedFiles = [...new Set(fileChanges.flatMap(tool => changedPaths(tool)))];
-  const steeringJobId = options.jobId ?? options.parentBridge?.jobId ?? null;
-  const unconsumedSteers = steeringJobId
-    ? await finalizeUnconsumedGeminiNotes(options.parentBridge?.cwd ?? cwd, steeringJobId).catch(() => [])
-    : [];
+  await finalizeSteering();
+  let steeringNotice = null;
+  if (steeringFinalizeError) {
+    steeringNotice = `Could not finalize Gemini steering inbox at turn end (${steeringFinalizeError}); queued steering messages may be unconsumed—inspect steering state before resending.`;
+    blockers.push({ code: "steering_finalize_failed", message: steeringNotice });
+  }
   const status = failure || ["cancelled", "max_tokens", "max_turn_requests"].includes(stopReason) ? 1 : 0;
   const turnStatus = stopReason === "cancelled" || cancelRequested ? "interrupted" : status ? "failed" : "completed";
+  turnReturned = true;
   return { provider: "antigravity", status, threadId, turnId, finalMessage, reasoningSummary: thought ? [thought] : [],
     turn: { id: turnId, status: turnStatus, error: failure ? { message: failure.message } : null },
     turnStatus, turnEnded, stopReason, turnInterruptAttempted: cancelRequested && submitted,
@@ -766,6 +785,26 @@ export async function runAntigravityTurn(cwd, options = {}) {
     sandbox: "danger-full-access", approvalPolicy: options.onApprovalRequest ? "antigravity-rules+parent-once" : "antigravity-rules+deny",
     model, effort, ...(usage ? { usage } : {}),
     ...(unconsumedSteers.length ? { unconsumedSteers } : {}),
+    ...(steeringNotice ? { notice: steeringNotice } : {}),
     fileChanges, touchedFiles, commandExecutions,
     blockers, error: failure ? { message: failure.message } : null, stderr: client?.stderr ?? "", acpUsage };
+  } finally {
+    if (!turnReturned && steeringJobId) {
+      await finalizeSteering();
+      if (options.jobId && (unconsumedSteers.length || steeringFinalizeError)) {
+        try {
+          const errorNotice = steeringFinalizeError
+            ? `Could not finalize Gemini steering inbox at turn end (${steeringFinalizeError}); queued steering messages may be unconsumed—inspect steering state before resending.`
+            : null;
+          updateJob(cwd, options.jobId, current => ({
+            ...(unconsumedSteers.length ? { unconsumedSteers } : {}),
+            ...(steeringFinalizeError ? {
+              steeringFinalizeError,
+              notice: [current.notice, errorNotice].filter(Boolean).join(" ")
+            } : {})
+          }));
+        } catch { /* Job file may not exist in standalone unit tests. */ }
+      }
+    }
+  }
 }

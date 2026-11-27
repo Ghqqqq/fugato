@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { redactActivity } from "./activity.mjs";
 import { resolveJobFile, tryAcquirePidLock } from "./state.mjs";
 
 const ACTIVE = new Set(["queued", "running"]);
 const TERMINAL = new Set(["applied", "deferred", "failed", "unknown"]);
 const GEMINI_SOURCES = new Set(["chair-steer", "denial-guidance"]);
+const GEMINI_DELIVERY_ID = /^[A-Za-z0-9._:-]{1,64}$/;
 const MAX_DELIVERIES = 256;
 const digest = text => createHash("sha256").update(text).digest("hex");
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -82,9 +84,13 @@ function endedRejection(error) {
     && /\bno active turn\b|\bturn (?:has |already )?(?:ended|completed|finished)\b|expected[_ ]?turn[_ ]?id.*(?:mismatch|does not match)|(?:mismatch|does not match).*expected[_ ]?turn[_ ]?id/i.test(error.message);
 }
 
+function sanitizeGeminiText(text) {
+  return redactActivity(text).replace(/\s+/g, " ").trim();
+}
+
 function validateGeminiNoteText(text) {
-  if (typeof text !== "string" || !text.trim() || text.length > 65536) {
-    throw new Error("Gemini note requires non-empty text of at most 65536 characters.");
+  if (typeof text !== "string" || text.length > 65536 || !sanitizeGeminiText(text)) {
+    throw new Error("Gemini note requires non-empty displayable text of at most 65536 characters.");
   }
 }
 
@@ -94,12 +100,16 @@ function validateGeminiSource(source) {
   }
 }
 
+const antigravityTurnSubmitted = job => Boolean(
+  job && ACTIVE.has(job.status) && !job.cancelRequested && job.threadId && job.turnId && job.turnSubmission
+);
+
 export async function queueGeminiNote(cwd, jobId, text, { source = "chair-steer", deliveryId = null, sessionId = null, ownerId = null, handoff = false } = {}) {
   validateGeminiNoteText(text);
   validateGeminiSource(source);
   const id = deliveryId ?? randomUUID();
-  if (typeof id !== "string" || !id.trim() || id.length > 512) {
-    throw new Error("Gemini note delivery ID must be at most 512 characters.");
+  if (typeof id !== "string" || !GEMINI_DELIVERY_ID.test(id)) {
+    throw new Error("Gemini steering delivery ID must be 1 to 64 characters matching [A-Za-z0-9._:-].");
   }
   const jobFile = resolveJobFile(cwd, jobId);
   return locked(jobFile, (inbox, job) => {
@@ -118,12 +128,43 @@ export async function queueGeminiNote(cwd, jobId, text, { source = "chair-steer"
       }
       return {
         changed: false,
-        value: { id: existing.deliveryId, deliveryId: existing.deliveryId, status: existing.status, source: existing.source ?? source, at: existing.at ?? null, reason: existing.reason ?? null }
+        value: { id: existing.deliveryId, deliveryId: existing.deliveryId, status: existing.status, fallback: false, source: existing.source ?? source, at: existing.at ?? null, reason: existing.reason ?? null }
+      };
+    }
+    let deferReason = null;
+    if (inbox.sealedAt) deferReason = "no_active_turn";
+    else if (handoff) {
+      if (job.request?.permissionPolicy) deferReason = "permission_mapping";
+      else if (pendingQuestion(job)) deferReason = "pending_question";
+      else if (!antigravityTurnSubmitted(job)) deferReason = "no_active_turn";
+    }
+    if (deferReason) {
+      const at = now();
+      if (inbox.deliveries.length < MAX_DELIVERIES) {
+        const row = {
+          deliveryId: id, text, at, status: "queued", source,
+          sessionId: sessionId ?? job?.sessionId ?? null,
+          ownerId: ownerId ?? job?.ownerId ?? null
+        };
+        finish(row, "deferred", deferReason);
+        row.fallbackClaimedAt = now();
+        inbox.deliveries.push(row);
+        return {
+          changed: true,
+          value: handoff
+            ? receipt(jobId, row, true)
+            : { id: row.deliveryId, deliveryId: row.deliveryId, status: row.status, fallback: true, source: row.source, at: row.at, reason: row.reason ?? null }
+        };
+      }
+      const deferred = { deliveryId: id, status: "deferred", reason: deferReason };
+      return {
+        changed: false,
+        value: handoff ? receipt(jobId, deferred, true) : { id, ...deferred, fallback: true, source, at }
       };
     }
     if (inbox.deliveries.length >= MAX_DELIVERIES) {
       const full = { deliveryId: id, status: "failed", reason: "inbox_full" };
-      return { changed: false, value: handoff ? receipt(jobId, full) : { id, ...full, source, at: now() } };
+      return { changed: false, value: handoff ? receipt(jobId, full) : { id, ...full, fallback: false, source, at: now() } };
     }
     const at = now();
     const row = {
@@ -131,35 +172,31 @@ export async function queueGeminiNote(cwd, jobId, text, { source = "chair-steer"
       sessionId: sessionId ?? job?.sessionId ?? null,
       ownerId: ownerId ?? job?.ownerId ?? null
     };
-    let fallback = false;
-    if (handoff) {
-      if (job.request?.permissionPolicy) finish(row, "deferred", "permission_mapping");
-      else if (pendingQuestion(job)) finish(row, "deferred", "pending_question");
-      else if (!ACTIVE.has(job.status)) finish(row, "deferred", "no_active_turn");
-      if (row.status === "deferred") {
-        row.fallbackClaimedAt = now();
-        fallback = true;
-      }
-    }
     inbox.deliveries.push(row);
     return {
       changed: true,
       value: handoff
-        ? receipt(jobId, row, fallback)
-        : { id: row.deliveryId, deliveryId: row.deliveryId, status: row.status, source: row.source, at: row.at, reason: row.reason ?? null }
+        ? receipt(jobId, row, false)
+        : { id: row.deliveryId, deliveryId: row.deliveryId, status: row.status, fallback: false, source: row.source, at: row.at, reason: row.reason ?? null }
     };
   }, { requireJob: handoff, createDir: !handoff });
 }
 
-export async function drainGeminiNotes(cwd, jobId) {
+export async function drainGeminiNotes(cwd, jobId, { turnId = null } = {}) {
   if (!cwd || !jobId) return [];
   const jobFile = resolveJobFile(cwd, jobId);
   if (!fs.existsSync(inboxPath(jobFile))) return [];
-  return locked(jobFile, inbox => {
+  return locked(jobFile, (inbox, job) => {
+    if (inbox.sealedAt || !job || job.id !== jobId
+        || (job.request?.backend ?? job.backend) !== "antigravity"
+        || !ACTIVE.has(job.status) || job.cancelRequested
+        || (turnId && job.turnId !== turnId)) {
+      return { changed: false, value: [] };
+    }
     const drained = [];
     const appliedAt = now();
     for (const row of inbox.deliveries) {
-      if (row.status !== "queued" || typeof row.text !== "string" || !row.text.trim()) continue;
+      if (row.status !== "queued" || typeof row.text !== "string" || !sanitizeGeminiText(row.text)) continue;
       drained.push({
         id: row.deliveryId,
         text: row.text,
@@ -176,18 +213,23 @@ export async function drainGeminiNotes(cwd, jobId) {
 export async function finalizeUnconsumedGeminiNotes(cwd, jobId) {
   if (!cwd || !jobId) return [];
   const jobFile = resolveJobFile(cwd, jobId);
-  if (!fs.existsSync(inboxPath(jobFile))) return [];
   return locked(jobFile, inbox => {
     const unconsumed = [];
     const endedAt = now();
+    let changed = false;
+    if (!inbox.sealedAt) {
+      inbox.sealedAt = endedAt;
+      changed = true;
+    }
     for (const row of inbox.deliveries) {
-      if (row.status !== "queued" || typeof row.text !== "string" || !row.text.trim()) continue;
-      unconsumed.push({ id: row.deliveryId, text: row.text });
+      if (row.status !== "queued" || typeof row.text !== "string") continue;
+      if (sanitizeGeminiText(row.text)) unconsumed.push({ id: row.deliveryId, text: row.text });
       finish(row, "deferred", "turn_ended");
       row.fallbackClaimedAt = endedAt;
+      changed = true;
     }
-    return { changed: unconsumed.length > 0, value: unconsumed };
-  }, { requireJob: false });
+    return { changed, value: unconsumed };
+  }, { requireJob: false, createDir: true });
 }
 
 export async function handoffSteering(cwd, jobId, { deliveryId, text, sessionId, ownerId }) {

@@ -142,10 +142,10 @@ function formatSteeringNote(note) {
   return `${header}\n${note.text}`;
 }
 async function withSteeringFooter(payload, job) {
-  if (!payload || !Array.isArray(payload.content) || backend !== "antigravity" || !job || !ACTIVE.has(job.status)) return payload;
+  if (!payload || !Array.isArray(payload.content) || backend !== "antigravity" || !job || !ACTIVE.has(job.status) || job.cancelRequested) return payload;
   try {
     if (jobBackend(job) !== "antigravity" || !job.workspaceRoot || !job.id) return payload;
-    const notes = await drainGeminiNotes(job.workspaceRoot, job.id);
+    const notes = await drainGeminiNotes(job.workspaceRoot, job.id, { turnId: job.turnId ?? null });
     if (!notes.length) return payload;
     return { ...payload, content: [...payload.content, { type: "text", text: notes.map(formatSteeringNote).join("\n\n") }] };
   } catch {
@@ -210,8 +210,9 @@ process.stdin.on("data", createJsonLineReader(async line => {
           break;
         }
         const callId = typeof _meta?.callId === "string" && /^[A-Za-z0-9_-]{1,120}$/.test(_meta.callId) ? _meta.callId : null;
-        const { text } = await askParentQuestion(job.workspaceRoot, job.id, { question: args.question, options: args.options ?? [], callId }, { caller, turnId: job.turnId });
-        send({ id: message.id, result: await withSteeringFooter(withUnreadFooter(result(text), name, job), job) });
+        const { text, resolution } = await askParentQuestion(job.workspaceRoot, job.id, { question: args.question, options: args.options ?? [], callId }, { caller, turnId: job.turnId });
+        const askPayload = withUnreadFooter(result(text), name, job);
+        send({ id: message.id, result: ["interrupted", "cancelled"].includes(resolution) ? askPayload : await withSteeringFooter(askPayload, job) });
         break;
       }
       default:
