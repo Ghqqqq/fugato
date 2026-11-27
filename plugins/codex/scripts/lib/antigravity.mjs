@@ -241,39 +241,87 @@ export const GEMINI_WORKSPACE_GUIDANCE =
 // Fugato's fail-closed boundary gate for tool calls agy submits through
 // session/request_permission. Passing it is not approval: an allowed built-in
 // call still parks for the parent unless the bridge or a job grant allows it.
-const POLICY_PATH_KEYS = /^(?:path|absolutepath|file|filepath|filename|targetfile|directory|dirpath|searchpath|searchdirectory|cwd|workingdirectory|source|destination|uri)$/i;
-function policyToolPaths(tool) {
-  const paths = [];
-  for (const location of Array.isArray(tool.locations) ? tool.locations : []) if (typeof location?.path === "string" && location.path) paths.push(location.path);
-  const input = isPlainObject(tool.rawInput) ? tool.rawInput : {};
-  for (const [key, value] of Object.entries(input)) {
-    if (typeof value !== "string" || !value || !POLICY_PATH_KEYS.test(key)) continue;
-    paths.push(value.startsWith("file://") ? fileURLToPath(value) : value);
-  }
-  return [...new Set(paths)];
+const normalizedKey = key => String(key).toLowerCase().replace(/[^a-z0-9]/g, "");
+const POLICY_PATH_KEYS = new Set(["path", "paths", "absolutepath", "file", "files", "filepath", "filepaths", "filename", "targetfile",
+  "directory", "directorypath", "dir", "dirpath", "searchpath", "searchdirectory", "source", "sourcepath", "destination",
+  "destinationpath", "from", "to", "uri", "uris", "root", "location", "locations", "outputpath", "inputpath"]);
+const POLICY_CWD_KEYS = new Set(["cwd", "workingdirectory", "workdir"]);
+const POLICY_COMMAND_KEYS = new Set(["commandline", "command", "cmd", "script", "shellcommand"]);
+const READ_KINDS = new Set(["read", "search", "fetch", "think"]);
+const READ_NAME = /^(?:read|view|list|search|grep|find|glob|get|cat|fetch|open)(?:_|$|[A-Z])/i;
+function policyPathValue(value) {
+  if (/^file:/i.test(value)) return fileURLToPath(new URL(value));
+  return value;
 }
-const policyWriteName = /write|edit|delete|remove|move|rename|create|replace/i;
+// evaluatePath expands a leading ~ against the configured HOME; keep it intact.
+const resolvePolicyPath = (base, value) => {
+  const raw = policyPathValue(value);
+  return raw === "~" || raw.startsWith("~/") || raw.startsWith("~\\") ? raw : path.resolve(base, raw);
+};
+function collectPolicyFields(value, out, depth = 0, key = "") {
+  if (depth > 6 || value == null) return;
+  const normalized = normalizedKey(key);
+  if (typeof value === "string") {
+    if (!value) return;
+    if (POLICY_CWD_KEYS.has(normalized)) out.cwds.push(value);
+    else if (POLICY_COMMAND_KEYS.has(normalized)) out.commands.push(value);
+    else if (POLICY_PATH_KEYS.has(normalized)) out.paths.push(value);
+    return;
+  }
+  if (Array.isArray(value)) { for (const item of value.slice(0, 256)) collectPolicyFields(item, out, depth + 1, key); return; }
+  if (typeof value === "object") {
+    for (const [childKey, child] of Object.entries(value).slice(0, 256)) collectPolicyFields(child, out, depth + 1, childKey);
+  }
+}
 export function acpPolicyDenial(tool, executionCwd, env = process.env) {
-  if (!tool || typeof tool !== "object" || !executionCwd) return null;
-  const name = typeof tool.name === "string" && tool.name ? tool.name : String(tool.kind ?? "tool");
+  const name = typeof tool?.name === "string" && tool.name ? tool.name : String(tool?.kind ?? "tool");
+  const deny = (code, reason) => ({ tool: name, code, reason });
+  if (!tool || typeof tool !== "object") return null;
+  if (!executionCwd) return deny("invalid_execution_cwd", "No job execution directory is known for this request.");
   try {
-    const input = isPlainObject(tool.rawInput) ? tool.rawInput : {};
+    const fields = { paths: [], cwds: [], commands: [] };
+    if (typeof tool.rawInput === "string") fields.commands.push(tool.rawInput);
+    else collectPolicyFields(tool.rawInput, fields);
+    if (typeof tool.args === "string") fields.commands.push(tool.args);
+    else if (!isDeepStrictEqual(tool.args, tool.rawInput)) collectPolicyFields(tool.args, fields);
+    for (const location of Array.isArray(tool.locations) ? tool.locations : []) if (typeof location?.path === "string" && location.path) fields.paths.push(location.path);
+    const diffs = Array.isArray(tool.content) ? tool.content.filter(block => block?.type === "diff" && typeof block.path === "string" && block.path) : [];
+    for (const block of diffs) fields.paths.push(block.path);
     const execute = tool.name === "run_command" || tool.kind === "execute";
+    const root = path.resolve(executionCwd);
+    // A relative path is resolved against the request's own working directory.
+    const cwdVerdicts = [];
+    let base = root;
+    for (const value of [...new Set(fields.cwds)]) {
+      const candidate = resolvePolicyPath(root, value);
+      const verdict = evaluatePath({ target: candidate, executionCwd: root, access: "read", env });
+      if (!verdict.allowed) return deny(verdict.code, verdict.reason);
+      const absolute = candidate.startsWith("~") ? path.join(env?.HOME || env?.USERPROFILE || process.env.HOME || "/", candidate.slice(1)) : candidate;
+      cwdVerdicts.push(absolute);
+      base = absolute;
+    }
     if (execute) {
-      const commandLine = typeof input.CommandLine === "string" ? input.CommandLine : typeof input.command === "string" ? input.command : null;
-      if (commandLine) {
-        const verdict = evaluateCommand(commandLine, { executionCwd, env });
-        if (!verdict.allowed) return { tool: name, code: verdict.code, reason: verdict.reason };
+      // Commands run only inside the job's directory; outside it the text checks
+      // cannot see what relative paths refer to.
+      for (const candidate of cwdVerdicts) {
+        const inside = evaluatePath({ target: path.join(candidate, ".fugato-cwd-probe"), executionCwd: root, access: "write", env });
+        if (!inside.allowed) return deny("outside_workspace", "Commands must run inside the job execution directory.");
+      }
+      for (const commandLine of [...new Set(fields.commands)]) {
+        const verdict = evaluateCommand(commandLine, { executionCwd: root, env });
+        if (!verdict.allowed) return deny(verdict.code, verdict.reason);
       }
     }
-    const access = !execute && (["edit", "delete", "move"].includes(tool.kind) || policyWriteName.test(String(tool.name ?? ""))) ? "write" : "read";
-    for (const target of policyToolPaths(tool)) {
-      const verdict = evaluatePath({ target, executionCwd, access, env });
-      if (!verdict.allowed) return { tool: name, code: verdict.code, reason: verdict.reason };
+    const readOnly = !execute && !diffs.length && (READ_KINDS.has(tool.kind) || READ_NAME.test(String(tool.name ?? "")));
+    const access = execute || readOnly ? "read" : "write";
+    for (const value of [...new Set(fields.paths)]) {
+      const target = resolvePolicyPath(base, value);
+      const verdict = evaluatePath({ target, executionCwd: root, access, env });
+      if (!verdict.allowed) return deny(verdict.code, verdict.reason);
     }
     return null;
   } catch (error) {
-    return { tool: name, code: "policy_error", reason: `Boundary check failed: ${error instanceof Error ? error.message : String(error)}` };
+    return deny("policy_error", `Boundary check failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -286,7 +334,12 @@ export function editAmbiguityWarning(tool, executionCwd) {
   const target = typeof input.Target === "string" ? input.Target : typeof input.TargetContent === "string" ? input.TargetContent : null;
   const file = [input.Path, input.TargetFile, input.AbsolutePath, tool.locations?.[0]?.path].find(value => typeof value === "string" && value);
   if (!target || !file) return null;
-  const root = path.resolve(executionCwd), absolute = path.resolve(root, file), relative = path.relative(root, absolute);
+  let root, absolute;
+  try {
+    root = fs.realpathSync.native(path.resolve(executionCwd));
+    absolute = fs.realpathSync.native(path.resolve(root, policyPathValue(file)));
+  } catch { return null; }
+  const relative = path.relative(root, absolute);
   if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
   let content;
   try {
@@ -296,8 +349,9 @@ export function editAmbiguityWarning(tool, executionCwd) {
   } catch { return null; }
   let count = 0;
   for (let from = content.indexOf(target); from !== -1; from = content.indexOf(target, from + target.length)) count += 1;
-  if (count > 1) return `AMBIGUOUS: edit_file replaces all ${count} occurrences of Target in ${relative}; prefer workspace_edit.`;
-  if (count === 0) return `NO MATCH: Target was not found in ${relative}; check the text or prefer workspace_edit.`;
+  const shown = JSON.stringify(relative.length > 160 ? `…${relative.slice(-159)}` : relative);
+  if (count > 1) return `AMBIGUOUS: edit_file replaces all ${count} occurrences of Target in ${shown}; prefer workspace_edit.`;
+  if (count === 0) return `NO MATCH: Target was not found in ${shown}; check the text or prefer workspace_edit.`;
   return null;
 }
 
@@ -541,7 +595,8 @@ async function permissionDecision(options, params, binding, turnSignal, requestS
     const staging = workspaceRoot && options.jobId ? { workspaceRoot, jobId: options.jobId, env: options.env } : null;
     let review = call && binding.turnId && allow ? permissionReview(call.tool, staging) : null;
     const editWarning = review?.question ? editAmbiguityWarning(call.tool, executionCwd) : null;
-    if (editWarning) review = { ...review, question: `${editWarning}\n${review.question}` };
+    // Keep an inline card within the inline limit; a staged card is always small.
+    if (editWarning && Buffer.byteLength(`${editWarning}\n${review.question}`, "utf8") <= MAX_APPROVAL_BYTES) review = { ...review, question: `${editWarning}\n${review.question}` };
     if (review?.question && options.onApprovalRequest) {
       const request = { kind: "acp-permission", question: review.question,
         options: grantPrefix ? actionApprovalOptions(grantPrefix) : ACTION_APPROVAL_OPTIONS,
@@ -932,8 +987,9 @@ export async function runAntigravityTurn(cwd, options = {}) {
   const guidedDenials = blockers.filter(value => value?.kind === "acp-permission" && value.code === "approval_denied" && guidanceOf(value));
   const deniedActions = stopReason === "end_turn" && !failure && !cancelRequested && guidedDenials.length && guidedDenials.length === blockers.length
     ? blockers.splice(0).map(value => ({ code: value.code, guidance: guidanceOf(value) })) : [];
+  const firstGuidance = deniedActions[0]?.guidance ? JSON.stringify(deniedActions[0].guidance.length > 160 ? `${deniedActions[0].guidance.slice(0, 159)}…` : deniedActions[0].guidance) : "";
   const denialNotice = deniedActions.length
-    ? `${deniedActions.length} denied ${deniedActions.length === 1 ? "action" : "actions"} came with guidance; the worker continued and ended its turn normally.` : null;
+    ? `${deniedActions.length} denied ${deniedActions.length === 1 ? "action" : "actions"} came with guidance (${firstGuidance}${deniedActions.length > 1 ? ", …" : ""}); the worker continued and ended its turn normally.` : null;
   const notice = [steeringNotice, denialNotice].filter(Boolean).join(" ") || null;
   const status = failure || ["cancelled", "max_tokens", "max_turn_requests"].includes(stopReason) ? 1 : 0;
   const turnStatus = stopReason === "cancelled" || cancelRequested ? "interrupted" : status ? "failed" : "completed";

@@ -83,7 +83,7 @@ export function taskArtifactPaths(workspaceRoot, jobId) {
 const blockerEntry = blocker => Object.fromEntries(Object.entries({ ...blocker, ...(typeof blocker.message === "string" ? { message: shorten(blocker.message) } : {}) }).filter(([, v]) => v !== null && v !== undefined));
 export const REPORT_LINE_BUDGET = 60;
 /** @type {[string, string | null, number][]} */
-const BUDGET_LISTS = [["touchedFiles", "touchedFilesOmitted", 1], ["keyFindings", null, 1], ["verification", null, 1], ["claimedVerification", null, 1], ["preExistingChanges", "preExistingChangesOmitted", 1], ["assumptions", null, 0], ["unconsumedSteers", "unconsumedSteersOmitted", 0], ["blockers", "blockersOmitted", 1]];
+const BUDGET_LISTS = [["touchedFiles", "touchedFilesOmitted", 1], ["keyFindings", null, 1], ["verification", null, 1], ["claimedVerification", null, 1], ["preExistingChanges", "preExistingChangesOmitted", 1], ["assumptions", null, 0], ["unconsumedSteers", "unconsumedSteersOmitted", 0], ["deniedActions", null, 1], ["blockers", "blockersOmitted", 1]];
 const reportLines = report => `${JSON.stringify(report, null, 2)}\n`.split("\n").length;
 // Trim lists (longest first, blockers last) until the pretty-printed report
 // fits the budget; omitted counters account for every dropped entry.
@@ -201,6 +201,8 @@ export function buildWorkerReport(payload, meta = {}) {
     assumptions,
     ...(unconsumedSteers.length ? { unconsumedSteers } : {}),
     ...(unconsumedSteersOmitted ? { unconsumedSteersOmitted } : {}),
+    ...(Array.isArray(payload.deniedActions) && payload.deniedActions.length ? { deniedActions: payload.deniedActions.slice(0, 3)
+      .filter(entry => entry && typeof entry.guidance === "string").map(entry => ({ code: shorten(entry.code ?? "approval_denied", 64), guidance: shorten(entry.guidance) })) } : {}),
     ...(notice ? { notice } : {}),
     ...(browserBlocker ? { browserBlocker } : {}),
     blockers,

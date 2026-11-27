@@ -47,6 +47,27 @@ test("boundary policy denies protected homes, forbidden commands and out-of-work
     assert.equal(deny({ name: "run_command", kind: "execute", rawInput: { CommandLine } }).code, "forbidden_command", CommandLine);
   }
   assert.equal(deny({ name: "run_command", kind: "execute", rawInput: { CommandLine: "ls", Cwd: path.join(f.home, ".claude") } }).code, "protected_home");
+  // Review repros: other input shapes, keys, URIs, Cwd-relative paths and write-like tools.
+  const gemini = path.join(f.home, ".gemini", "oauth_creds.json");
+  for (const [label, tool, code] of [
+    ["string rawInput", { name: "run_command", kind: "execute", rawInput: "git push origin main", args: "git push origin main" }, "forbidden_command"],
+    ["empty CommandLine with command", { name: "run_command", kind: "execute", rawInput: { CommandLine: "", command: "git push origin main" } }, "forbidden_command"],
+    ["env -S wrapper", { name: "run_command", kind: "execute", rawInput: { CommandLine: "env -S \"npm run build\"" } }, "forbidden_command"],
+    ["command Cwd outside", { name: "run_command", kind: "execute", rawInput: { CommandLine: "rm -rf target", Cwd: f.outside } }, "outside_workspace"],
+    ["command Cwd home relative", { name: "run_command", kind: "execute", rawInput: { CommandLine: "cat .gemini/oauth_creds.json", Cwd: f.home } }, "outside_workspace"],
+    ["diff-only outside edit", { name: "edit_file", kind: "edit", rawInput: {}, content: [{ type: "diff", path: path.join(f.outside, "pwn.txt"), oldText: "a", newText: "b" }] }, "outside_workspace"],
+    ["snake_case file_path", { name: "write_file", kind: "edit", rawInput: { file_path: path.join(f.outside, "x.txt") } }, "outside_workspace"],
+    ["DirectoryPath", { name: "list_dir", kind: "read", rawInput: { DirectoryPath: path.join(f.home, ".gemini") } }, "protected_home"],
+    ["array of paths", { name: "read_files", kind: "read", rawInput: { paths: [gemini] } }, "protected_home"],
+    ["nested edits", { name: "multi_edit", kind: "edit", rawInput: { edits: [{ path: path.join(f.outside, "pwn.txt") }] } }, "outside_workspace"],
+    ["FILE:// uri", { name: "read_file", kind: "read", rawInput: { uri: `FILE://${gemini}` } }, "protected_home"],
+    ["read Cwd home relative", { name: "read_file", kind: "read", rawInput: { Cwd: f.home, Path: ".gemini/oauth_creds.json" } }, "protected_home"],
+    ["apply_patch kind other", { name: "apply_patch", kind: "other", rawInput: { path: path.join(f.repo, ".git", "hooks", "pre-commit") } }, "git_metadata_write"],
+    ["copy_file outside", { name: "copy_file", rawInput: { source: "a.txt", destination: path.join(f.outside, "x.txt") } }, "outside_workspace"]
+  ]) assert.equal(deny(tool)?.code, code, label);
+  fs.mkdirSync(path.join(f.repo, "sub"));
+  assert.equal(deny({ name: "edit_file", kind: "edit", rawInput: { Cwd: path.join(f.repo, "sub"), Path: "../a.txt", Target: "x", Replacement: "y" } }), null);
+  assert.equal(acpPolicyDenial({ name: "read_file", kind: "read", rawInput: { Path: "a.txt" } }, null, f.env).code, "invalid_execution_cwd");
 });
 
 test("built-in edit_file cards warn on ambiguous and missing targets but stay parked", () => {
@@ -57,6 +78,8 @@ test("built-in edit_file cards warn on ambiguous and missing targets but stay pa
   assert.match(card({ Path: "t.txt", Target: "gamma", Replacement: "x" }), /^NO MATCH: /);
   assert.equal(card({ Path: "t.txt", Target: "beta", Replacement: "x" }), null);
   assert.equal(card({ Path: path.join(f.outside, "t.txt"), Target: "alpha", Replacement: "x" }), null);
+  fs.symlinkSync(f.repo, path.join(f.dir, "repo-link"));
+  assert.match(editAmbiguityWarning({ name: "edit_file", kind: "edit", rawInput: { Path: path.join(f.dir, "repo-link", "t.txt"), Target: "alpha", Replacement: "x" } }, f.repo), /^AMBIGUOUS: /);
 });
 
 test("bridge workspace_edit/workspace_write edit inside the worktree, record fileChange activity and bridgeTouchedFiles", async t => {

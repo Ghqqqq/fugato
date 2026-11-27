@@ -325,7 +325,11 @@ sibling roundtable worktrees), writes to the worktree's `gitdir`/`commondir`, an
 any other write are denied locally without waking Claude. Commands that run
 `npm run build`, `npm run verify`, `npm publish`, `npm install`/`ci`,
 `git push`, a recursive `rm` of an absolute or parent path, or that reference a
-protected home are denied the same way. Each denial ends up as a blocker with
+protected home are denied the same way, as is a command whose working directory
+lies outside the job's directory. Paths are taken from every path-like argument
+(including nested and array values, `file:` URIs and diff targets) and resolved
+against the request's own working directory; a tool not clearly read-only is
+checked as a write. Each denial ends up as a blocker with
 its policy code (`protected_home`, `outside_workspace`, `git_metadata_write`,
 `forbidden_command`). Fugato gates only the tool calls agy submits through
 `session/request_permission`; it is not an operating-system sandbox.

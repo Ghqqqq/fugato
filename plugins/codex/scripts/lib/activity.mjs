@@ -51,7 +51,7 @@ export function seedApprovalTotals(stored) {
       autoDenied: nonNegativeInt(stored.approvalTotals.autoDenied)
     };
   }
-  let answered = 0, denied = 0, autoAllowed = 0;
+  let answered = 0, denied = 0, autoAllowed = 0, autoDenied = 0;
   if (Array.isArray(stored?.questionHistory)) {
     for (const entry of stored.questionHistory) {
       if (entry?.kind !== "action-approval") continue;
@@ -62,9 +62,10 @@ export function seedApprovalTotals(stored) {
   if (Array.isArray(stored?.activity)) {
     for (const event of stored.activity) {
       if (event?.type === "permissionAutoAllowed") autoAllowed += 1;
+      if (event?.type === "permissionAutoDenied") autoDenied += 1;
     }
   }
-  return { answered, denied, autoAllowed, autoDenied: 0 };
+  return { answered, denied, autoAllowed, autoDenied };
 }
 
 export function recordApprovalResolution(stored, entry) {
@@ -92,10 +93,12 @@ export function appendActivity(stored, events, at = new Date().toISOString()) {
   const seq = stored.activitySeq ?? retained.at(-1)?.seq ?? 0;
   const appended = events.map((event, index) => ({ ...event, seq: seq + index + 1, at }));
   const autoAllowedDelta = appended.filter(event => event?.type === "permissionAutoAllowed").length;
-  const approvalPatch = autoAllowedDelta > 0 || stored.approvalTotals || retained.some(event => event?.type === "permissionAutoAllowed")
+  const autoDeniedDelta = appended.filter(event => event?.type === "permissionAutoDenied").length;
+  const approvalPatch = autoAllowedDelta > 0 || autoDeniedDelta > 0 || stored.approvalTotals
+      || retained.some(event => event?.type === "permissionAutoAllowed" || event?.type === "permissionAutoDenied")
     ? { approvalTotals: (() => {
         const current = seedApprovalTotals(stored);
-        return { ...current, autoAllowed: current.autoAllowed + autoAllowedDelta };
+        return { ...current, autoAllowed: current.autoAllowed + autoAllowedDelta, autoDenied: current.autoDenied + autoDeniedDelta };
       })() }
     : {};
   return {

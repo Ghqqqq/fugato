@@ -595,12 +595,20 @@ function checkSegmentArgv(argv, depth, context) {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
       if (arg === "--") break;
-      if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg) && typeof args[i + 1] === "string") {
-        const inner = checkCommandRecursive(args[i + 1], depth + 1, context);
+      if (/^-[A-Za-z]*c[A-Za-z]*$/.test(arg)) {
+        const script = args[i + 1] === "--" ? args[i + 2] : args[i + 1];
+        if (typeof script !== "string") break;
+        const inner = checkCommandRecursive(script, depth + 1, context);
         if (inner) return inner;
         break;
       }
     }
+  }
+
+  // eval and xargs run their arguments as a command line.
+  if ((cmd === "eval" || cmd === "xargs") && args.length && depth < MAX_COMMAND_DEPTH) {
+    const inner = checkCommandRecursive(args.filter(arg => cmd !== "xargs" || !arg.startsWith("-")).join(" "), depth + 1, context);
+    if (inner) return inner;
   }
 
   // 1. npm denylist: npm run build, npm run verify, npm publish, npm install / npm i / npm ci
@@ -786,6 +794,19 @@ function checkCommandRecursive(commandLine, depth, context) {
   }
 
   for (const segment of segments) {
+    const words = segment.filter(token => !token.isRedirect).map(token => token.value);
+    for (let i = 0; i < words.length && depth < MAX_COMMAND_DEPTH; i++) {
+      if (path.posix.basename(words[i]) !== "env") continue;
+      for (let j = i + 1; j < words.length; j++) {
+        const split = words[j] === "-S" || words[j] === "--split-string" ? words[j + 1]
+          : words[j].startsWith("--split-string=") ? words[j].slice("--split-string=".length)
+          : /^-S./.test(words[j]) ? words[j].slice(2) : null;
+        if (typeof split === "string" && split) {
+          const inner = checkCommandRecursive(split, depth + 1, context);
+          if (inner) return inner;
+        }
+      }
+    }
     const argv = stripRedirectsAndPrefixes(segment);
     const denied = checkSegmentArgv(argv, depth, context);
     if (denied) return denied;
@@ -819,6 +840,9 @@ export function evaluateCommand(commandLine, { executionCwd, env = process.env }
   }
   const canonicalCwd = executionCwd !== undefined ? resolveCanonicalDir(executionCwd) : null;
   const homes = resolveProtectedHomes(env);
+  if (homes.isolatedError) {
+    return { allowed: false, code: "protected_home", reason: `Cannot verify isolated home boundary (${homes.isolatedError}); denying commands.` };
+  }
   const denied = checkCommandRecursive(commandLine, 0, { canonicalCwd, homes });
   return denied ?? { allowed: true };
 }

@@ -198,9 +198,11 @@ test("runCommandPrefix enforces rawInput key allowlist, exact Cwd realpath equal
     }
   });
   assert.deepEqual(seen.get("ok-root-cwd"), ["Allow once", 'Allow "node --test" for this job', "Deny"]);
-  for (const id of ["unknown-env", "unknown-workdir", "unknown-bg", "unknown-daemon", "sub-cwd", "git-ineligible"]) {
+  for (const id of ["unknown-env", "unknown-bg", "unknown-daemon", "sub-cwd", "git-ineligible"]) {
     assert.deepEqual(seen.get(id), ["Allow once", "Deny"], id);
   }
+  // A working directory outside the job's directory is denied by the boundary policy before parking.
+  assert.equal(seen.has("unknown-workdir"), false);
   assert.equal(seen.has("   "), false, "whitespace-only toolCallId must be rejected before asking");
 });
 
@@ -263,6 +265,7 @@ test("fugato answer handles Deny: <guidance>, plain Deny, Allow once, and reject
         assert.equal(job.status, "completed");
         assert.deepEqual(job.result.blockers, []);
         assert.deepEqual(job.result.deniedActions, [{ code: "approval_denied", guidance: expectedGuidance }]);
+        assert.deepEqual(job.report.deniedActions, [{ code: "approval_denied", guidance: expectedGuidance.slice(0, 240) }]);
         assert.match(job.result.notice, /denied action came with guidance/);
         assert.equal(job.result.unconsumedSteers, undefined, "denial guidance is not reported as an unconsumed steer");
         return;
